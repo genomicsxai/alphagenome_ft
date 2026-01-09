@@ -4,11 +4,11 @@ A lightweight Python package for finetuning [Google DeepMind's AlphaGenome](http
 
 ## Features
 
-- 🎯 **Custom Prediction Heads**: Define and register your own task-specific prediction heads
-- 🔒 **Parameter Freezing**: Flexible parameter management (freeze backbone, heads, or specific layers)
-- 🔧 **Easy Integration**: Works seamlessly with pretrained AlphaGenome models
-- 📊 **Parameter Inspection**: Utilities to explore and count model parameters
-- 🚀 **JAX/Haiku Native**: Built on the same framework as AlphaGenome
+- **Custom Prediction Heads**: Define and register your own task-specific prediction heads
+- **Parameter Freezing**: Flexible parameter management (freeze backbone, heads, or specific layers)
+- **Easy Integration**: Works seamlessly with pretrained AlphaGenome models
+- **Parameter Inspection**: Utilities to explore and count model parameters
+- **JAX/Haiku Native**: Built on the same framework as AlphaGenome
 
 ## Installation
 
@@ -222,64 +222,27 @@ if is_custom_head('my_head'):
 all_heads = list_custom_heads()
 ```
 
-## Examples
+## Testing
 
-### Example 1: MPRA Finetuning
+The package includes a comprehensive test suite using pytest.
 
-Predict reporter activity from sequences:
+### Run Tests
 
-```python
-class MPRAHead(CustomHead):
-    def predict(self, embeddings, organism_index, **kwargs):
-        # Get 1bp embeddings and pool over central window
-        x = embeddings.get_sequence_embeddings(resolution=1)
-        
-        # Per-position predictions
-        x = hk.Linear(256)(x)
-        x = jax.nn.relu(x)
-        per_pos = hk.Linear(1)(x)
-        
-        # Pool over central 128bp
-        seq_len = per_pos.shape[1]
-        center_start = (seq_len - 128) // 2
-        center_end = center_start + 128
-        pooled = jnp.mean(per_pos[:, center_start:center_end], axis=1)
-        
-        return {'predictions': pooled}
+```bash
+# Install test dependencies
+pip install -e ".[test]"
+
+# Run all tests
+pytest
+
+# Run with coverage
+pytest --cov=alphagenome_ft --cov-report=html
+
+# Run specific test file
+pytest tests/test_custom_heads.py
 ```
 
-### Example 2: Multi-Resolution Head
-
-Use multiple resolution embeddings:
-
-```python
-class MultiResHead(CustomHead):
-    def predict(self, embeddings, organism_index, **kwargs):
-        # Get embeddings at different resolutions
-        x_1bp = embeddings.get_sequence_embeddings(resolution=1)
-        x_128bp = embeddings.get_sequence_embeddings(resolution=128)
-        
-        # Process each resolution
-        feat_1bp = hk.Linear(256)(x_1bp)
-        feat_128bp = hk.Linear(256)(x_128bp)
-        
-        # Upsample 128bp to match 1bp
-        feat_128bp_up = jnp.repeat(feat_128bp, 128, axis=1)
-        
-        # Combine
-        combined = feat_1bp + feat_128bp_up[:, :feat_1bp.shape[1]]
-        predictions = hk.Linear(self._num_tracks)(combined)
-        
-        return {'predictions': predictions}
-```
-
-## Comparison with Other Approaches
-
-| Approach | Custom Heads | Keep Standard Heads | Parameter Control | Ease of Use |
-|----------|--------------|-------------------|------------------|-------------|
-| **alphagenome-ft** | ✅ | ✅ | ✅ Full control | ⭐⭐⭐ Easy |
-| Fork & modify | ✅ | ✅ | ✅ Manual | ⭐ Hard |
-| External wrapper | ✅ | ❌ | ⚠️ Limited | ⭐⭐ Medium |
+See [`tests/README.md`](tests/README.md) for detailed testing documentation.
 
 ## Contributing
 
@@ -287,32 +250,13 @@ Contributions welcome! Please:
 
 1. Fork the repository
 2. Create a feature branch
-3. Add tests for new functionality
-4. Submit a pull request
-
-## Citation
-
-If you use this package, please cite the original AlphaGenome paper:
-
-```bibtex
-@article{alphagenome2024,
-  title={AlphaGenome: ...},
-  author={...},
-  journal={...},
-  year={2024}
-}
-```
+3. **Add tests for new functionality** (see [`tests/README.md`](tests/README.md))
+4. Ensure tests pass: `pytest`
+5. Submit a pull request
 
 ## License
 
 MIT License - see [LICENSE](LICENSE) file for details.
 
 This project extends [AlphaGenome](https://github.com/google-deepmind/alphagenome_research/), which has its own license terms.
-
-## Links
-
-- 📖 [Documentation](https://github.com/yourusername/alphagenome_ft)
-- 🐛 [Issue Tracker](https://github.com/yourusername/alphagenome_ft/issues)
-- 💬 [Discussions](https://github.com/yourusername/alphagenome_ft/discussions)
-- 🔬 [AlphaGenome Research](https://github.com/google-deepmind/alphagenome_research/)
 
