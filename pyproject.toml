@@ -21,10 +21,8 @@ classifiers = [
 ]
 
 dependencies = [
-    "jax>=0.4.0",
-    "jaxlib>=0.4.0",
-    "dm-haiku>=0.0.10",
-    "numpy>=1.24.0",
+    # Note: Users should have these installed via alphagenome_research
+    # We keep these as informational but don't enforce versions
 ]
 
 [project.optional-dependencies]
