@@ -24,8 +24,8 @@ from alphagenome_ft import (
 # Test Custom Head Definition
 # ============================================================================
 
-class TestMPRAHead(CustomHead):
-    """Test custom head for MPRA predictions."""
+class MPRAHeadForTesting(CustomHead):
+    """Test custom head for MPRA predictions (used in fixtures)."""
     
     def __init__(self, *, name, output_type, num_tracks, num_organisms, metadata):
         super().__init__(
@@ -119,7 +119,7 @@ def mpra_head_config():
 def registered_mpra_head(mpra_head_config):
     """Register test MPRA head and clean up after test."""
     head_name = 'test_mpra_head'
-    register_custom_head(head_name, TestMPRAHead, mpra_head_config)
+    register_custom_head(head_name, MPRAHeadForTesting, mpra_head_config)
     yield head_name
     # Cleanup is handled by the registry (overwrites are allowed)
 
@@ -140,4 +140,5 @@ def custom_only_model(registered_mpra_head, device):
         custom_heads=[registered_mpra_head],
         device=device,
     )
+
 

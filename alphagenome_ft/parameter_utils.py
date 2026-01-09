@@ -20,6 +20,7 @@ Embeddings:
 Heads (task-specific predictions):
   - ATAC, DNASE, RNA_SEQ, etc.
   - YOUR_CUSTOM_HEAD ← Add here
+
 1. **Backbone**: Encoder + Transformer + Decoder 
 2. **Embeddings**: Multi-resolution representations 
 3. **Heads**: Task-specific prediction layers

@@ -6,7 +6,7 @@ A lightweight Python package for finetuning [Google DeepMind's AlphaGenome](http
 
 - **Custom Prediction Heads**: Define and register your own task-specific prediction heads
 - **Parameter Freezing**: Flexible parameter management (freeze backbone, heads, or specific layers)
-- **Easy Integration**: Works seamlessly with pretrained AlphaGenome models
+- **Easy Integration**: Works seamlessly with pretrained AlphaGenome models (Simple wrapper classes)
 - **Parameter Inspection**: Utilities to explore and count model parameters
 - **JAX/Haiku Native**: Built on the same framework as AlphaGenome
 

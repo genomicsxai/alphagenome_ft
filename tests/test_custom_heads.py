@@ -12,7 +12,7 @@ from alphagenome_ft import (
     get_custom_head_config,
     list_custom_heads,
 )
-from tests.conftest import TestMPRAHead
+from tests.conftest import MPRAHeadForTesting
 
 
 class TestHeadRegistry:
@@ -23,7 +23,7 @@ class TestHeadRegistry:
         head_name = 'test_registration_head'
         
         # Register head
-        register_custom_head(head_name, TestMPRAHead, mpra_head_config)
+        register_custom_head(head_name, MPRAHeadForTesting, mpra_head_config)
         
         # Verify it's registered
         assert is_custom_head(head_name)
@@ -58,7 +58,7 @@ class TestHeadRegistry:
         head_name = 'test_overwrite_head'
         
         # Register once
-        register_custom_head(head_name, TestMPRAHead, mpra_head_config)
+        register_custom_head(head_name, MPRAHeadForTesting, mpra_head_config)
         first_config = get_custom_head_config(head_name)
         
         # Register again with different config
@@ -68,7 +68,7 @@ class TestHeadRegistry:
             output_type=dna_output.OutputType.ATAC,  # Different output type
             num_tracks=2,  # Different num_tracks
         )
-        register_custom_head(head_name, TestMPRAHead, new_config)
+        register_custom_head(head_name, MPRAHeadForTesting, new_config)
         second_config = get_custom_head_config(head_name)
         
         # Verify it was overwritten
@@ -116,23 +116,22 @@ class TestCustomHeadBase:
         # This is enforced by Python's abstract base class
         # Attempting to instantiate without implementing methods should fail
         
-        # TestMPRAHead implements both methods, so it should work
+        # MPRAHeadForTesting implements both methods, so it should work
         # This is tested implicitly by other tests
-        assert hasattr(TestMPRAHead, 'predict')
-        assert hasattr(TestMPRAHead, 'loss')
+        assert hasattr(MPRAHeadForTesting, 'predict')
+        assert hasattr(MPRAHeadForTesting, 'loss')
     
-    def test_custom_head_initialization(self, mpra_head_config):
-        """Test custom head initialization."""
-        head = TestMPRAHead(
-            name='test_head',
-            output_type=dna_output.OutputType.RNA_SEQ,
-            num_tracks=1,
-            num_organisms=2,
-            metadata={},
-        )
+    def test_custom_head_in_model(self, wrapped_model_with_head):
+        """Test custom head initialization within a model."""
+        # Custom heads are Haiku modules and must be initialized within hk.transform()
+        # This test verifies that the head was properly initialized in the wrapped model
         
-        assert head._name == 'test_head'
-        assert head._output_type == dna_output.OutputType.RNA_SEQ
-        assert head._num_tracks == 1
-        assert head._num_organisms == 2
+        # Check that custom head parameters exist (this means it was initialized)
+        custom_head_params = [
+            k for k in wrapped_model_with_head._params.keys()
+            if 'test_mpra_head' in k
+        ]
+        
+        assert len(custom_head_params) > 0, "Custom head was not properly initialized"
+
 
