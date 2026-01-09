@@ -129,16 +129,17 @@ DNA Sequence (B, S, 4)
     ↓
 ┌─────────────────────────────────────┐
 │ BACKBONE (can be frozen)            │
-│  ├─ SequenceEncoder                 │
-│  ├─ TransformerTower (9 blocks)     │
-│  └─ SequenceDecoder                 │
-└─────────────────────────────────────┘
-    ↓
-┌─────────────────────────────────────┐
-│ EMBEDDINGS (multi-resolution)       │
+│  ├─ SequenceEncoder ←────────────┐  │
+│  ├─ TransformerTower (9 blocks)  │  │
+│  └─ SequenceDecoder              │  │
+└──────────────────────────────────┼──┘
+    ↓                              │
+┌──────────────────────────────────┼──┐
+│ EMBEDDINGS (multi-resolution)    │  │
 │  ├─ embeddings_1bp:   (B, S, 1536)  │
 │  ├─ embeddings_128bp: (B, S/128, 3072) │
-│  └─ embeddings_pair:  (B, S/2048, S/2048, 128) │
+│  ├─ embeddings_pair:  (B, S/2048, S/2048, 128) │
+│  └─ encoder_output*:  (B, S/128, D)  │  *Advanced
 └─────────────────────────────────────┘
     ↓
 ┌─────────────────────────────────────┐
@@ -147,6 +148,29 @@ DNA Sequence (B, S, 4)
 │  └─ Custom: YOUR_HEAD_HERE ← Add!   │
 └─────────────────────────────────────┘
 ```
+
+### Advanced: Access Earlier Architecture Layers
+
+By default, custom heads receive embeddings **after** the decoder. For research or comparison, you can finetune from earlier layers:
+
+```python
+from alphagenome_ft.embeddings_extended import ExtendedEmbeddings
+from alphagenome_ft.custom_forward import forward_with_encoder_output
+
+# Custom head that uses encoder output (before transformer)
+class EncoderOnlyHead(CustomHead):
+    def predict(self, embeddings, organism_index, **kwargs):
+        # Access raw encoder output (CNN features, no attention)
+        x = embeddings.encoder_output  # (B, S/128, D)
+        # ... your prediction layers ...
+```
+
+**Available representations:**
+- `embeddings_1bp` - Decoder output (local + global context via skip connections)
+- `embeddings_128bp` - Transformer output (global attention context)  
+- `encoder_output`* - Encoder output (pure CNN features, before transformer)
+
+*Requires using `ExtendedEmbeddings` and custom forward pass. See `alphagenome_ft/custom_forward.py` for implementation.
 
 ## API Reference
 

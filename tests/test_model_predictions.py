@@ -6,7 +6,11 @@ Verifies that wrapped models produce identical predictions to the base model.
 import jax
 import jax.numpy as jnp
 import pytest
+import haiku as hk
 from alphagenome.models import dna_output
+from alphagenome_research.model import model as model_lib
+from alphagenome_ft.custom_forward import forward_with_encoder_output
+from alphagenome_ft.embeddings_extended import ExtendedEmbeddings
 
 
 class TestPredictionConsistency:
@@ -179,5 +183,96 @@ class TestPredictionConsistency:
         assert param_count > 400_000_000, (
             f"Model should have hundreds of millions of parameters, got {param_count:,}"
         )
+    
+    def test_custom_forward_matches_standard_forward(
+        self,
+        base_model,
+        test_sequence,
+        organism_index,
+    ):
+        """Verify forward_with_encoder_output produces identical embeddings to standard forward."""
+        
+        # Get metadata for AlphaGenome model
+        metadata = base_model._metadata
+        
+        # Create transform for custom forward
+        @hk.transform
+        def custom_forward_fn(dna_sequence, organism_index):
+            alphagenome = model_lib.AlphaGenome(metadata)
+            return forward_with_encoder_output(alphagenome, dna_sequence, organism_index)
+        
+        # Initialize with base model params
+        rng = jax.random.PRNGKey(42)
+        
+        # Get standard embeddings from base model
+        with base_model._device_context:
+            _, standard_embeddings = base_model._forward_fn.apply(
+                base_model._params,
+                base_model._state,
+                None,  # rng
+                test_sequence,
+                organism_index,
+            )
+        
+        # Get extended embeddings from custom forward
+        with base_model._device_context:
+            extended_embeddings = custom_forward_fn.apply(
+                base_model._params,
+                None,  # rng
+                test_sequence,
+                organism_index,
+            )
+        
+        # Verify extended embeddings is the right type
+        assert isinstance(extended_embeddings, ExtendedEmbeddings), (
+            f"Expected ExtendedEmbeddings, got {type(extended_embeddings)}"
+        )
+        
+        # Verify encoder_output is present and has correct shape
+        assert extended_embeddings.encoder_output is not None, (
+            "encoder_output should not be None"
+        )
+        assert extended_embeddings.encoder_output.ndim == 3, (
+            f"encoder_output should be 3D, got {extended_embeddings.encoder_output.ndim}D"
+        )
+        # Encoder output at 128bp resolution
+        expected_seq_len = test_sequence.shape[1] // 128
+        assert extended_embeddings.encoder_output.shape[1] == expected_seq_len, (
+            f"encoder_output should have seq_len//128={expected_seq_len}, "
+            f"got {extended_embeddings.encoder_output.shape[1]}"
+        )
+        
+        # Compare standard embeddings to extended embeddings
+        # They should be identical (our custom forward should match standard)
+        
+        # 1bp embeddings
+        assert extended_embeddings.embeddings_1bp is not None
+        assert standard_embeddings.embeddings_1bp is not None
+        assert jnp.allclose(
+            extended_embeddings.embeddings_1bp,
+            standard_embeddings.embeddings_1bp,
+            rtol=1e-5,
+            atol=1e-8
+        ), "1bp embeddings differ between custom and standard forward"
+        
+        # 128bp embeddings
+        assert extended_embeddings.embeddings_128bp is not None
+        assert standard_embeddings.embeddings_128bp is not None
+        assert jnp.allclose(
+            extended_embeddings.embeddings_128bp,
+            standard_embeddings.embeddings_128bp,
+            rtol=1e-5,
+            atol=1e-8
+        ), "128bp embeddings differ between custom and standard forward"
+        
+        # Pair embeddings (if present)
+        if standard_embeddings.embeddings_pair is not None:
+            assert extended_embeddings.embeddings_pair is not None
+            assert jnp.allclose(
+                extended_embeddings.embeddings_pair,
+                standard_embeddings.embeddings_pair,
+                rtol=1e-5,
+                atol=1e-8
+            ), "Pair embeddings differ between custom and standard forward"
 
 
