@@ -184,14 +184,20 @@ class CustomAlphaGenomeModel:
                 custom_head_predictions = {k: v for k, v in raw_predictions.items() 
                                           if k in custom_heads_set}
                 
-                # Process standard predictions through extract_predictions and reverse_complement
-                extracted = extract_predictions(standard_predictions)
-                reversed_preds = augmentation.reverse_complement(
-                    extracted,
-                    negative_strand_mask,
-                    strand_reindexing=strand_reindexing,
-                    sequence_length=sequences.shape[1],
-                )
+                # Only process standard predictions if they exist
+                # (models with custom heads only won't have standard predictions)
+                if standard_predictions:
+                    # Process standard predictions through extract_predictions and reverse_complement
+                    extracted = extract_predictions(standard_predictions)
+                    reversed_preds = augmentation.reverse_complement(
+                        extracted,
+                        negative_strand_mask,
+                        strand_reindexing=strand_reindexing,
+                        sequence_length=sequences.shape[1],
+                    )
+                else:
+                    # No standard predictions - return empty dict
+                    reversed_preds = {}
                 
                 # Return a wrapper that allows dict-like access but stores keys separately
                 # This avoids JAX tree processing issues with mixed key types
