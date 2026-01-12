@@ -10,6 +10,7 @@ tests/
 ├── conftest.py                      # Pytest fixtures and shared setup
 ├── test_custom_heads.py             # Tests for custom head functionality
 ├── test_model_predictions.py        # Tests for model prediction consistency
+├── test_encoder_only_mode.py        # Tests for encoder-only mode (short sequences)
 ├── test_parameter_management.py     # Tests for parameter freezing
 └── README.md                        # This file
 ```
@@ -80,7 +81,15 @@ Tests for model prediction consistency:
 - Custom head outputs are correctly structured
 - Parameter preservation in custom-only models
 
-### 3. Parameter Management Tests (`test_parameter_management.py`)
+### 3. Encoder-Only Mode Tests (`test_encoder_only_mode.py`)
+
+Tests for encoder-only mode (short sequence support):
+- Model creation with `use_encoder_output=True`
+- Short sequence inference (< 1000 bp)
+- Encoder embeddings availability
+- Parameter freezing in encoder-only mode
+
+### 4. Parameter Management Tests (`test_parameter_management.py`)
 
 Tests for parameter inspection and freezing:
 - Parameter counting and path listing

@@ -424,51 +424,29 @@ def create_model_with_custom_heads(
     
     if use_encoder_output:
         # Use custom forward pass that captures encoder output
+        # This skips transformer/decoder for short sequences that would fail
         from alphagenome_ft.embeddings_extended import ExtendedEmbeddings
         
         @hk.transform_with_state
         def _forward_with_custom_heads(dna_sequence, organism_index):
-            """Forward pass with custom heads and encoder output."""
-            # Apply mixed precision policies to all modules
+            """Forward pass with encoder output only (no transformer/decoder)."""
+            # Apply mixed precision policies to encoder
             with hk.mixed_precision.push_policy(model_lib.AlphaGenome, policy):
                 with hk.mixed_precision.push_policy(model_lib.SequenceEncoder, policy):
-                    with hk.mixed_precision.push_policy(model_lib.TransformerTower, policy):
-                        with hk.mixed_precision.push_policy(model_lib.SequenceDecoder, policy):
-                            with hk.mixed_precision.push_policy(embeddings_module.OutputEmbedder, policy):
-                                with hk.mixed_precision.push_policy(embeddings_module.OutputPair, policy):
-                                    with hk.name_scope('alphagenome'):
-                                        num_organisms = len(metadata)
-                                        
-                                        # Step 1: Run encoder
-                                        trunk, intermediates = model_lib.SequenceEncoder()(dna_sequence)
-                                        encoder_output = trunk  # Save before organism embedding
-                                        
-                                        # Step 2: Add organism embedding
-                                        organism_embedding_trunk = hk.Embed(num_organisms, trunk.shape[-1])(
-                                            organism_index
-                                        )
-                                        trunk += organism_embedding_trunk[:, None, :]
-                                        
-                                        # Step 3: Run transformer
-                                        trunk, pair_activations = model_lib.TransformerTower()(trunk)
-                                        
-                                        # Step 4: Run decoder
-                                        x = model_lib.SequenceDecoder()(trunk, intermediates)
-                                        
-                                        # Step 5: Create embeddings
-                                        embeddings_128bp = embeddings_module.OutputEmbedder(num_organisms)(
-                                            trunk, organism_index
-                                        )
-                                        embeddings_1bp = embeddings_module.OutputEmbedder(num_organisms)(
-                                            x, organism_index, embeddings_128bp
-                                        )
-                                        
-                                        # Create extended embeddings with encoder output
-                                        embeddings = ExtendedEmbeddings(
-                                            embeddings_1bp=embeddings_1bp,
-                                            embeddings_128bp=embeddings_128bp,
-                                            encoder_output=encoder_output,
-                                        )
+                    with hk.name_scope('alphagenome'):
+                        num_organisms = len(metadata)
+                        
+                        # Step 1: Run encoder ONLY
+                        trunk, intermediates = model_lib.SequenceEncoder()(dna_sequence)
+                        encoder_output = trunk  # Save encoder output
+                        
+                        # Create extended embeddings with ONLY encoder output
+                        # No transformer/decoder for short sequences
+                        embeddings = ExtendedEmbeddings(
+                            embeddings_1bp=None,  # Not available without decoder
+                            embeddings_128bp=None,  # Not available without transformer
+                            encoder_output=encoder_output,  # Raw encoder output
+                        )
             
             # Run custom heads (outside alphagenome scope)
             predictions = {}

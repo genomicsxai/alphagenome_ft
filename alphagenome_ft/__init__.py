@@ -20,6 +20,7 @@ from alphagenome_ft.custom_heads import (
     is_custom_head,
     list_custom_heads,
 )
+from alphagenome_ft import templates
 
 __all__ = [
     # Model classes
@@ -35,5 +36,7 @@ __all__ = [
     'get_custom_head_config',
     'is_custom_head',
     'list_custom_heads',
+    # Templates module (contains example head implementations)
+    'templates',
 ]
 
