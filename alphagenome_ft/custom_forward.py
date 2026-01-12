@@ -49,11 +49,12 @@ def forward_with_encoder_output(
                     with hk.mixed_precision.push_policy(model_lib.TransformerTower, policy):
                         with hk.mixed_precision.push_policy(model_lib.SequenceDecoder, policy):
                             with hk.mixed_precision.push_policy(embeddings_module.OutputEmbedder, policy):
-                                with hk.name_scope('alphagenome'):
-                                    alphagenome = model_lib.AlphaGenome(metadata)
-                                    return forward_with_encoder_output(
-                                        alphagenome, dna_sequence, organism_index
-                                    )
+                                with hk.mixed_precision.push_policy(embeddings_module.OutputPair, policy):
+                                    with hk.name_scope('alphagenome'):
+                                        alphagenome = model_lib.AlphaGenome(metadata)
+                                        return forward_with_encoder_output(
+                                            alphagenome, dna_sequence, organism_index
+                                        )
         ```
     """
     # Get number of organisms from the alphagenome instance

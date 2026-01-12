@@ -334,6 +334,7 @@ def create_model_with_custom_heads(
     custom_heads: Sequence[str],
     organism_settings: Mapping[dna_model.Organism, Any] | None = None,
     device: jax.Device | None = None,
+    use_encoder_output: bool = False,
 ) -> CustomAlphaGenomeModel:
     """Create an AlphaGenome model with custom heads replacing standard heads.
     
@@ -349,6 +350,8 @@ def create_model_with_custom_heads(
         custom_heads: List of custom head names (must be registered).
         organism_settings: Optional organism settings.
         device: Optional JAX device.
+        use_encoder_output: If True, use custom forward pass that provides encoder output
+            before transformer. This enables heads to access raw CNN features.
         
     Returns:
         CustomAlphaGenomeModel with custom heads and pretrained backbone.
@@ -419,29 +422,88 @@ def create_model_with_custom_heads(
     policy = jmp.get_policy('params=float32,compute=bfloat16,output=bfloat16')
     hk.mixed_precision.set_policy(model_lib.AlphaGenome, policy)
     
-    @hk.transform_with_state
-    def _forward_with_custom_heads(dna_sequence, organism_index):
-        """Forward pass with custom heads only."""
-        # Create AlphaGenome trunk (encoder, transformer, decoder)
-        # This will use pretrained params for the backbone
-        alphagenome = model_lib.AlphaGenome(metadata)
+    if use_encoder_output:
+        # Use custom forward pass that captures encoder output
+        from alphagenome_ft.embeddings_extended import ExtendedEmbeddings
         
-        # Get embeddings from the backbone (without running standard heads)
-        # We only need the embeddings, not the standard predictions
-        _, embeddings = alphagenome(dna_sequence, organism_index)
-        
-        # Create predictions dict (only custom heads)
-        predictions = {}
-        
-        # Run custom heads
-        # Get number of organisms from metadata (should be 2: human and mouse)
-        num_organisms = len(metadata)
-        with hk.name_scope('head'):
-            for head_name in custom_heads:
-                head = custom_heads_module.create_custom_head(head_name, metadata, num_organisms=num_organisms)
-                predictions[head_name] = head(embeddings, organism_index)
-        
-        return predictions, embeddings
+        @hk.transform_with_state
+        def _forward_with_custom_heads(dna_sequence, organism_index):
+            """Forward pass with custom heads and encoder output."""
+            # Apply mixed precision policies to all modules
+            with hk.mixed_precision.push_policy(model_lib.AlphaGenome, policy):
+                with hk.mixed_precision.push_policy(model_lib.SequenceEncoder, policy):
+                    with hk.mixed_precision.push_policy(model_lib.TransformerTower, policy):
+                        with hk.mixed_precision.push_policy(model_lib.SequenceDecoder, policy):
+                            with hk.mixed_precision.push_policy(embeddings_module.OutputEmbedder, policy):
+                                with hk.mixed_precision.push_policy(embeddings_module.OutputPair, policy):
+                                    with hk.name_scope('alphagenome'):
+                                        num_organisms = len(metadata)
+                                        
+                                        # Step 1: Run encoder
+                                        trunk, intermediates = model_lib.SequenceEncoder()(dna_sequence)
+                                        encoder_output = trunk  # Save before organism embedding
+                                        
+                                        # Step 2: Add organism embedding
+                                        organism_embedding_trunk = hk.Embed(num_organisms, trunk.shape[-1])(
+                                            organism_index
+                                        )
+                                        trunk += organism_embedding_trunk[:, None, :]
+                                        
+                                        # Step 3: Run transformer
+                                        trunk, pair_activations = model_lib.TransformerTower()(trunk)
+                                        
+                                        # Step 4: Run decoder
+                                        x = model_lib.SequenceDecoder()(trunk, intermediates)
+                                        
+                                        # Step 5: Create embeddings
+                                        embeddings_128bp = embeddings_module.OutputEmbedder(num_organisms)(
+                                            trunk, organism_index
+                                        )
+                                        embeddings_1bp = embeddings_module.OutputEmbedder(num_organisms)(
+                                            x, organism_index, embeddings_128bp
+                                        )
+                                        
+                                        # Create extended embeddings with encoder output
+                                        embeddings = ExtendedEmbeddings(
+                                            embeddings_1bp=embeddings_1bp,
+                                            embeddings_128bp=embeddings_128bp,
+                                            encoder_output=encoder_output,
+                                        )
+            
+            # Run custom heads (outside alphagenome scope)
+            predictions = {}
+            num_organisms = len(metadata)
+            with hk.name_scope('head'):
+                for head_name in custom_heads:
+                    head = custom_heads_module.create_custom_head(head_name, metadata, num_organisms=num_organisms)
+                    predictions[head_name] = head(embeddings, organism_index)
+            
+            return predictions, embeddings
+    else:
+        # Standard forward pass (no encoder output)
+        @hk.transform_with_state
+        def _forward_with_custom_heads(dna_sequence, organism_index):
+            """Forward pass with custom heads only."""
+            # Create AlphaGenome trunk (encoder, transformer, decoder)
+            # This will use pretrained params for the backbone
+            alphagenome = model_lib.AlphaGenome(metadata)
+            
+            # Get embeddings from the backbone (without running standard heads)
+            # We only need the embeddings, not the standard predictions
+            _, embeddings = alphagenome(dna_sequence, organism_index)
+            
+            # Create predictions dict (only custom heads)
+            predictions = {}
+            
+            # Run custom heads
+            # Get number of organisms from metadata (should be 2: human and mouse)
+            num_organisms = len(metadata)
+            with hk.name_scope('head'):
+                for head_name in custom_heads:
+                    head = custom_heads_module.create_custom_head(head_name, metadata, num_organisms=num_organisms)
+                    predictions[head_name] = head(embeddings, organism_index)
+            
+            return predictions, embeddings
     
     # Initialize parameters with dummy data
     print("Initializing parameters...")
