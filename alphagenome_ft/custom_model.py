@@ -136,7 +136,7 @@ class CustomAlphaGenomeModel:
         state: PyTree,
         custom_forward_fn: Any | None = None,
         custom_heads_list: Sequence[str] | None = None,
-        head_instances: dict[str, Any] | None = None,
+        head_configs: dict[str, Any] | None = None,
     ):
         """Initialize the custom model.
         
@@ -146,7 +146,7 @@ class CustomAlphaGenomeModel:
             state: Model state.
             custom_forward_fn: Optional custom forward function.
             custom_heads_list: List of custom head names in this model.
-            head_instances: Dictionary mapping head names to head instances for loss computation.
+            head_configs: Dictionary mapping head names to head configs for loss computation.
         """
         # Copy attributes from base model
         self._device_context = base_model._device_context
@@ -155,7 +155,7 @@ class CustomAlphaGenomeModel:
         self._fasta_extractors = base_model._fasta_extractors
         self._output_metadata_by_organism = base_model._output_metadata_by_organism
         self._variant_scorers = base_model._variant_scorers
-        self._head_instances = head_instances or {}
+        self._head_configs = head_configs or {}
         
         # Get the actual device from the device context
         device = self._device_context._device
@@ -314,24 +314,63 @@ class CustomAlphaGenomeModel:
         """
         return parameter_utils.count_parameters(self._params)
     
-    def get_head_instance(self, head_name: str) -> Any:
-        """Get the head instance for a given head name.
+    def get_head_config(self, head_name: str) -> dict:
+        """Get the head configuration for a given head name.
         
         Args:
             head_name: Name of the head.
             
         Returns:
-            Head instance for loss computation.
+            Head configuration dict.
             
         Raises:
-            KeyError: If head_name not found in head_instances.
+            KeyError: If head_name not found.
         """
-        if head_name not in self._head_instances:
+        if head_name not in self._head_configs:
             raise KeyError(
                 f"Head '{head_name}' not found in model. "
-                f"Available heads: {list(self._head_instances.keys())}"
+                f"Available heads: {list(self._head_configs.keys())}"
             )
-        return self._head_instances[head_name]
+        return self._head_configs[head_name]
+    
+    def create_loss_fn_for_head(self, head_name: str):
+        """Create a loss function for a custom head.
+        
+        This creates a function that can compute loss by instantiating the head
+        within a transform context. Use this in your training loop.
+        
+        Args:
+            head_name: Name of the custom head.
+            
+        Returns:
+            A function(predictions, batch) -> loss_dict that computes the loss.
+        """
+        # Verify head exists
+        _ = self.get_head_config(head_name)
+        
+        # Create a transformed function
+        def loss_computation(predictions_and_batch):
+            """Compute loss within transform."""
+            predictions, batch = predictions_and_batch
+            head = custom_heads_module.create_custom_head(
+                head_name,
+                metadata=self._metadata,
+                num_organisms=len(self._metadata)
+            )
+            return head.loss(predictions, batch)
+        
+        # Transform without apply_rng since we don't need randomness
+        transformed = hk.without_apply_rng(hk.transform(
+            lambda p_and_b: loss_computation(p_and_b)
+        ))
+        
+        def loss_fn(predictions, batch):
+            """Compute loss for predictions and batch."""
+            # Transform expects a single argument, so pack them
+            loss_dict = transformed.apply({}, (predictions, batch))
+            return loss_dict
+        
+        return loss_fn
     
     # ========================================================================
     # Delegate to base model for other methods
@@ -553,12 +592,10 @@ def create_model_with_custom_heads(
         )
         return predictions
     
-    # Create head instances for loss computation
-    head_instances = {}
+    # Store head configs for loss computation
+    head_configs = {}
     for head_name in custom_heads:
-        head_instances[head_name] = custom_heads_module.create_custom_head(
-            head_name, metadata=metadata, num_organisms=len(metadata)
-        )
+        head_configs[head_name] = custom_heads_module.get_custom_head_config(head_name)
     
     # Create and return custom model
     custom_model = CustomAlphaGenomeModel(
@@ -567,7 +604,7 @@ def create_model_with_custom_heads(
         merged_state,
         custom_forward_fn=custom_forward,
         custom_heads_list=list(custom_heads),
-        head_instances=head_instances,
+        head_configs=head_configs,
     )
     
     print("✓ Custom model created successfully")
@@ -720,12 +757,10 @@ def add_custom_heads_to_model(
         )
         return predictions
     
-    # Create head instances for loss computation
-    head_instances = {}
+    # Store head configs for loss computation
+    head_configs = {}
     for head_name in custom_heads:
-        head_instances[head_name] = custom_heads_module.create_custom_head(
-            head_name, metadata=metadata, num_organisms=len(metadata)
-        )
+        head_configs[head_name] = custom_heads_module.get_custom_head_config(head_name)
     
     # Create and return custom model
     custom_model = CustomAlphaGenomeModel(
@@ -734,7 +769,7 @@ def add_custom_heads_to_model(
         merged_state,
         custom_forward_fn=custom_forward,
         custom_heads_list=list(custom_heads),
-        head_instances=head_instances,
+        head_configs=head_configs,
     )
     
     print("✓ Custom heads added successfully")

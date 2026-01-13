@@ -111,6 +111,9 @@ model = add_custom_heads_to_model(base_model, custom_heads=['my_head'])
 
 # 4. Freeze backbone + standard heads, train only custom head
 model.freeze_except_head('my_head')
+
+# 5. Create loss function for training (see "Training with Custom Heads" section)
+loss_fn = model.create_loss_fn_for_head('my_head')
 ```
 
 **When to use each approach:**
@@ -436,6 +439,65 @@ head_paths = model.get_head_parameter_paths()     # Just head parameters
 backbone_paths = model.get_backbone_parameter_paths()  # Just backbone
 count = model.count_parameters()           # Total parameter count
 ```
+
+### Training with Custom Heads
+
+When training your model, you need to compute loss using your custom head's `loss()` method. Since heads are Haiku modules that can only be instantiated within transforms, use the `create_loss_fn_for_head()` method:
+
+```python
+import jax
+import jax.numpy as jnp
+
+# Create model with custom head
+model = create_model_with_custom_heads('all_folds', custom_heads=['my_head'])
+model.freeze_except_head('my_head')
+
+# Create a loss function for your head (do this ONCE before training)
+loss_fn = model.create_loss_fn_for_head('my_head')
+
+# Training loop
+def train_step(model, batch, optimizer_state):
+    """Single training step."""
+    def loss_fn_inner(params):
+        # Get model predictions
+        predictions = model._predict(
+            params,
+            model._state,
+            batch['sequences'],
+            batch['organism_index'],
+            negative_strand_mask=jnp.zeros(len(batch['sequences']), dtype=bool),
+            strand_reindexing=model._metadata[Organism.HOMO_SAPIENS].strand_reindexing,
+        )
+        
+        # Get predictions for our custom head
+        head_predictions = predictions['my_head']
+        
+        # Compute loss using the head's loss function
+        loss_dict = loss_fn(head_predictions, batch)  # ← Uses head's loss() method
+        return loss_dict['loss']
+    
+    # Compute gradients
+    loss, grads = jax.value_and_grad(loss_fn_inner)(model._params)
+    
+    # Update parameters with optimizer
+    updates, optimizer_state = optimizer.update(grads, optimizer_state)
+    model._params = optax.apply_updates(model._params, updates)
+    
+    return loss, optimizer_state
+
+# Train
+for epoch in range(num_epochs):
+    for batch in dataloader:
+        loss, optimizer_state = train_step(model, batch, optimizer_state)
+        print(f"Loss: {loss}")
+```
+
+**Key points:**
+- Call `model.create_loss_fn_for_head(head_name)` **once** before training to get a reusable loss function
+- The returned `loss_fn` automatically instantiates the head within a transform and calls its `loss()` method
+- Use this `loss_fn` inside your gradient computation
+
+For a complete working example with gradient accumulation and Weights & Biases integration, see the [MPRA finetuning example](../alphagenome_FT_MPRA/src/README.md).
 
 ### Head Registration
 
