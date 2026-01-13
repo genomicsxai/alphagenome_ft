@@ -136,6 +136,7 @@ class CustomAlphaGenomeModel:
         state: PyTree,
         custom_forward_fn: Any | None = None,
         custom_heads_list: Sequence[str] | None = None,
+        head_instances: dict[str, Any] | None = None,
     ):
         """Initialize the custom model.
         
@@ -145,6 +146,7 @@ class CustomAlphaGenomeModel:
             state: Model state.
             custom_forward_fn: Optional custom forward function.
             custom_heads_list: List of custom head names in this model.
+            head_instances: Dictionary mapping head names to head instances for loss computation.
         """
         # Copy attributes from base model
         self._device_context = base_model._device_context
@@ -153,6 +155,7 @@ class CustomAlphaGenomeModel:
         self._fasta_extractors = base_model._fasta_extractors
         self._output_metadata_by_organism = base_model._output_metadata_by_organism
         self._variant_scorers = base_model._variant_scorers
+        self._head_instances = head_instances or {}
         
         # Get the actual device from the device context
         device = self._device_context._device
@@ -310,6 +313,25 @@ class CustomAlphaGenomeModel:
             Total parameter count.
         """
         return parameter_utils.count_parameters(self._params)
+    
+    def get_head_instance(self, head_name: str) -> Any:
+        """Get the head instance for a given head name.
+        
+        Args:
+            head_name: Name of the head.
+            
+        Returns:
+            Head instance for loss computation.
+            
+        Raises:
+            KeyError: If head_name not found in head_instances.
+        """
+        if head_name not in self._head_instances:
+            raise KeyError(
+                f"Head '{head_name}' not found in model. "
+                f"Available heads: {list(self._head_instances.keys())}"
+            )
+        return self._head_instances[head_name]
     
     # ========================================================================
     # Delegate to base model for other methods
@@ -531,6 +553,13 @@ def create_model_with_custom_heads(
         )
         return predictions
     
+    # Create head instances for loss computation
+    head_instances = {}
+    for head_name in custom_heads:
+        head_instances[head_name] = custom_heads_module.create_custom_head(
+            head_name, metadata=metadata, num_organisms=len(metadata)
+        )
+    
     # Create and return custom model
     custom_model = CustomAlphaGenomeModel(
         base_model,
@@ -538,6 +567,7 @@ def create_model_with_custom_heads(
         merged_state,
         custom_forward_fn=custom_forward,
         custom_heads_list=list(custom_heads),
+        head_instances=head_instances,
     )
     
     print("✓ Custom model created successfully")
@@ -690,6 +720,13 @@ def add_custom_heads_to_model(
         )
         return predictions
     
+    # Create head instances for loss computation
+    head_instances = {}
+    for head_name in custom_heads:
+        head_instances[head_name] = custom_heads_module.create_custom_head(
+            head_name, metadata=metadata, num_organisms=len(metadata)
+        )
+    
     # Create and return custom model
     custom_model = CustomAlphaGenomeModel(
         base_model,
@@ -697,6 +734,7 @@ def add_custom_heads_to_model(
         merged_state,
         custom_forward_fn=custom_forward,
         custom_heads_list=list(custom_heads),
+        head_instances=head_instances,
     )
     
     print("✓ Custom heads added successfully")

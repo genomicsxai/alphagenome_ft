@@ -83,6 +83,40 @@ All templates use simple architecture: **Linear → ReLU → Linear**
 
 The key difference is **which embeddings** they access. See [`alphagenome_ft/templates.py`](alphagenome_ft/templates.py) for code.
 
+### Alternative: Add Custom Head to Existing Model (Keep Standard Heads)
+
+If you want to **keep the standard AlphaGenome heads** (ATAC, RNA-seq, etc.) and add your custom head:
+
+```python
+from alphagenome_research.model import dna_model
+from alphagenome_ft import templates, HeadConfig, HeadType, register_custom_head, add_custom_heads_to_model
+
+# 1. Load pretrained model (includes standard heads)
+base_model = dna_model.create_from_kaggle('all_folds')
+
+# 2. Register custom head
+register_custom_head(
+    'my_head',
+    templates.StandardHead,
+    HeadConfig(
+        type=HeadType.GENOME_TRACKS,
+        name='my_head',
+        output_type=dna_output.OutputType.RNA_SEQ,
+        num_tracks=1,
+    )
+)
+
+# 3. Add custom head to model (keeps ALL standard heads)
+model = add_custom_heads_to_model(base_model, custom_heads=['my_head'])
+
+# 4. Freeze backbone + standard heads, train only custom head
+model.freeze_except_head('my_head')
+```
+
+**When to use each approach:**
+- `create_model_with_custom_heads()` - Custom heads **only** (faster, smaller)
+- `add_custom_heads_to_model()` - Custom heads **+ standard heads** (useful for multi-task)
+
 ### Custom Head from Scratch
 
 Define your own head for specialized tasks:
