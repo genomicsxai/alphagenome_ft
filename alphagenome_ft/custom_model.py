@@ -354,7 +354,7 @@ class CustomAlphaGenomeModel:
             predictions, batch = predictions_and_batch
             head = custom_heads_module.create_custom_head(
                 head_name,
-                metadata=self._metadata,
+                metadata=None,  # Use head's config metadata, not organism metadata
                 num_organisms=len(self._metadata)
             )
             return head.loss(predictions, batch)
@@ -514,7 +514,7 @@ def create_model_with_custom_heads(
             num_organisms = len(metadata)
             with hk.name_scope('head'):
                 for head_name in custom_heads:
-                    head = custom_heads_module.create_custom_head(head_name, metadata, num_organisms=num_organisms)
+                    head = custom_heads_module.create_custom_head(head_name, metadata=None, num_organisms=num_organisms)
                     predictions[head_name] = head(embeddings, organism_index)
             
             return predictions, embeddings
@@ -539,7 +539,7 @@ def create_model_with_custom_heads(
             num_organisms = len(metadata)
             with hk.name_scope('head'):
                 for head_name in custom_heads:
-                    head = custom_heads_module.create_custom_head(head_name, metadata, num_organisms=num_organisms)
+                    head = custom_heads_module.create_custom_head(head_name, metadata=None, num_organisms=num_organisms)
                     predictions[head_name] = head(embeddings, organism_index)
             
             return predictions, embeddings
@@ -704,7 +704,7 @@ def add_custom_heads_to_model(
         num_organisms = len(metadata)
         with hk.name_scope('head'):
             for head_name in custom_heads:
-                head = custom_heads_module.create_custom_head(head_name, metadata, num_organisms=num_organisms)
+                head = custom_heads_module.create_custom_head(head_name, metadata=None, num_organisms=num_organisms)
                 predictions[head_name] = head(embeddings, organism_index)
         
         return predictions, embeddings
