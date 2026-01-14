@@ -10,6 +10,7 @@ from alphagenome_ft.custom_model import (
     create_model_with_custom_heads,
     wrap_pretrained_model,
     add_custom_heads_to_model,
+    load_checkpoint,
 )
 from alphagenome_ft.custom_heads import (
     CustomHead,
@@ -28,6 +29,7 @@ __all__ = [
     'create_model_with_custom_heads',
     'wrap_pretrained_model',
     'add_custom_heads_to_model',
+    'load_checkpoint',
     # Head classes and utilities
     'CustomHead',
     'HeadConfig',

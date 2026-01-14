@@ -34,13 +34,16 @@ and embeddings.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import json
 import os
+from pathlib import Path
 from typing import Any
 
 import haiku as hk
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Int, PyTree
+import orbax.checkpoint as ocp
 
 # Optional import for bfloat16 matrix multiplication patch
 try:
@@ -371,6 +374,209 @@ class CustomAlphaGenomeModel:
             return loss_dict
         
         return loss_fn
+    
+    # ========================================================================
+    # Checkpoint Save/Load Methods
+    # ========================================================================
+    
+    def save_checkpoint(
+        self,
+        checkpoint_dir: str | Path,
+        *,
+        save_full_model: bool = False,
+    ) -> None:
+        """Save custom head parameters and configuration.
+        
+        By default, only saves the custom head parameters (efficient for finetuning).
+        Optionally can save the full model including backbone parameters.
+        
+        Args:
+            checkpoint_dir: Directory to save checkpoint files.
+            save_full_model: If True, saves all parameters including backbone.
+                If False (default), only saves custom head parameters.
+                
+        Example:
+            ```python
+            # After training
+            model.save_checkpoint('checkpoints/my_model')
+            
+            # Later, load the checkpoint
+            model = load_checkpoint(
+                'checkpoints/my_model',
+                base_model_version='all_folds'
+            )
+            ```
+        """
+        checkpoint_dir = Path(checkpoint_dir)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save metadata about the checkpoint
+        metadata = {
+            'custom_heads': self._custom_heads,
+            'head_configs': {
+                name: {
+                    'type': config.type.name,
+                    'name': config.name,
+                    'output_type': config.output_type.name,
+                    'num_tracks': config.num_tracks,
+                    'metadata': config.metadata,
+                }
+                for name, config in self._head_configs.items()
+            },
+            'save_full_model': save_full_model,
+        }
+        
+        with open(checkpoint_dir / 'config.json', 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        # Determine what parameters to save
+        if save_full_model:
+            # Save all parameters
+            params_to_save = self._params
+            state_to_save = self._state
+        else:
+            # Only save custom head parameters
+            params_to_save = {}
+            state_to_save = {}
+            
+            # Extract head parameters - check both possible parameter structures
+            # 1. Try alphagenome/head path (encoder-only mode)
+            if 'alphagenome/head' in self._params:
+                for head_name in self._custom_heads:
+                    if head_name in self._params['alphagenome/head']:
+                        if 'alphagenome/head' not in params_to_save:
+                            params_to_save['alphagenome/head'] = {}
+                        params_to_save['alphagenome/head'][head_name] = \
+                            self._params['alphagenome/head'][head_name]
+            
+            # 2. Try alphagenome -> head path (standard mode)
+            if 'alphagenome' in self._params and 'head' in self._params['alphagenome']:
+                for head_name in self._custom_heads:
+                    if head_name in self._params['alphagenome']['head']:
+                        if 'alphagenome' not in params_to_save:
+                            params_to_save['alphagenome'] = {}
+                        if 'head' not in params_to_save['alphagenome']:
+                            params_to_save['alphagenome']['head'] = {}
+                        params_to_save['alphagenome']['head'][head_name] = \
+                            self._params['alphagenome']['head'][head_name]
+            
+            # Extract head state if it exists (check both structures)
+            if 'alphagenome/head' in self._state:
+                for head_name in self._custom_heads:
+                    if head_name in self._state['alphagenome/head']:
+                        if 'alphagenome/head' not in state_to_save:
+                            state_to_save['alphagenome/head'] = {}
+                        state_to_save['alphagenome/head'][head_name] = \
+                            self._state['alphagenome/head'][head_name]
+            
+            if 'alphagenome' in self._state and 'head' in self._state['alphagenome']:
+                for head_name in self._custom_heads:
+                    if head_name in self._state['alphagenome']['head']:
+                        if 'alphagenome' not in state_to_save:
+                            state_to_save['alphagenome'] = {}
+                        if 'head' not in state_to_save['alphagenome']:
+                            state_to_save['alphagenome']['head'] = {}
+                        state_to_save['alphagenome']['head'][head_name] = \
+                            self._state['alphagenome']['head'][head_name]
+        
+        # Save parameters using orbax
+        checkpointer = ocp.StandardCheckpointer()
+        checkpointer.save(
+            str(checkpoint_dir / 'checkpoint'),
+            (params_to_save, state_to_save)
+        )
+        # Wait for async save to complete
+        checkpointer.wait_until_finished()
+        
+        print(f"✓ Checkpoint saved to {checkpoint_dir}")
+        if save_full_model:
+            print("  Saved: Full model (backbone + custom heads)")
+        else:
+            print(f"  Saved: Custom heads only {self._custom_heads}")
+    
+    def get_head_parameters(self, head_name: str) -> PyTree:
+        """Extract parameters for a specific head.
+        
+        Args:
+            head_name: Name of the head.
+            
+        Returns:
+            Parameter tree for the head.
+        """
+        if head_name not in self._custom_heads:
+            raise KeyError(f"Head '{head_name}' not found in custom heads")
+        
+        # Search through all parameter keys to find the head
+        # Haiku can create different path structures depending on the transform
+        def find_head_params(params_dict, target_head_name, path_prefix=''):
+            """Recursively search for head parameters in nested or flat dict structure."""
+            if not isinstance(params_dict, dict):
+                return None
+            
+            # For nested dicts: check if this level contains the head name directly
+            if target_head_name in params_dict:
+                return params_dict[target_head_name]
+            
+            # For flat dicts with '/' keys: look for keys containing the head name
+            # e.g., 'alphagenome/head/test_mpra_head/...'
+            head_key_pattern = f'head/{target_head_name}'
+            matching_keys = {k: v for k, v in params_dict.items() 
+                            if isinstance(k, str) and head_key_pattern in k}
+            if matching_keys:
+                # Reconstruct nested structure from flat keys
+                result = {}
+                for flat_key, value in matching_keys.items():
+                    # Extract the path after the head name
+                    parts = flat_key.split('/')
+                    try:
+                        head_idx = parts.index(target_head_name)
+                        # Build nested dict from parts after head name
+                        if head_idx < len(parts) - 1:
+                            current = result
+                            for part in parts[head_idx+1:-1]:
+                                if part not in current:
+                                    current[part] = {}
+                                current = current[part]
+                            current[parts[-1]] = value
+                        else:
+                            # This is the head itself
+                            result = value if not isinstance(value, dict) else {**result, **value}
+                    except ValueError:
+                        continue
+                if result:
+                    return result
+            
+            # Search recursively in all sub-dictionaries
+            for key, value in params_dict.items():
+                if isinstance(value, dict):
+                    new_prefix = f"{path_prefix}/{key}" if path_prefix else key
+                    result = find_head_params(value, target_head_name, new_prefix)
+                    if result is not None:
+                        return result
+            
+            return None
+        
+        head_params = find_head_params(self._params, head_name)
+        if head_params is not None:
+            return head_params
+        
+        # If still not found, raise error with available keys for debugging
+        def get_all_keys(d, prefix=''):
+            """Get all keys in nested dict for debugging."""
+            keys = []
+            if isinstance(d, dict):
+                for k, v in d.items():
+                    full_key = f"{prefix}/{k}" if prefix else k
+                    keys.append(full_key)
+                    if isinstance(v, dict):
+                        keys.extend(get_all_keys(v, full_key))
+            return keys
+        
+        available_keys = get_all_keys(self._params)
+        raise ValueError(
+            f"Parameters for head '{head_name}' not found in model. "
+            f"Available keys: {available_keys[:10]}..."  # Show first 10 keys
+        )
     
     # ========================================================================
     # Delegate to base model for other methods
@@ -773,6 +979,156 @@ def add_custom_heads_to_model(
     )
     
     print("✓ Custom heads added successfully")
+    print(f"  Total parameters: {custom_model.count_parameters():,}")
+    
+    return custom_model
+
+
+def load_checkpoint(
+    checkpoint_dir: str | Path,
+    *,
+    base_model_version: str | dna_model.ModelVersion = 'all_folds',
+    organism_settings: Mapping[dna_model.Organism, Any] | None = None,
+    device: jax.Device | None = None,
+) -> CustomAlphaGenomeModel:
+    """Load a saved custom head checkpoint.
+    
+    This function loads a checkpoint saved with `model.save_checkpoint()`.
+    It handles both full model checkpoints and custom-heads-only checkpoints.
+    
+    Args:
+        checkpoint_dir: Directory containing the checkpoint files.
+        base_model_version: Base model version to use (only needed for heads-only checkpoints).
+        organism_settings: Optional organism settings.
+        device: Optional JAX device.
+        
+    Returns:
+        CustomAlphaGenomeModel with loaded parameters.
+        
+    Example:
+        ```python
+        # Load a checkpoint
+        model = load_checkpoint(
+            'checkpoints/my_model',
+            base_model_version='all_folds'
+        )
+        
+        # Continue training or use for inference
+        predictions = model.predict(...)
+        ```
+        
+    Raises:
+        FileNotFoundError: If checkpoint files are not found.
+        ValueError: If checkpoint configuration is invalid.
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+    
+    # Load configuration
+    config_path = checkpoint_dir / 'config.json'
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+    
+    custom_heads = config['custom_heads']
+    save_full_model = config['save_full_model']
+    
+    # Re-register custom heads from config
+    from . import custom_heads as custom_heads_module
+    from alphagenome.models import dna_output
+    from .custom_heads import HeadConfig, HeadType
+    
+    print(f"Loading checkpoint from {checkpoint_dir}")
+    print(f"  Custom heads: {custom_heads}")
+    print(f"  Full model: {save_full_model}")
+    
+    for head_name, head_config_dict in config['head_configs'].items():
+        # Check if head is already registered
+        try:
+            existing_config = custom_heads_module.get_custom_head_config(head_name)
+            print(f"  Head '{head_name}' already registered")
+        except KeyError:
+            # Need to get the head class - this requires the user to have imported it
+            # We'll provide a helpful error message
+            raise RuntimeError(
+                f"Head '{head_name}' is not registered. "
+                f"Please import and register the head class before loading the checkpoint. "
+                f"Example:\n"
+                f"  from your_module import {head_name.title().replace('_', '')}Head\n"
+                f"  register_custom_head('{head_name}', {head_name.title().replace('_', '')}Head, config)"
+            )
+    
+    # Load checkpoint parameters
+    checkpointer = ocp.StandardCheckpointer()
+    checkpoint_path = checkpoint_dir / 'checkpoint'
+    
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    
+    loaded_params, loaded_state = checkpointer.restore(checkpoint_path)
+    
+    if save_full_model:
+        # Full model checkpoint - load base model structure and use saved params
+        print("Loading full model from checkpoint...")
+        base_model = dna_model.create_from_kaggle(
+            base_model_version,
+            organism_settings=organism_settings,
+            device=device,
+        )
+        
+        # Create custom model with loaded parameters
+        custom_model = CustomAlphaGenomeModel(
+            base_model,
+            loaded_params,
+            loaded_state,
+            custom_heads_list=custom_heads,
+            head_configs={
+                name: custom_heads_module.get_custom_head_config(name)
+                for name in custom_heads
+            },
+        )
+    else:
+        # Heads-only checkpoint - need to merge with base model
+        print(f"Loading base model '{base_model_version}'...")
+        
+        # Determine if we need encoder output
+        # Check if any head name suggests encoder-only mode (simple heuristic)
+        use_encoder_output = any('encoder' in name.lower() for name in custom_heads)
+        
+        # Create model with custom heads
+        custom_model = create_model_with_custom_heads(
+            base_model_version,
+            custom_heads=custom_heads,
+            organism_settings=organism_settings,
+            device=device,
+            use_encoder_output=use_encoder_output,
+        )
+        
+        # Merge loaded head parameters into model
+        def merge_head_params(model_params: PyTree, loaded_head_params: PyTree) -> PyTree:
+            """Merge loaded head parameters into model parameters."""
+            import copy
+            merged = copy.deepcopy(model_params)
+            
+            if 'alphagenome/head' in loaded_head_params:
+                if 'alphagenome/head' not in merged:
+                    merged['alphagenome/head'] = {}
+                
+                for head_name, head_params in loaded_head_params['alphagenome/head'].items():
+                    merged['alphagenome/head'][head_name] = head_params
+            
+            return merged
+        
+        custom_model._params = merge_head_params(custom_model._params, loaded_params)
+        custom_model._state = merge_head_params(custom_model._state, loaded_state)
+        
+        # Re-put on device
+        device = custom_model._device_context._device
+        custom_model._params = jax.device_put(custom_model._params, device)
+        custom_model._state = jax.device_put(custom_model._state, device)
+    
+    print("✓ Checkpoint loaded successfully")
     print(f"  Total parameters: {custom_model.count_parameters():,}")
     
     return custom_model

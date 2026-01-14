@@ -12,6 +12,7 @@ tests/
 ├── test_model_predictions.py        # Tests for model prediction consistency
 ├── test_encoder_only_mode.py        # Tests for encoder-only mode (short sequences)
 ├── test_parameter_management.py     # Tests for parameter freezing
+├── test_checkpoint.py               # Tests for checkpoint save/load functionality
 └── README.md                        # This file
 ```
 
@@ -96,6 +97,17 @@ Tests for parameter inspection and freezing:
 - Backbone vs head parameter identification
 - Freezing and unfreezing functionality
 - Parameter value preservation
+
+### 5. Checkpoint Tests (`test_checkpoint.py`)
+
+Tests for checkpoint save and load functionality:
+- Saving heads-only checkpoints (efficient mode)
+- Saving full model checkpoints
+- Loading checkpoints and verifying structure
+- Prediction consistency after loading
+- Multiple save/load cycles
+- Error handling for invalid checkpoints
+- Configuration preservation
 
 ## Fixtures
 

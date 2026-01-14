@@ -520,6 +520,57 @@ if is_custom_head('my_head'):
 all_heads = list_custom_heads()
 ```
 
+## Saving and Loading Checkpoints
+
+After training, save your custom head parameters for later use.
+
+### Saving a Checkpoint
+
+```python
+# After training your model
+model.save_checkpoint(
+    'checkpoints/my_model',
+    save_full_model=False  # Default: only save custom heads (efficient)
+)
+```
+
+**Options:**
+- `save_full_model=False` (default): Only saves custom head parameters (~MBs)
+  - **Recommended for finetuning** - much smaller checkpoints
+  - Requires loading the base model when restoring
+- `save_full_model=True`: Saves entire model including backbone (~GBs)
+  - Self-contained checkpoint
+  - Larger file size but no need for base model
+  - Use if unfreezing the base model
+
+### Loading a Checkpoint
+
+```python
+from alphagenome_ft import load_checkpoint
+
+# Load a heads-only checkpoint (requires base model)
+model = load_checkpoint(
+    'checkpoints/my_model',
+    base_model_version='all_folds'  # Which base model to use
+)
+
+# Now use for inference or continue training
+predictions = model.predict(...)
+```
+
+**Important:** Before loading, you must register the custom head classes:
+
+```python
+# Import and register your custom head class
+from your_module import MyCustomHead
+from alphagenome_ft import register_custom_head
+
+register_custom_head('my_head', MyCustomHead, config)
+
+# Now load checkpoint
+model = load_checkpoint('checkpoints/my_model')
+```
+
 ## Testing
 
 The package includes a comprehensive test suite using pytest.
@@ -538,7 +589,16 @@ pytest --cov=alphagenome_ft --cov-report=html
 
 # Run specific test file
 pytest tests/test_custom_heads.py
+pytest tests/test_checkpoint.py
 ```
+
+### Test Categories
+
+- **`test_custom_heads.py`** - Custom head registration and configuration
+- **`test_model_predictions.py`** - Model prediction consistency
+- **`test_encoder_only_mode.py`** - Encoder-only mode for short sequences
+- **`test_parameter_management.py`** - Parameter freezing and inspection
+- **`test_checkpoint.py`** - Checkpoint save/load functionality
 
 See [`tests/README.md`](tests/README.md) for detailed testing documentation.
 
