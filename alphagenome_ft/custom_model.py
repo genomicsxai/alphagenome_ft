@@ -480,9 +480,15 @@ class CustomAlphaGenomeModel:
                             self._state['alphagenome']['head'][head_name]
         
         # Save parameters using orbax
+        # Remove existing checkpoint directory if it exists (to allow overwriting)
+        checkpoint_path = checkpoint_dir / 'checkpoint'
+        if checkpoint_path.exists():
+            import shutil
+            shutil.rmtree(checkpoint_path)
+        
         checkpointer = ocp.StandardCheckpointer()
         checkpointer.save(
-            str(checkpoint_dir / 'checkpoint'),
+            str(checkpoint_path),
             (params_to_save, state_to_save)
         )
         # Wait for async save to complete
