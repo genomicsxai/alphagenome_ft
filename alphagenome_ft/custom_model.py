@@ -1137,12 +1137,38 @@ def load_checkpoint(
             import copy
             merged = copy.deepcopy(model_params)
             
+            # Structure 1: Flat keys like 'head/{head_name}/...' (use_encoder_output=True mode)
+            # This happens when custom heads are created with hk.name_scope('head') outside alphagenome scope
+            if isinstance(loaded_head_params, dict):
+                # Check if we have flat keys starting with 'head/'
+                head_keys = {k: v for k, v in loaded_head_params.items() 
+                            if isinstance(k, str) and k.startswith('head/')}
+                if head_keys:
+                    # Merge flat keys directly
+                    for key, value in head_keys.items():
+                        merged[key] = value
+            
+            # Structure 2: alphagenome/head (encoder-only mode, nested)
             if 'alphagenome/head' in loaded_head_params:
                 if 'alphagenome/head' not in merged:
                     merged['alphagenome/head'] = {}
                 
                 for head_name, head_params in loaded_head_params['alphagenome/head'].items():
                     merged['alphagenome/head'][head_name] = head_params
+            
+            # Structure 3: alphagenome -> head (standard mode, nested)
+            if 'alphagenome' in loaded_head_params:
+                if isinstance(loaded_head_params['alphagenome'], dict):
+                    if 'head' in loaded_head_params['alphagenome']:
+                        if 'alphagenome' not in merged:
+                            merged['alphagenome'] = {}
+                        if not isinstance(merged['alphagenome'], dict):
+                            merged['alphagenome'] = {}
+                        if 'head' not in merged['alphagenome']:
+                            merged['alphagenome']['head'] = {}
+                        
+                        for head_name, head_params in loaded_head_params['alphagenome']['head'].items():
+                            merged['alphagenome']['head'][head_name] = head_params
             
             return merged
         
