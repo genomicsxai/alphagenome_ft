@@ -439,8 +439,18 @@ class CustomAlphaGenomeModel:
             params_to_save = {}
             state_to_save = {}
             
-            # Extract head parameters - check both possible parameter structures
-            # 1. Try alphagenome/head path (encoder-only mode)
+            # Extract head parameters - check all possible parameter structures
+            # Structure 1: Flat keys like 'head/mpra_head/...' (use_encoder_output=True mode)
+            # This happens when custom heads are created with hk.name_scope('head') outside alphagenome scope
+            if isinstance(self._params, dict):
+                for key, value in self._params.items():
+                    if isinstance(key, str):
+                        # Check if this key belongs to any of our custom heads
+                        for head_name in self._custom_heads:
+                            if key.startswith(f'head/{head_name}/') or key == f'head/{head_name}':
+                                params_to_save[key] = value
+            
+            # Structure 2: alphagenome/head (encoder-only mode, nested)
             if 'alphagenome/head' in self._params:
                 for head_name in self._custom_heads:
                     if head_name in self._params['alphagenome/head']:
@@ -449,7 +459,7 @@ class CustomAlphaGenomeModel:
                         params_to_save['alphagenome/head'][head_name] = \
                             self._params['alphagenome/head'][head_name]
             
-            # 2. Try alphagenome -> head path (standard mode)
+            # Structure 3: alphagenome -> head (standard mode, nested)
             if 'alphagenome' in self._params and 'head' in self._params['alphagenome']:
                 for head_name in self._custom_heads:
                     if head_name in self._params['alphagenome']['head']:
@@ -460,7 +470,16 @@ class CustomAlphaGenomeModel:
                         params_to_save['alphagenome']['head'][head_name] = \
                             self._params['alphagenome']['head'][head_name]
             
-            # Extract head state if it exists (check both structures)
+            # Extract head state if it exists (check all structures)
+            # Structure 1: Flat keys
+            if isinstance(self._state, dict):
+                for key, value in self._state.items():
+                    if isinstance(key, str):
+                        for head_name in self._custom_heads:
+                            if key.startswith(f'head/{head_name}/') or key == f'head/{head_name}':
+                                state_to_save[key] = value
+            
+            # Structure 2: alphagenome/head
             if 'alphagenome/head' in self._state:
                 for head_name in self._custom_heads:
                     if head_name in self._state['alphagenome/head']:
@@ -469,6 +488,7 @@ class CustomAlphaGenomeModel:
                         state_to_save['alphagenome/head'][head_name] = \
                             self._state['alphagenome/head'][head_name]
             
+            # Structure 3: alphagenome -> head
             if 'alphagenome' in self._state and 'head' in self._state['alphagenome']:
                 for head_name in self._custom_heads:
                     if head_name in self._state['alphagenome']['head']:
