@@ -22,6 +22,7 @@ from alphagenome_ft.custom_heads import (
     list_custom_heads,
 )
 from alphagenome_ft import templates
+from alphagenome_ft import finetune
 
 __all__ = [
     # Model classes
@@ -40,5 +41,6 @@ __all__ = [
     'list_custom_heads',
     # Templates module (contains example head implementations)
     'templates',
+    # Finetuning workflow module
+    'finetune',
 ]
-
