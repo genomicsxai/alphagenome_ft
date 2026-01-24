@@ -63,8 +63,8 @@ def parse_track_list(entries: Sequence[str | Mapping[str, Any]]) -> list[TrackIn
     return tracks
 
 
-def build_head_specs(args) -> list[HeadSpec]:
-    config = load_targets_config(args.targets_config)
+def build_head_specs(targets_config: Path) -> list[HeadSpec]:
+    config = load_targets_config(targets_config)
     heads_cfg = config.get('targets') or config.get('heads')
     if not heads_cfg:
         raise ValueError('Targets config must define a non-empty "targets" list.')

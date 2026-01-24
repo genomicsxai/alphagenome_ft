@@ -118,11 +118,18 @@ class BigWigDataModule:
         return padded
 
 
-def load_intervals(args) -> Mapping[str, list[genome.Interval]]:
+def load_intervals(
+    *,
+    bed: Path,
+    window_size: int | None,
+    limit_train: int | None = None,
+    limit_valid: int | None = None,
+    limit_test: int | None = None,
+) -> Mapping[str, list[genome.Interval]]:
     splits: dict[str, list[genome.Interval]] = defaultdict(list)
-    opened = gzip.open if args.bed.suffix == '.gz' else open
+    opened = gzip.open if bed.suffix == '.gz' else open
     mode = 'rt'
-    with opened(args.bed, mode) as handle:
+    with opened(bed, mode) as handle:
         for raw in handle:
             line = raw.strip()
             if not line or line.startswith('#'):
@@ -138,16 +145,16 @@ def load_intervals(args) -> Mapping[str, list[genome.Interval]]:
                 chromosome=chrom,
                 start=int(float(start_str)),
                 end=int(float(end_str)),
-                window_size=args.window_size,
+                window_size=window_size,
             )
             splits[label].append(interval)
 
     if not splits['train']:
         raise ValueError('No training intervals found in --bed file.')
 
-    _maybe_limit(splits['train'], args.limit_train)
-    _maybe_limit(splits['valid'], args.limit_valid)
-    _maybe_limit(splits['test'], args.limit_test)
+    _maybe_limit(splits['train'], limit_train)
+    _maybe_limit(splits['valid'], limit_valid)
+    _maybe_limit(splits['test'], limit_test)
 
     for key in list(splits.keys()):
         if not splits[key]:
