@@ -52,6 +52,8 @@ except ImportError:
     pass
 
 from alphagenome.models import dna_output, dna_client
+from dataclasses import replace
+
 from alphagenome_research.model import dna_model, model as model_lib, embeddings as embeddings_module
 from alphagenome_research.model.metadata import metadata as metadata_lib
 
@@ -628,6 +630,7 @@ def create_model_with_custom_heads(
     organism_settings: Mapping[dna_model.Organism, Any] | None = None,
     device: jax.Device | None = None,
     use_encoder_output: bool = False,
+    detach_backbone: bool = False,
 ) -> CustomAlphaGenomeModel:
     """Create an AlphaGenome model with custom heads replacing standard heads.
     
@@ -645,6 +648,8 @@ def create_model_with_custom_heads(
         device: Optional JAX device.
         use_encoder_output: If True, use custom forward pass that provides encoder output
             before transformer. This enables heads to access raw CNN features.
+        detach_backbone: If True, stop gradients at the backbone embeddings so
+            heads-only training avoids backprop through the backbone.
         
     Returns:
         CustomAlphaGenomeModel with custom heads and pretrained backbone.
@@ -715,6 +720,16 @@ def create_model_with_custom_heads(
     policy = jmp.get_policy('params=float32,compute=bfloat16,output=bfloat16')
     hk.mixed_precision.set_policy(model_lib.AlphaGenome, policy)
     
+    def _stop_gradient_embeddings(embeddings):
+        if embeddings is None:
+            return None
+        values = {}
+        for field in ('embeddings_1bp', 'embeddings_128bp', 'embeddings_pair', 'encoder_output'):
+            if hasattr(embeddings, field):
+                value = getattr(embeddings, field)
+                values[field] = None if value is None else jax.lax.stop_gradient(value)
+        return replace(embeddings, **values)
+
     if use_encoder_output:
         # Use custom forward pass that captures encoder output
         # This skips transformer/decoder for short sequences that would fail
@@ -740,6 +755,8 @@ def create_model_with_custom_heads(
                             embeddings_128bp=None,  # Not available without transformer
                             encoder_output=encoder_output,  # Raw encoder output
                         )
+                        if detach_backbone:
+                            embeddings = _stop_gradient_embeddings(embeddings)
             
             # Run custom heads (outside alphagenome scope)
             predictions = {}
@@ -762,6 +779,8 @@ def create_model_with_custom_heads(
             # Get embeddings from the backbone (without running standard heads)
             # We only need the embeddings, not the standard predictions
             _, embeddings = alphagenome(dna_sequence, organism_index)
+            if detach_backbone:
+                embeddings = _stop_gradient_embeddings(embeddings)
             
             # Create predictions dict (only custom heads)
             predictions = {}
@@ -1184,4 +1203,3 @@ def load_checkpoint(
     print(f"  Total parameters: {custom_model.count_parameters():,}")
     
     return custom_model
-
