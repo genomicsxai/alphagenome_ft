@@ -12,7 +12,7 @@ from alphagenome_ft.finetune.data import (
     BigWigDataModule,
     build_interval,
     load_intervals,
-    prepare_batch_for_jax,
+    prepare_batch,
 )
 
 __all__ = [
@@ -25,5 +25,5 @@ __all__ = [
     'BigWigDataModule',
     'build_interval',
     'load_intervals',
-    'prepare_batch_for_jax',
+    'prepare_batch',
 ]

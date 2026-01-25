@@ -180,7 +180,7 @@ def _maybe_limit(intervals: list[genome.Interval], limit: int | None) -> None:
         del intervals[limit:]
 
 
-def prepare_batch_for_jax(
+def prepare_batch(
     batch: Mapping[str, np.ndarray],
     organism_index_value: int,
     head_names: Sequence[str],
