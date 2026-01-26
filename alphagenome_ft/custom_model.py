@@ -631,6 +631,7 @@ def create_model_with_custom_heads(
     device: jax.Device | None = None,
     use_encoder_output: bool = False,
     detach_backbone: bool = False,
+    init_seq_len: int | None = None,
 ) -> CustomAlphaGenomeModel:
     """Create an AlphaGenome model with custom heads replacing standard heads.
     
@@ -796,9 +797,12 @@ def create_model_with_custom_heads(
             return predictions, embeddings
     
     # Initialize parameters with dummy data
-    print("Initializing parameters...")
+    # Use init_seq_len if provided (important for flatten pooling with cached embeddings)
+    # Otherwise use default full sequence length
+    seq_len = init_seq_len if init_seq_len is not None else 2**17
+    print(f"Initializing parameters... (seq_len={seq_len})")
     rng = jax.random.PRNGKey(42)
-    dummy_seq = jnp.zeros((1, 2**17, 4), dtype=jnp.bfloat16)
+    dummy_seq = jnp.zeros((1, seq_len, 4), dtype=jnp.bfloat16)
     dummy_org = jnp.array([0])
     
     new_params, new_state = _forward_with_custom_heads.init(rng, dummy_seq, dummy_org)
