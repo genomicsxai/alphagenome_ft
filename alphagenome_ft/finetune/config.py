@@ -5,22 +5,24 @@ Expected YAML/JSON format:
 heads:
   - name: my_custom_head
     source: custom
-    targets:
+    bigwigs:
       - /data/tracks/track1.bw
-      - path: /data/tracks/track2.bw
-        name: track2
+      - /data/tracks/track2.bw
     # Custom heads must be registered in code before loading this config.
 
   - name: my_rna_instance  # instance name
     source: predefined
     config:
-      name: rna_seq  # predefined head kind (config name)
-      resolutions: [1, 128]
-      apply_squashing: true
-      # num_tracks is inferred from targets if omitted.
+      name: rna_seq  # predefined head kind
+      # Optional overrides:
+      # resolutions: [1, 128]
+      # apply_squashing: true # true for RNA-seq, false for the others
+    # Use either `targets` with metadata or `bigwigs` without metadata. 
     targets:
-      - /data/rnaseq/track_001.bw
-      - /data/rnaseq/track_002.bw
+      - bigwig: /data/rnaseq/track_001.bw
+        label: track_001  # optional; defaults to filename stem
+        nonzero_mean: 0.8  # optional; defaults to 1.0 if any are provided
+      - bigwig: /data/rnaseq/track_002.bw
       # Must include one entry per track.
 """
 
@@ -35,6 +37,10 @@ try:
     import yaml
 except ImportError:  # pragma: no cover - handled at runtime
     yaml = None
+
+import pandas as pd
+
+from alphagenome.models import dna_client
 
 from alphagenome_ft import (
     get_custom_head_config,
@@ -51,6 +57,7 @@ class TrackInfo:
 
     name: str
     path: Path
+    nonzero_mean: float | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -61,6 +68,7 @@ class HeadSpec:
     source: str
     tracks: Sequence[TrackInfo]
     config: Any | None = None
+    metadata: Mapping[dna_client.Organism, pd.DataFrame] | None = None
 
 
 def load_targets_config(path: Path) -> Mapping[str, Any]:
@@ -69,33 +77,83 @@ def load_targets_config(path: Path) -> Mapping[str, Any]:
     text = path.read_text()
     if path.suffix.lower() in {'.yml', '.yaml'}:
         if yaml is None:
-            raise ImportError('pyyaml is required to parse YAML configs for targets.')
+            raise ImportError('pyyaml is required to parse YAML configs.')
         return yaml.safe_load(text)
     return json.loads(text)
 
 
-def parse_track_list(entries: Sequence[str | Mapping[str, Any]]) -> list[TrackInfo]:
+def parse_bigwigs(entries: Sequence[str]) -> list[TrackInfo]:
     tracks: list[TrackInfo] = []
     for item in entries:
-        if isinstance(item, str):
-            path = Path(item)
-            name = path.stem
-        elif isinstance(item, Mapping):
-            path = Path(item['path'])
-            name = str(item.get('name', path.stem))
-        else:
-            raise ValueError(f'Unsupported track entry: {item!r}')
+        if not isinstance(item, str):
+            raise ValueError(
+                "Entries under 'bigwigs' must be file paths (strings). "
+                "Use 'targets' for metadata."
+            )
+        path = Path(item)
         if not path.exists():
             raise FileNotFoundError(f'BigWig not found: {path}')
-        tracks.append(TrackInfo(name=name, path=path))
+        tracks.append(TrackInfo(name=path.stem, path=path))
     return tracks
 
 
-def build_head_specs(targets_config: Path) -> list[HeadSpec]:
+def parse_targets(entries: Sequence[Mapping[str, Any]]) -> list[TrackInfo]:
+    tracks: list[TrackInfo] = []
+    for item in entries:
+        if not isinstance(item, Mapping):
+            raise ValueError(
+                "Entries under 'targets' must be mappings with a 'bigwig' path."
+            )
+        if 'bigwig' not in item:
+            raise ValueError(f'Each target must include "bigwig": {item!r}')
+        path = Path(item['bigwig'])
+        name = str(item.get('label') or path.stem)
+        nonzero_mean = item.get('nonzero_mean')
+        if nonzero_mean is not None:
+            nonzero_mean = float(nonzero_mean)
+        if not path.exists():
+            raise FileNotFoundError(f'BigWig not found: {path}')
+        tracks.append(TrackInfo(name=name, path=path, nonzero_mean=nonzero_mean))
+    return tracks
+
+
+def _build_track_metadata(
+    tracks: Sequence[TrackInfo],
+    organism: dna_client.Organism | None,
+) -> Mapping[dna_client.Organism, pd.DataFrame] | None:
+    nonzero_means = [track.nonzero_mean for track in tracks]
+    if all(value is None for value in nonzero_means):
+        return None
+    nonzero_means = [
+        1.0 if value is None else float(value) for value in nonzero_means
+    ]
+    df = pd.DataFrame(
+        {
+            "name": [track.name for track in tracks],
+            "nonzero_mean": nonzero_means,
+        }
+    )
+    if organism is not None:
+        return {organism: df}
+    return {org: df for org in dna_client.Organism}
+
+
+def build_head_specs(
+    targets_config: Path,
+    *,
+    organism: str | None = None,
+) -> list[HeadSpec]:
     config = load_targets_config(targets_config)
-    heads_cfg = config.get('heads') or config.get('targets')
+    heads_cfg = config.get('heads')
     if not heads_cfg:
         raise ValueError('Config must define a non-empty "heads" list.')
+
+    organism_enum: dna_client.Organism | None = None
+    if organism is not None:
+        try:
+            organism_enum = dna_client.Organism[organism]
+        except KeyError as exc:
+            raise ValueError(f'Unknown organism "{organism}".') from exc
 
     specs: list[HeadSpec] = []
     seen_names: set[str] = set()
@@ -114,9 +172,19 @@ def build_head_specs(targets_config: Path) -> list[HeadSpec]:
 
         source = str(entry['source']).lower()
         targets = entry.get('targets')
-        if targets is None:
-            raise ValueError(f'Head "{head_name}" must include "targets".')
-        tracks = parse_track_list(targets)
+        bigwigs = entry.get('bigwigs')
+        if targets is not None and bigwigs is not None:
+            raise ValueError(
+                f'Head "{head_name}" must use only one of "targets" or "bigwigs".'
+            )
+        if targets is None and bigwigs is None:
+            raise ValueError(
+                f'Head "{head_name}" must include "targets" (preferred) or "bigwigs".'
+            )
+        if targets is not None:
+            tracks = parse_targets(targets)
+        else:
+            tracks = parse_bigwigs(bigwigs)
         config_block = entry.get('config')
         if config_block is not None and not isinstance(config_block, Mapping):
             raise ValueError(f'Head "{head_name}" config must be a mapping.')
@@ -150,12 +218,12 @@ def build_head_specs(targets_config: Path) -> list[HeadSpec]:
                     f'Predefined head "{head_name}" must include config.name.'
                 )
             kind_name = config_block['name']
+            overrides = dict(config_block)
+            overrides.pop('name', None)
             if not is_predefined_head(kind_name):
                 raise ValueError(
                     f'Unknown predefined head kind "{kind_name}".'
                 )
-            overrides = dict(config_block)
-            overrides.pop('name', None)
             allowed_fields = {
                 'resolutions',
                 'apply_squashing',
@@ -173,7 +241,7 @@ def build_head_specs(targets_config: Path) -> list[HeadSpec]:
                 if int(overrides['num_tracks']) != len(tracks):
                     raise ValueError(
                         f'Predefined head "{head_name}" num_tracks '
-                        f'{overrides["num_tracks"]} does not match targets '
+                        f'{overrides["num_tracks"]} does not match bigwigs '
                         f'({len(tracks)}).'
                     )
             head_config = get_predefined_head_config(
@@ -184,12 +252,14 @@ def build_head_specs(targets_config: Path) -> list[HeadSpec]:
                 embedding_channels=overrides.get('embedding_channels'),
                 num_tissues=overrides.get('num_tissues'),
             )
+            metadata = _build_track_metadata(tracks, organism_enum)
             specs.append(
                 HeadSpec(
                     head_name=head_name,
                     source='predefined',
                     tracks=tracks,
                     config=head_config,
+                    metadata=metadata,
                 )
             )
         else:
@@ -216,4 +286,3 @@ def validate_heads(specs: Sequence[HeadSpec]) -> None:
                 f'Custom head "{spec.head_name}" is not registered. '
                 'Register it before loading this config.'
             )
-

@@ -62,6 +62,36 @@ from alphagenome_ft import parameter_utils
 from alphagenome_ft import custom_heads as custom_heads_module
 
 
+def _resolve_user_metadata(
+    *,
+    head_name: str,
+    head_config: custom_heads_module.HeadConfigLike,
+) -> Mapping[enum.Enum, Any] | None:
+    """Return user-provided metadata, validated against num_tracks."""
+    metadata = custom_heads_module.get_registered_head_metadata(head_name)
+    if metadata is None:
+        return None
+
+    if isinstance(metadata, Mapping):
+        for organism, meta in metadata.items():
+            if meta is None:
+                continue
+            if len(meta) != head_config.num_tracks:
+                raise ValueError(
+                    f"Head '{head_name}' metadata has {len(meta)} tracks "
+                    f"for {getattr(organism, 'name', organism)}, expected "
+                    f"{head_config.num_tracks}."
+                )
+        return metadata
+
+    if len(metadata) != head_config.num_tracks:
+        raise ValueError(
+            f"Head '{head_name}' metadata has {len(metadata)} tracks, "
+            f"expected {head_config.num_tracks}."
+        )
+    return {organism: metadata for organism in dna_client.Organism}
+
+
 class _PredictionsDict:
     """Wrapper for predictions that allows mixing OutputType enum keys with string keys.
 
@@ -377,14 +407,61 @@ class CustomAlphaGenomeModel:
             entry = self._head_configs[head_name]
             if entry.source == 'predefined':
                 head_config = entry.config
-                head_metadata = {
-                    organism: output_metadata.get(head_config.output_type)
-                    for organism, output_metadata in self._output_metadata_by_organism.items()
-                }
+                head_metadata = _resolve_user_metadata(
+                    head_name=head_name,
+                    head_config=head_config,
+                ) or {}
                 head = custom_heads_module.create_predefined_head_from_config(
                     head_config,
                     metadata=head_metadata,
                 )
+                if not isinstance(batch, Mapping):
+                    raise TypeError(
+                        f"Expected batch mapping for head '{head_name}', got {type(batch)!r}."
+                    )
+                # Build a minimal DataBatch for GenomeTracksHead loss.
+                from alphagenome_research.model import schemas
+                from alphagenome_research.io import bundles as bundles_lib
+                import jax.numpy as jnp
+
+                if 'targets' not in batch or 'organism_index' not in batch:
+                    raise ValueError(
+                        f"Batch for head '{head_name}' must include 'targets' "
+                        "and 'organism_index'."
+                    )
+                targets = batch['targets']
+                organism_index = batch['organism_index']
+                if not hasattr(head_config, 'bundle') or head_config.bundle is None:
+                    raise ValueError(
+                        f"Predefined head '{head_name}' is missing bundle info."
+                    )
+                bundle = head_config.bundle
+                mask = jnp.ones(
+                    (targets.shape[0], 1, targets.shape[-1]), dtype=bool
+                )
+
+                data_kwargs: dict[str, Any] = {
+                    'organism_index': organism_index,
+                }
+                if bundle == bundles_lib.BundleName.ATAC:
+                    data_kwargs.update(atac=targets, atac_mask=mask)
+                elif bundle == bundles_lib.BundleName.RNA_SEQ:
+                    data_kwargs.update(rna_seq=targets, rna_seq_mask=mask)
+                elif bundle == bundles_lib.BundleName.DNASE:
+                    data_kwargs.update(dnase=targets, dnase_mask=mask)
+                elif bundle == bundles_lib.BundleName.PROCAP:
+                    data_kwargs.update(procap=targets, procap_mask=mask)
+                elif bundle == bundles_lib.BundleName.CAGE:
+                    data_kwargs.update(cage=targets, cage_mask=mask)
+                elif bundle == bundles_lib.BundleName.CHIP_TF:
+                    data_kwargs.update(chip_tf=targets, chip_tf_mask=mask)
+                elif bundle == bundles_lib.BundleName.CHIP_HISTONE:
+                    data_kwargs.update(chip_histone=targets, chip_histone_mask=mask)
+                else:
+                    raise ValueError(
+                        f"Unsupported bundle {bundle!r} for head '{head_name}'."
+                    )
+                batch = schemas.DataBatch(**data_kwargs)
             else:
                 head = custom_heads_module.create_custom_head(
                     head_name,
@@ -678,7 +755,8 @@ def create_model_with_heads(
     device: jax.Device | None = None,
     use_encoder_output: bool = False,
     detach_backbone: bool = False,
-    init_seq_len: int = 2**20,
+    include_standard_heads: bool = False,
+    init_seq_len: int = 2**14,
 ) -> CustomAlphaGenomeModel:
     """Create an AlphaGenome model with specified heads replacing standard heads.
 
@@ -698,6 +776,9 @@ def create_model_with_heads(
             before transformer. This enables heads to access raw CNN features.
         detach_backbone: If True, stop gradients at the backbone embeddings so
             heads-only training avoids backprop through the backbone.
+        include_standard_heads: If True, compute the standard pretrained heads
+            in addition to the requested heads. If False, skip standard heads
+            to save compute/memory.
 
     Returns:
         CustomAlphaGenomeModel with requested heads and pretrained backbone.
@@ -821,10 +902,10 @@ def create_model_with_heads(
                             num_organisms=num_organisms,
                         )
                     else:
-                        head_metadata = {
-                            organism: output_metadata.get(head_config.output_type)
-                            for organism, output_metadata in metadata.items()
-                        }
+                        head_metadata = _resolve_user_metadata(
+                            head_name=head_name,
+                            head_config=head_config,
+                        ) or {}
                         head = custom_heads_module.create_predefined_head_from_config(
                             head_config,
                             metadata=head_metadata,
@@ -839,7 +920,8 @@ def create_model_with_heads(
             """Forward pass with requested heads only."""
             # Create AlphaGenome trunk (encoder, transformer, decoder)
             # This will use pretrained params for the backbone
-            alphagenome = model_lib.AlphaGenome(metadata)
+            standard_heads = None if include_standard_heads else ()
+            alphagenome = model_lib.AlphaGenome(metadata, heads=standard_heads)
 
             # Get embeddings from the backbone (without running standard heads)
             # We only need the embeddings, not the standard predictions
@@ -863,10 +945,10 @@ def create_model_with_heads(
                             num_organisms=num_organisms,
                         )
                     else:
-                        head_metadata = {
-                            organism: output_metadata.get(head_config.output_type)
-                            for organism, output_metadata in metadata.items()
-                        }
+                        head_metadata = _resolve_user_metadata(
+                            head_name=head_name,
+                            head_config=head_config,
+                        ) or {}
                         head = custom_heads_module.create_predefined_head_from_config(
                             head_config,
                             metadata=head_metadata,
@@ -958,6 +1040,7 @@ def create_model_with_custom_heads(
     device: jax.Device | None = None,
     use_encoder_output: bool = False,
     detach_backbone: bool = False,
+    include_standard_heads: bool = False,
     init_seq_len: int = 2**20,
 ) -> CustomAlphaGenomeModel:
     """Backward-compatible wrapper for create_model_with_heads()."""
@@ -968,6 +1051,7 @@ def create_model_with_custom_heads(
         device=device,
         use_encoder_output=use_encoder_output,
         detach_backbone=detach_backbone,
+        include_standard_heads=include_standard_heads,
         init_seq_len=init_seq_len,
     )
 
@@ -1074,10 +1158,10 @@ def add_heads_to_model(
                         num_organisms=num_organisms,
                     )
                 else:
-                    head_metadata = {
-                        organism: output_metadata.get(head_config.output_type)
-                        for organism, output_metadata in metadata.items()
-                    }
+                    head_metadata = _resolve_user_metadata(
+                        head_name=head_name,
+                        head_config=head_config,
+                    ) or {}
                     head = custom_heads_module.create_predefined_head_from_config(
                         head_config,
                         metadata=head_metadata,

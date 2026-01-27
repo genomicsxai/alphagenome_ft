@@ -64,7 +64,7 @@ HeadConfig = CustomHeadConfig
 
 HeadNameLike: TypeAlias = str | enum.Enum
 HeadConfigLike: TypeAlias = PredefinedHeadConfig | CustomHeadConfig
-HeadLike: TypeAlias = predefined_heads.Head | "CustomHead"
+HeadLike: TypeAlias = "predefined_heads.Head | CustomHead"
 HeadFactory: TypeAlias = Callable[[HeadConfigLike, Mapping | None, int], HeadLike]
 
 
@@ -155,6 +155,7 @@ class CustomHead(ABC, hk.Module):
 # Head registries: instance name -> (factory, config).
 _HEAD_REGISTRY: dict[str, HeadFactory] = {}
 _HEAD_CONFIG_REGISTRY: dict[str, HeadConfigLike] = {}
+_HEAD_METADATA_REGISTRY: dict[str, Mapping | None] = {}
 
 
 # --- Normalization and classification helpers ---
@@ -353,6 +354,8 @@ def create_custom_head(
 def register_predefined_head(
     head_name: HeadNameLike,
     config: PredefinedHeadConfig,
+    *,
+    metadata: Mapping | None = None,
 ) -> None:
     """Register a predefined head config under an instance name."""
     normalized_name = normalize_head_name(head_name)
@@ -374,6 +377,13 @@ def register_predefined_head(
 
     _HEAD_REGISTRY[normalized_name] = _predefined_factory
     _HEAD_CONFIG_REGISTRY[normalized_name] = config
+    _HEAD_METADATA_REGISTRY[normalized_name] = metadata
+
+
+def get_registered_head_metadata(head_name: HeadNameLike) -> Mapping | None:
+    """Get optional metadata for a registered head."""
+    normalized = normalize_head_name(head_name)
+    return _HEAD_METADATA_REGISTRY.get(normalized)
 
 
 def get_predefined_head_config(
