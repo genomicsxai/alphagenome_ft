@@ -6,7 +6,7 @@ from alphagenome_ft.finetune.config import (
     load_targets_config,
     parse_track_list,
     build_head_specs,
-    register_heads,
+    validate_heads,
 )
 from alphagenome_ft.finetune.data import (
     BigWigDataModule,
@@ -21,7 +21,7 @@ __all__ = [
     'load_targets_config',
     'parse_track_list',
     'build_head_specs',
-    'register_heads',
+    'validate_heads',
     'BigWigDataModule',
     'build_interval',
     'load_intervals',
