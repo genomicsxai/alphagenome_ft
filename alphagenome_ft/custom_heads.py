@@ -32,11 +32,11 @@ class HeadType(enum.Enum):
 class HeadConfig:
     """Configuration for a prediction head."""
     type: HeadType
-    # Optional Haiku module name for the head. If None, the registry key
-    # (head_name) will be used as the module name when constructing the head.
-    name: str | None = None
     output_type: dna_output.OutputType
     num_tracks: int
+    # Optional: Haiku module name for the head. If None, the registry key
+    # (head_name) will be used as the module name when constructing the head.
+    name: str | None = None
     metadata: Mapping | None = None
 
 
