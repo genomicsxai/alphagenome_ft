@@ -36,8 +36,6 @@ try:
 except ImportError:  # pragma: no cover - handled at runtime
     yaml = None
 
-import dataclasses
-
 from alphagenome.models import dna_output
 from alphagenome_research.model import heads as predefined_heads
 
