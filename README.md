@@ -37,7 +37,35 @@ pip install git+https://github.com/google-deepmind/alphagenome_research.git
 
 ## Quick Start
 
-### Using Template Heads (Recommended for starting out)
+### Using a Predefined AlphaGenome Head
+
+You can reuse the predefined head kinds from `alphagenome_research` without importing
+`HeadName` by passing the string value. Supported strings are:
+`atac`, `dnase`, `procap`, `cage`, `rna_seq`, `chip_tf`, `chip_histone`, `contact_maps`,
+`splice_sites_classification`, `splice_sites_usage`, `splice_sites_junction`.
+
+```python
+from alphagenome_ft import (
+    get_predefined_head_config,
+    register_predefined_head,
+    create_model_with_heads,
+)
+
+# 1. Build a predefined head config (num_tracks must match your targets)
+rna_config = get_predefined_head_config(
+    "rna_seq",
+    num_tracks=4,
+)
+
+# 2. Register it under an instance name you will train
+register_predefined_head("K562_rna_seq", rna_config)
+
+# 3. Create a model that uses the registered instance
+model = create_model_with_heads("all_folds", heads=["rna_seq_ft"])
+model.freeze_except_head("rna_seq_ft")
+```
+
+### Using Template Heads
 
 We provide ready-to-use template heads for common scenarios:
 
@@ -46,18 +74,18 @@ from alphagenome.models import dna_output
 from alphagenome_research.model import dna_model
 from alphagenome_ft import (
     templates,
-    HeadConfig,
-    HeadType,
+    CustomHeadConfig,
+    CustomHeadType,
     register_custom_head,
-    create_model_with_custom_heads,
+    create_model_with_heads,
 )
 
 # 1. Register a template head (modify class for your task)
 register_custom_head(
     'my_head',
     templates.StandardHead,  # Choose template: StandardHead, TransformerHead, EncoderOnlyHead
-    HeadConfig(
-        type=HeadType.GENOME_TRACKS,
+    CustomHeadConfig(
+        type=CustomHeadType.GENOME_TRACKS,
         name='my_head',
         output_type=dna_output.OutputType.RNA_SEQ,
         num_tracks=1,
@@ -65,9 +93,9 @@ register_custom_head(
 )
 
 # 2. Create model with custom head
-model = create_model_with_custom_heads(
+model = create_model_with_heads(
     'all_folds',
-    custom_heads=['my_head'],
+    heads=['my_head'],
 )
 
 # 3. Freeze backbone for finetuning
@@ -89,7 +117,13 @@ If you want to **keep the standard AlphaGenome heads** (ATAC, RNA-seq, etc.) and
 
 ```python
 from alphagenome_research.model import dna_model
-from alphagenome_ft import templates, HeadConfig, HeadType, register_custom_head, add_custom_heads_to_model
+from alphagenome_ft import (
+    templates,
+    CustomHeadConfig,
+    CustomHeadType,
+    register_custom_head,
+    add_heads_to_model,
+)
 
 # 1. Load pretrained model (includes standard heads)
 base_model = dna_model.create_from_kaggle('all_folds')
@@ -98,8 +132,8 @@ base_model = dna_model.create_from_kaggle('all_folds')
 register_custom_head(
     'my_head',
     templates.StandardHead,
-    HeadConfig(
-        type=HeadType.GENOME_TRACKS,
+    CustomHeadConfig(
+        type=CustomHeadType.GENOME_TRACKS,
         name='my_head',
         output_type=dna_output.OutputType.RNA_SEQ,
         num_tracks=1,
@@ -107,7 +141,7 @@ register_custom_head(
 )
 
 # 3. Add custom head to model (keeps ALL standard heads)
-model = add_custom_heads_to_model(base_model, custom_heads=['my_head'])
+model = add_heads_to_model(base_model, heads=['my_head'])
 
 # 4. Freeze backbone + standard heads, train only custom head
 model.freeze_except_head('my_head')
@@ -117,8 +151,8 @@ loss_fn = model.create_loss_fn_for_head('my_head')
 ```
 
 **When to use each approach:**
-- `create_model_with_custom_heads()` - Custom heads **only** (faster, smaller)
-- `add_custom_heads_to_model()` - Custom heads **+ standard heads** (useful for multi-task)
+- `create_model_with_heads()` - Heads **only** (faster, smaller)
+- `add_heads_to_model()` - Added heads **+ standard heads** (useful for multi-task)
 
 ### Custom Head from Scratch
 
@@ -132,23 +166,23 @@ from alphagenome_ft import CustomHead
 
 class MyCustomHead(CustomHead):
     """Your custom prediction head."""
-    
+
     def predict(self, embeddings, organism_index, **kwargs):
         # Get embeddings at desired resolution
         x = embeddings.get_sequence_embeddings(resolution=1)  # or 128
-        
+
         # Add your prediction layers
         x = hk.Linear(256, name='hidden')(x)
         x = jax.nn.relu(x)
         predictions = hk.Linear(self._num_tracks, name='output')(x)
-        
+
         return predictions
-    
+
     def loss(self, predictions, batch):
         targets = batch.get('targets')
         if targets is None:
             return {'loss': jnp.array(0.0)}
-        
+
         mse = jnp.mean((predictions - targets) ** 2)
         return {'loss': mse, 'mse': mse}
 
@@ -206,7 +240,7 @@ class MyHead(templates.StandardHead):
 # Or use template directly:
 register_custom_head('my_head', templates.StandardHead, config)
 
-model = create_model_with_custom_heads('all_folds', custom_heads=['my_head'])
+model = create_model_with_heads('all_folds', heads=['my_head'])
 ```
 
 ### Type 2: Transformer Head (128bp Resolution)
@@ -219,7 +253,7 @@ model = create_model_with_custom_heads('all_folds', custom_heads=['my_head'])
 
 ```python
 register_custom_head('my_head', templates.TransformerHead, config)
-model = create_model_with_custom_heads('all_folds', custom_heads=['my_head'])
+model = create_model_with_heads('all_folds', heads=['my_head'])
 ```
 
 ### Type 3: Encoder-Only Head (For Short Sequences)
@@ -234,9 +268,9 @@ model = create_model_with_custom_heads('all_folds', custom_heads=['my_head'])
 register_custom_head('my_head', templates.EncoderOnlyHead, config)
 
 # IMPORTANT: Must use use_encoder_output=True for short sequences
-model = create_model_with_custom_heads(
+model = create_model_with_heads(
     'all_folds',
-    custom_heads=['my_head'],
+    heads=['my_head'],
     use_encoder_output=True,  # ← Required for encoder-only mode
 )
 ```
@@ -276,24 +310,18 @@ x_encoder = embeddings.encoder_output
 ### Example 1: ChIP-seq Peak Prediction (Standard Head)
 
 ```python
-from alphagenome.models import dna_output
-from alphagenome_research.model import dna_model
-from alphagenome_ft import templates, HeadConfig, HeadType, register_custom_head, create_model_with_custom_heads
-
-# Register head
-register_custom_head(
-    'chipseq_head',
-    templates.StandardHead,  # 1bp resolution
-    HeadConfig(
-        type=HeadType.GENOME_TRACKS,
-        name='chipseq_head',
-        output_type=dna_output.OutputType.ATAC,
-        num_tracks=1,
-    )
+from alphagenome_ft import (
+    get_predefined_head_config,
+    register_predefined_head,
+    create_model_with_heads,
 )
 
+# Build and register a predefined ChIP head (num_tracks must match targets)
+chip_config = get_predefined_head_config("chip_tf", num_tracks=1)
+register_predefined_head("chipseq_head", chip_config)
+
 # Create model
-model = create_model_with_custom_heads('all_folds', custom_heads=['chipseq_head'])
+model = create_model_with_heads('all_folds', heads=['chipseq_head'])
 model.freeze_except_head('chipseq_head')
 
 # Now train on your ChIP-seq data!
@@ -302,19 +330,17 @@ model.freeze_except_head('chipseq_head')
 ### Example 2: Gene Expression Prediction (Transformer Head)
 
 ```python
-# Register head for gene expression (operates at 128bp resolution)
-register_custom_head(
-    'expression_head',
-    templates.TransformerHead,  # 128bp resolution, global context
-    HeadConfig(
-        type=HeadType.GENOME_TRACKS,
-        name='expression_head',
-        output_type=dna_output.OutputType.RNA_SEQ,
-        num_tracks=1,
-    )
+from alphagenome_ft import (
+    get_predefined_head_config,
+    register_predefined_head,
+    create_model_with_heads,
 )
 
-model = create_model_with_custom_heads('all_folds', custom_heads=['expression_head'])
+# Build and register a predefined RNA-seq head (num_tracks must match targets)
+rna_config = get_predefined_head_config("rna_seq", num_tracks=1)
+register_predefined_head("expression_head", rna_config)
+
+model = create_model_with_heads('all_folds', heads=['expression_head'])
 model.freeze_except_head('expression_head')
 ```
 
@@ -325,8 +351,8 @@ model.freeze_except_head('expression_head')
 register_custom_head(
     'mpra_head',
     templates.EncoderOnlyHead,  # Encoder only (no transformer/decoder)
-    HeadConfig(
-        type=HeadType.GENOME_TRACKS,
+    CustomHeadConfig(
+        type=CustomHeadType.GENOME_TRACKS,
         name='mpra_head',
         output_type=dna_output.OutputType.RNA_SEQ,
         num_tracks=1,
@@ -334,9 +360,9 @@ register_custom_head(
 )
 
 # CRITICAL: use_encoder_output=True for short sequences
-model = create_model_with_custom_heads(
+model = create_model_with_heads(
     'all_folds',
-    custom_heads=['mpra_head'],
+    heads=['mpra_head'],
     use_encoder_output=True,  # ← Skips transformer/decoder
 )
 model.freeze_except_head('mpra_head')
@@ -354,27 +380,27 @@ from alphagenome_ft import CustomHead
 
 class AttentionPoolingHead(CustomHead):
     """Custom head with attention-based pooling."""
-    
+
     def predict(self, embeddings, organism_index, **kwargs):
         x = embeddings.get_sequence_embeddings(resolution=1)
-        
+
         # Attention pooling
         query = hk.Linear(256, name='query')(x)
         key = hk.Linear(256, name='key')(x)
         value = hk.Linear(256, name='value')(x)
-        
+
         # Compute attention scores
         scores = jnp.matmul(query, key.transpose((0, 2, 1)))
         scores = scores / jnp.sqrt(256)
         attn_weights = jax.nn.softmax(scores, axis=-1)
-        
+
         # Apply attention
         x = jnp.matmul(attn_weights, value)
-        
+
         # Output
         predictions = hk.Linear(self._num_tracks, name='output')(x)
         return predictions
-    
+
     def loss(self, predictions, batch):
         targets = batch.get('targets')
         if targets is None:
@@ -384,7 +410,7 @@ class AttentionPoolingHead(CustomHead):
 
 # Register and use
 register_custom_head('attention_head', AttentionPoolingHead, config)
-model = create_model_with_custom_heads('all_folds', custom_heads=['attention_head'])
+model = create_model_with_heads('all_folds', heads=['attention_head'])
 ```
 
 ## API Reference
@@ -395,26 +421,26 @@ model = create_model_with_custom_heads('all_folds', custom_heads=['attention_hea
 class CustomHead:
     def predict(self, embeddings, organism_index, **kwargs):
         """Generate predictions from embeddings.
-        
+
         Args:
             embeddings: Multi-resolution embeddings object with methods:
                 - get_sequence_embeddings(resolution=1)   # 1bp resolution
                 - get_sequence_embeddings(resolution=128) # 128bp resolution
                 - get_pair_embeddings()                   # Pairwise embeddings
             organism_index: (B,) array of organism indices
-            
+
         Returns:
             dict: Must contain 'predictions' key
         """
         raise NotImplementedError
-    
+
     def loss(self, predictions, batch):
         """Compute loss for predictions.
-        
+
         Args:
             predictions: Output from predict()
             batch: dict with 'targets' and other training data
-            
+
         Returns:
             dict: Must contain 'loss' key, can include other metrics
         """
@@ -449,7 +475,7 @@ import jax
 import jax.numpy as jnp
 
 # Create model with custom head
-model = create_model_with_custom_heads('all_folds', custom_heads=['my_head'])
+model = create_model_with_heads('all_folds', heads=['my_head'])
 model.freeze_except_head('my_head')
 
 # Create a loss function for your head (do this ONCE before training)
@@ -468,21 +494,21 @@ def train_step(model, batch, optimizer_state):
             negative_strand_mask=jnp.zeros(len(batch['sequences']), dtype=bool),
             strand_reindexing=model._metadata[Organism.HOMO_SAPIENS].strand_reindexing,
         )
-        
+
         # Get predictions for our custom head
         head_predictions = predictions['my_head']
-        
+
         # Compute loss using the head's loss function
         loss_dict = loss_fn(head_predictions, batch)  # ← Uses head's loss() method
         return loss_dict['loss']
-    
+
     # Compute gradients
     loss, grads = jax.value_and_grad(loss_fn_inner)(model._params)
-    
+
     # Update parameters with optimizer
     updates, optimizer_state = optimizer.update(grads, optimizer_state)
     model._params = optax.apply_updates(model._params, updates)
-    
+
     return loss, optimizer_state
 
 # Train
@@ -617,4 +643,3 @@ Contributions welcome! Please:
 MIT License - see [LICENSE](LICENSE) file for details.
 
 This project extends [AlphaGenome](https://github.com/google-deepmind/alphagenome_research/), which has its own license terms.
-
