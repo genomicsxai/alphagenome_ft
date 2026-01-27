@@ -36,11 +36,9 @@ try:
 except ImportError:  # pragma: no cover - handled at runtime
     yaml = None
 
-from alphagenome.models import dna_output
-from alphagenome_research.model import heads as predefined_heads
-
 from alphagenome_ft import (
     get_custom_head_config,
+    get_predefined_head_config,
     is_custom_head,
     is_predefined_head,
     normalize_head_name,
@@ -156,15 +154,21 @@ def build_head_specs(targets_config: Path) -> list[HeadSpec]:
                 raise ValueError(
                     f'Unknown predefined head kind "{kind_name}".'
                 )
-            kind_enum = _normalize_predefined_kind(kind_name)
-            if kind_enum is None:
-                raise ValueError(
-                    f'Unknown predefined head kind "{kind_name}".'
-                )
-            base_config = predefined_heads.get_head_config(kind_enum)
             overrides = dict(config_block)
             overrides.pop('name', None)
-            _validate_predefined_overrides(kind_enum, base_config, overrides)
+            allowed_fields = {
+                'resolutions',
+                'apply_squashing',
+                'embedding_channels',
+                'num_tissues',
+                'num_tracks',
+            }
+            unknown = set(overrides) - allowed_fields
+            if unknown:
+                raise ValueError(
+                    f'Unknown config field(s) for predefined head "{head_name}": '
+                    f'{sorted(unknown)}'
+                )
             if 'num_tracks' in overrides:
                 if int(overrides['num_tracks']) != len(tracks):
                     raise ValueError(
@@ -172,8 +176,14 @@ def build_head_specs(targets_config: Path) -> list[HeadSpec]:
                         f'{overrides["num_tracks"]} does not match targets '
                         f'({len(tracks)}).'
                     )
-            overrides['num_tracks'] = len(tracks)
-            head_config = dataclasses.replace(base_config, **overrides)
+            head_config = get_predefined_head_config(
+                kind_name,
+                num_tracks=len(tracks),
+                resolutions=overrides.get('resolutions'),
+                apply_squashing=overrides.get('apply_squashing'),
+                embedding_channels=overrides.get('embedding_channels'),
+                num_tissues=overrides.get('num_tissues'),
+            )
             specs.append(
                 HeadSpec(
                     head_name=head_name,
@@ -207,51 +217,3 @@ def validate_heads(specs: Sequence[HeadSpec]) -> None:
                 'Register it before loading this config.'
             )
 
-
-def _normalize_predefined_kind(kind_name: Any):
-    if isinstance(kind_name, predefined_heads.HeadName):
-        return kind_name
-    for candidate in predefined_heads.HeadName:
-        if str(kind_name).lower() in {candidate.value.lower(), candidate.name.lower()}:
-            return candidate
-    return None
-
-
-def _validate_predefined_overrides(kind_enum, base_config, overrides: dict[str, Any]) -> None:
-    allowed_fields = {field.name for field in dataclasses.fields(base_config)}
-    unknown = set(overrides) - allowed_fields
-    if unknown:
-        raise ValueError(
-            f'Unknown config field(s) for predefined head "{kind_enum.value}": '
-            f'{sorted(unknown)}'
-        )
-    for field_name, enum_cls in (
-        ('type', predefined_heads.HeadType),
-        ('output_type', dna_output.OutputType),
-    ):
-        if field_name in overrides:
-            overrides[field_name] = _coerce_enum(overrides[field_name], enum_cls)
-            if overrides[field_name] != getattr(base_config, field_name):
-                raise ValueError(
-                    f'Predefined head "{kind_enum.value}" has fixed {field_name}.'
-                )
-    if hasattr(base_config, 'bundle') and 'bundle' in overrides:
-        from alphagenome_research.io import bundles
-        overrides['bundle'] = _coerce_enum(overrides['bundle'], bundles.BundleName)
-        if overrides['bundle'] != getattr(base_config, 'bundle'):
-            raise ValueError(
-                f'Predefined head "{kind_enum.value}" has fixed bundle.'
-            )
-    if 'num_tracks' in overrides:
-        overrides['num_tracks'] = int(overrides['num_tracks'])
-
-
-def _coerce_enum(value: Any, enum_cls):
-    if isinstance(value, enum_cls):
-        return value
-    if isinstance(value, str):
-        try:
-            return enum_cls[value]
-        except KeyError:
-            return enum_cls(value)
-    return enum_cls(value)
