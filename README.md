@@ -100,7 +100,6 @@ register_custom_head(
     templates.StandardHead,
     HeadConfig(
         type=HeadType.GENOME_TRACKS,
-        name='my_head',
         output_type=dna_output.OutputType.RNA_SEQ,
         num_tracks=1,
     )
@@ -286,7 +285,7 @@ register_custom_head(
     templates.StandardHead,  # 1bp resolution
     HeadConfig(
         type=HeadType.GENOME_TRACKS,
-        name='chipseq_head',
+        name='My favourite chipseq assay', #can pass huamn-readable head name to be passed into the actual Haiku module when it’s constructed - different to the registry key
         output_type=dna_output.OutputType.ATAC,
         num_tracks=1,
     )
@@ -308,7 +307,6 @@ register_custom_head(
     templates.TransformerHead,  # 128bp resolution, global context
     HeadConfig(
         type=HeadType.GENOME_TRACKS,
-        name='expression_head',
         output_type=dna_output.OutputType.RNA_SEQ,
         num_tracks=1,
     )
@@ -327,7 +325,6 @@ register_custom_head(
     templates.EncoderOnlyHead,  # Encoder only (no transformer/decoder)
     HeadConfig(
         type=HeadType.GENOME_TRACKS,
-        name='mpra_head',
         output_type=dna_output.OutputType.RNA_SEQ,
         num_tracks=1,
     )

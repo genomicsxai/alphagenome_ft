@@ -32,7 +32,9 @@ class HeadType(enum.Enum):
 class HeadConfig:
     """Configuration for a prediction head."""
     type: HeadType
-    name: str
+    # Optional Haiku module name for the head. If None, the registry key
+    # (head_name) will be used as the module name when constructing the head.
+    name: str | None = None
     output_type: dna_output.OutputType
     num_tracks: int
     metadata: Mapping | None = None
@@ -210,9 +212,10 @@ def create_custom_head(
     
     head_class = _CUSTOM_HEAD_REGISTRY[head_name]
     config = _CUSTOM_HEAD_CONFIG_REGISTRY[head_name]
-    
+    module_name = config.name or head_name
+
     return head_class(
-        name=config.name,
+        name=module_name,
         output_type=config.output_type,
         num_tracks=config.num_tracks,
         num_organisms=num_organisms,
