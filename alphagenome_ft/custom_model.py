@@ -813,9 +813,9 @@ def create_model_with_heads(
             num_organisms = len(metadata)
             with hk.name_scope('head'):
                 for head_name in normalized_heads:
-                    head_config = custom_heads_module.get_head_config(head_name)
+                    head_config = custom_heads_module.get_registered_head_config(head_name)
                     if custom_heads_module.is_custom_config(head_config):
-                        head = custom_heads_module.create_head(
+                        head = custom_heads_module.create_registered_head(
                             head_name,
                             metadata=None,
                             num_organisms=num_organisms,
@@ -855,9 +855,9 @@ def create_model_with_heads(
             num_organisms = len(metadata)
             with hk.name_scope('head'):
                 for head_name in normalized_heads:
-                    head_config = custom_heads_module.get_head_config(head_name)
+                    head_config = custom_heads_module.get_registered_head_config(head_name)
                     if custom_heads_module.is_custom_config(head_config):
-                        head = custom_heads_module.create_head(
+                        head = custom_heads_module.create_registered_head(
                             head_name,
                             metadata=None,
                             num_organisms=num_organisms,
@@ -926,7 +926,7 @@ def create_model_with_heads(
     # Store head configs for loss computation
     head_configs = {}
     for head_name in normalized_heads:
-        config = custom_heads_module.get_head_config(head_name)
+        config = custom_heads_module.get_registered_head_config(head_name)
         source = 'custom' if custom_heads_module.is_custom_config(config) else 'predefined'
         head_configs[head_name] = _HeadConfigEntry(
             source=source,
@@ -1035,7 +1035,7 @@ def add_heads_to_model(
         if not custom_heads_module.is_head_registered(head_name):
             raise ValueError(
                 f"Head '{head_name}' not found. "
-                f"Available heads: {custom_heads_module.list_heads()}"
+                f"Available heads: {custom_heads_module.list_registered_heads()}"
             )
 
     print(f"Adding heads to model: {list(normalized_heads)}")
@@ -1066,9 +1066,9 @@ def add_heads_to_model(
             for head_name in normalized_heads:
                 if head_name in predictions:
                     continue
-                head_config = custom_heads_module.get_head_config(head_name)
+                head_config = custom_heads_module.get_registered_head_config(head_name)
                 if custom_heads_module.is_custom_config(head_config):
-                    head = custom_heads_module.create_head(
+                    head = custom_heads_module.create_registered_head(
                         head_name,
                         metadata=None,
                         num_organisms=num_organisms,
@@ -1137,7 +1137,7 @@ def add_heads_to_model(
     # Store head configs for loss computation
     head_configs = {}
     for head_name in normalized_heads:
-        config = custom_heads_module.get_head_config(head_name)
+        config = custom_heads_module.get_registered_head_config(head_name)
         source = 'custom' if custom_heads_module.is_custom_config(config) else 'predefined'
         head_configs[head_name] = _HeadConfigEntry(
             source=source,
@@ -1272,9 +1272,9 @@ def load_checkpoint(
             head_configs={
                 name: _HeadConfigEntry(
                     source='custom' if custom_heads_module.is_custom_config(
-                        custom_heads_module.get_head_config(name)
+                        custom_heads_module.get_registered_head_config(name)
                     ) else 'predefined',
-                    config=custom_heads_module.get_head_config(name),
+                    config=custom_heads_module.get_registered_head_config(name),
                 )
                 for name in custom_heads
             },

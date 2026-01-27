@@ -6,10 +6,10 @@ Provides base classes and utilities for defining and registering custom predicti
 Main functions:
 - `register_custom_head`: Register a custom head class and config.
 - `register_predefined_head`: Register a predefined head config.
-- `create_head`: Instantiate a registered head by name.
+- `create_registered_head`: Instantiate a registered head by name.
 - `list_registered_heads`: List all heads registered by the user.
 - `list_predefined_heads`: List predefined head kinds.
-- `get_head_config`: Retrieve the config for a registered head.
+- `get_registered_head_config`: Retrieve the config for a registered head.
 """
 
 from __future__ import annotations
@@ -50,6 +50,7 @@ class CustomHeadConfig:
     """Configuration for a custom prediction head."""
     type: CustomHeadType
     output_type: dna_output.OutputType
+    num_tracks: int
     # Optional: Haiku module name for the head. If None, the registry key
     # ``head_name`` will be used as the module name when constructing the head.
     name: str | None = None
@@ -217,7 +218,7 @@ def is_head_registered(head_name: HeadNameLike) -> bool:
     return normalized in _HEAD_CONFIG_REGISTRY
 
 
-def get_head_config(head_name: HeadNameLike) -> HeadConfigLike:
+def get_registered_head_config(head_name: HeadNameLike) -> HeadConfigLike:
     """Get configuration for a registered head."""
     normalized = normalize_head_name(head_name)
     if normalized not in _HEAD_CONFIG_REGISTRY:
@@ -228,7 +229,7 @@ def get_head_config(head_name: HeadNameLike) -> HeadConfigLike:
     return _HEAD_CONFIG_REGISTRY[normalized]
 
 
-def create_head(
+def create_registered_head(
     head_name: HeadNameLike,
     *,
     metadata: Mapping | None = None,
@@ -241,7 +242,7 @@ def create_head(
             f"Head '{head_name}' is not registered. "
             f"Available heads: {list_registered_heads()}"
         )
-    config = get_head_config(normalized)
+    config = get_registered_head_config(normalized)
     factory = _HEAD_REGISTRY[normalized]
     return factory(config, metadata, num_organisms)
 
@@ -273,11 +274,12 @@ def register_custom_head(
         )
         ```
     """
-    if head_name in _HEAD_REGISTRY:
-        print(f"Warning: Overwriting existing custom head '{head_name}'")
+    normalized_name = normalize_head_name(head_name)
+    if normalized_name in _HEAD_REGISTRY:
+        print(f"Warning: Overwriting existing custom head '{normalized_name}'")
 
     if not head_config.name:
-        head_config = replace(head_config, name=head_name)
+        head_config = replace(head_config, name=normalized_name)
 
     def _custom_factory(
         config: HeadConfigLike,
@@ -286,7 +288,7 @@ def register_custom_head(
     ) -> HeadLike:
         if not isinstance(config, CustomHeadConfig):
             raise TypeError(
-                f"Expected custom head config for '{head_name}', got {type(config)!r}."
+                f"Expected custom head config for '{normalized_name}', got {type(config)!r}."
             )
         return head_class(
             name=config.name,
@@ -296,8 +298,8 @@ def register_custom_head(
             metadata=metadata or config.metadata,
         )
 
-    _HEAD_REGISTRY[head_name] = _custom_factory
-    _HEAD_CONFIG_REGISTRY[head_name] = head_config
+    _HEAD_REGISTRY[normalized_name] = _custom_factory
+    _HEAD_CONFIG_REGISTRY[normalized_name] = head_config
 
 
 def get_custom_head_config(head_name: str) -> CustomHeadConfig | None:
@@ -335,7 +337,11 @@ def create_custom_head(
             f"Custom head '{head_name}' not registered. "
             f"Available custom heads: {list_custom_heads()}"
         )
-    head = create_head(head_name, metadata=metadata, num_organisms=num_organisms)
+    head = create_registered_head(
+        head_name,
+        metadata=metadata,
+        num_organisms=num_organisms,
+    )
     if not isinstance(head, CustomHead):
         raise TypeError(
             f"Head '{head_name}' resolved to a predefined head, not a custom head."
@@ -370,12 +376,37 @@ def register_predefined_head(
     _HEAD_CONFIG_REGISTRY[normalized_name] = config
 
 
-def get_predefined_head_config(head_name: HeadNameLike) -> PredefinedHeadConfig:
-    """Get a registered predefined head config for an instance name."""
-    config = get_head_config(head_name)
-    if isinstance(config, CustomHeadConfig):
-        raise ValueError(f"Head '{head_name}' is a custom head, not predefined.")
-    return config
+def get_predefined_head_config(
+    head_name: HeadNameLike,
+    *,
+    num_tracks: int,
+    resolutions: list[int] | None = None,
+    apply_squashing: bool | None = None,
+    embedding_channels: int | None = None,
+    num_tissues: int | None = None,
+) -> PredefinedHeadConfig:
+    """Build a predefined head config with required num_tracks and safe overrides."""
+    kind_enum = _normalize_predefined_head_name(head_name)
+    if kind_enum is None:
+        raise ValueError(f"Head '{head_name}' is not a predefined head.")
+    base_config = predefined_heads.get_head_config(kind_enum)
+    overrides: dict[str, Any] = {"num_tracks": int(num_tracks)}
+
+    def _maybe_override(field: str, value: Any) -> None:
+        if value is None:
+            return
+        if not hasattr(base_config, field):
+            raise ValueError(
+                f'Predefined head "{kind_enum.value}" does not support "{field}".'
+            )
+        overrides[field] = value
+
+    _maybe_override("resolutions", list(resolutions) if resolutions is not None else None)
+    _maybe_override("apply_squashing", apply_squashing)
+    _maybe_override("embedding_channels", embedding_channels)
+    _maybe_override("num_tissues", num_tissues)
+
+    return replace(base_config, **overrides)
 
 
 def deserialize_predefined_head_config(
@@ -442,7 +473,11 @@ def create_predefined_head(
     num_organisms: int = _NUM_ORGANISMS,
 ) -> predefined_heads.Head:
     """Instantiate a predefined head using a registered config."""
-    head = create_head(head_name, metadata=metadata, num_organisms=num_organisms)
+    head = create_registered_head(
+        head_name,
+        metadata=metadata,
+        num_organisms=num_organisms,
+    )
     if not isinstance(head, predefined_heads.Head):
         raise TypeError(
             f"Head '{head_name}' resolved to a custom head, not a predefined head."
