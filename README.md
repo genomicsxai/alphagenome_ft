@@ -102,6 +102,16 @@ model = create_model_with_heads(
 model.freeze_except_head('my_head')
 ```
 
+Note if you have a local AlphaGenome weights version you want to use instead of getting the weights from Kaggle use:
+
+```
+model = create_model_with_custom_heads(
+    'all_folds',
+    custom_heads=['my_head'],
+    checkpoint_path="full/path/to/weights",
+)
+```
+
 **Available Templates:**
 - `templates.StandardHead` - Uses 1bp embeddings (decoder output: local + global features)
 - `templates.TransformerHead` - Uses 128bp embeddings (transformer output: pure attention)

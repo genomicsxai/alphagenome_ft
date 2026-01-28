@@ -753,6 +753,7 @@ def create_model_with_heads(
     heads: Sequence[Any],
     organism_settings: Mapping[dna_model.Organism, Any] | None = None,
     device: jax.Device | None = None,
+    checkpoint_path: str | os.PathLike[str] | None = None,
     use_encoder_output: bool = False,
     detach_backbone: bool = False,
     include_standard_heads: bool = False,
@@ -772,6 +773,9 @@ def create_model_with_heads(
         heads: List of head names (custom or predefined; custom must be registered).
         organism_settings: Optional organism settings.
         device: Optional JAX device.
+        checkpoint_path: Optional local checkpoint directory path. If provided,
+            the model will be loaded from this path using dna_model.create and
+            Kaggle will not be used.
         use_encoder_output: If True, use custom forward pass that provides encoder output
             before transformer. This enables heads to access raw CNN features.
         detach_backbone: If True, stop gradients at the backbone embeddings so
@@ -831,11 +835,19 @@ def create_model_with_heads(
 
     # Load pretrained model
     print("Loading pretrained AlphaGenome model...")
-    base_model = dna_model.create_from_kaggle(
-        model_version,
-        organism_settings=organism_settings,
-        device=device,
-    )
+    if checkpoint_path is not None:
+        print(f"  Using local checkpoint at: {checkpoint_path}")
+        base_model = dna_model.create(
+            checkpoint_path,
+            organism_settings=organism_settings,
+            device=device,
+        )
+    else:
+        base_model = dna_model.create_from_kaggle(
+            model_version,
+            organism_settings=organism_settings,
+            device=device,
+        )
     print("✓ Pretrained model loaded")
 
     # Get metadata
@@ -1258,6 +1270,7 @@ def load_checkpoint(
     base_model_version: str | dna_model.ModelVersion = 'all_folds',
     organism_settings: Mapping[dna_model.Organism, Any] | None = None,
     device: jax.Device | None = None,
+    base_checkpoint_path: str | os.PathLike[str] | None = None,
 ) -> CustomAlphaGenomeModel:
     """Load a saved head checkpoint.
 
@@ -1269,6 +1282,10 @@ def load_checkpoint(
         base_model_version: Base model version to use (only needed for heads-only checkpoints).
         organism_settings: Optional organism settings.
         device: Optional JAX device.
+
+        base_checkpoint_path: Optional local checkpoint directory for the base
+            AlphaGenome model. If provided, Kaggle will not be used when
+            instantiating the base model.
 
     Returns:
         CustomAlphaGenomeModel with loaded parameters.
@@ -1347,6 +1364,20 @@ def load_checkpoint(
             device=device,
         )
 
+        if base_checkpoint_path is not None:
+            print(f"  Using local base checkpoint at: {base_checkpoint_path}")
+            base_model = dna_model.create(
+                base_checkpoint_path,
+                organism_settings=organism_settings,
+                device=device,
+            )
+        else:
+            base_model = dna_model.create_from_kaggle(
+                base_model_version,
+                organism_settings=organism_settings,
+                device=device,
+            )
+
         # Create custom model with loaded parameters
         custom_model = CustomAlphaGenomeModel(
             base_model,
@@ -1377,6 +1408,7 @@ def load_checkpoint(
             heads=custom_heads,
             organism_settings=organism_settings,
             device=device,
+            checkpoint_path=base_checkpoint_path,
             use_encoder_output=use_encoder_output,
         )
 

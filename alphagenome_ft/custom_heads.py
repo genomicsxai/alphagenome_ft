@@ -338,6 +338,7 @@ def create_custom_head(
             f"Custom head '{head_name}' not registered. "
             f"Available custom heads: {list_custom_heads()}"
         )
+
     head = create_registered_head(
         head_name,
         metadata=metadata,
