@@ -289,6 +289,24 @@ def get_backbone_parameter_paths(params: PyTree) -> list[str]:
     ]
 
 
+def get_encoder_parameter_paths(params: PyTree) -> list[str]:
+    """Get all encoder parameter paths (sequence_encoder only, not transformer/decoder).
+    
+    Args:
+        params: Parameter tree to inspect.
+        
+    Returns:
+        List of encoder parameter paths.
+    """
+    all_paths = get_parameter_paths(params)
+    return [
+        p for p in all_paths
+        if 'sequence_encoder' in p 
+        and 'transformer_tower' not in p 
+        and 'sequence_decoder' not in p
+    ]
+
+
 def get_other_parameter_paths(params: PyTree) -> list[str]:
     """Get all non-backbone, non-head parameter paths.
     

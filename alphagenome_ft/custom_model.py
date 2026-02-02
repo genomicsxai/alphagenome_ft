@@ -386,21 +386,29 @@ class CustomAlphaGenomeModel:
         checkpoint_dir: str | Path,
         *,
         save_full_model: bool = False,
+        save_minimal_model: bool = False,
     ) -> None:
         """Save custom head parameters and configuration.
         
         By default, only saves the custom head parameters (efficient for finetuning).
-        Optionally can save the full model including backbone parameters.
+        Optionally can save the full model including backbone parameters, or a minimal
+        model with only encoder + custom heads (skips transformer/decoder).
         
         Args:
             checkpoint_dir: Directory to save checkpoint files.
             save_full_model: If True, saves all parameters including backbone.
                 If False (default), only saves custom head parameters.
+            save_minimal_model: If True, saves encoder + custom head parameters only
+                (skips transformer and decoder to save disk space). Only works when
+                use_encoder_output=True was used to create the model.
                 
         Example:
             ```python
             # After training
             model.save_checkpoint('checkpoints/my_model')
+            
+            # Save minimal model (encoder + heads only)
+            model.save_checkpoint('checkpoints/my_model', save_minimal_model=True)
             
             # Later, load the checkpoint
             model = load_checkpoint(
@@ -411,6 +419,10 @@ class CustomAlphaGenomeModel:
         """
         checkpoint_dir = Path(checkpoint_dir)
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Validate save options
+        if save_full_model and save_minimal_model:
+            raise ValueError("Cannot set both save_full_model=True and save_minimal_model=True")
         
         # Save metadata about the checkpoint
         metadata = {
@@ -426,6 +438,7 @@ class CustomAlphaGenomeModel:
                 for name, config in self._head_configs.items()
             },
             'save_full_model': save_full_model,
+            'save_minimal_model': save_minimal_model,
         }
         
         with open(checkpoint_dir / 'config.json', 'w') as f:
@@ -436,6 +449,90 @@ class CustomAlphaGenomeModel:
             # Save all parameters
             params_to_save = self._params
             state_to_save = self._state
+        elif save_minimal_model:
+            # Save only encoder + custom head parameters (skip transformer/decoder)
+            params_to_save = {}
+            state_to_save = {}
+            
+            # Helper function to recursively extract parameters matching a condition
+            def extract_matching(params_dict, condition_fn, result_dict, current_path=""):
+                """Recursively extract parameters matching a condition."""
+                if isinstance(params_dict, dict):
+                    for key, value in params_dict.items():
+                        key_str = str(key)
+                        full_path = f"{current_path}/{key_str}" if current_path else key_str
+                        
+                        if condition_fn(full_path, key_str):
+                            # This parameter matches - add it to result
+                            if current_path:
+                                # Need to reconstruct nested path
+                                parts = current_path.split('/')
+                                target = result_dict
+                                for part in parts:
+                                    if part and part not in target:
+                                        target[part] = {}
+                                    if part:
+                                        target = target[part]
+                                target[key] = value
+                            else:
+                                result_dict[key] = value
+                        elif isinstance(value, dict):
+                            # Recurse into nested dict
+                            new_path = full_path
+                            extract_matching(value, condition_fn, result_dict, new_path)
+            
+            # Condition: keep encoder parameters (sequence_encoder) but not transformer/decoder
+            def is_encoder_or_custom_head(path_str, key_str):
+                # Check for encoder
+                if 'sequence_encoder' in path_str and 'transformer_tower' not in path_str and 'sequence_decoder' not in path_str:
+                    return True
+                # Check for custom heads
+                for head_name in self._custom_heads:
+                    if head_name in path_str or head_name in key_str:
+                        return True
+                return False
+            
+            # Extract parameters
+            extract_matching(self._params, is_encoder_or_custom_head, params_to_save)
+            if self._state:
+                extract_matching(self._state, is_encoder_or_custom_head, state_to_save)
+            
+            # Also handle the common nested structure explicitly
+            if 'alphagenome' in self._params and isinstance(self._params['alphagenome'], dict):
+                if 'sequence_encoder' in self._params['alphagenome']:
+                    if 'alphagenome' not in params_to_save:
+                        params_to_save['alphagenome'] = {}
+                    params_to_save['alphagenome']['sequence_encoder'] = \
+                        self._params['alphagenome']['sequence_encoder']
+                
+                # Extract custom heads
+                if 'head' in self._params['alphagenome']:
+                    for head_name in self._custom_heads:
+                        if head_name in self._params['alphagenome']['head']:
+                            if 'alphagenome' not in params_to_save:
+                                params_to_save['alphagenome'] = {}
+                            if 'head' not in params_to_save['alphagenome']:
+                                params_to_save['alphagenome']['head'] = {}
+                            params_to_save['alphagenome']['head'][head_name] = \
+                                self._params['alphagenome']['head'][head_name]
+            
+            # Same for state
+            if self._state and 'alphagenome' in self._state and isinstance(self._state['alphagenome'], dict):
+                if 'sequence_encoder' in self._state['alphagenome']:
+                    if 'alphagenome' not in state_to_save:
+                        state_to_save['alphagenome'] = {}
+                    state_to_save['alphagenome']['sequence_encoder'] = \
+                        self._state['alphagenome']['sequence_encoder']
+                
+                if 'head' in self._state['alphagenome']:
+                    for head_name in self._custom_heads:
+                        if head_name in self._state['alphagenome']['head']:
+                            if 'alphagenome' not in state_to_save:
+                                state_to_save['alphagenome'] = {}
+                            if 'head' not in state_to_save['alphagenome']:
+                                state_to_save['alphagenome']['head'] = {}
+                            state_to_save['alphagenome']['head'][head_name] = \
+                                self._state['alphagenome']['head'][head_name]
         else:
             # Only save custom head parameters
             params_to_save = {}
@@ -518,7 +615,9 @@ class CustomAlphaGenomeModel:
         
         print(f"✓ Checkpoint saved to {checkpoint_dir}")
         if save_full_model:
-            print("  Saved: Full model (backbone + custom heads)")
+            print("  Saved: Full model (encoder + transformer + decoder + custom heads)")
+        elif save_minimal_model:
+            print("  Saved: Minimal model (encoder + custom heads only, no transformer/decoder)")
         else:
             print(f"  Saved: Custom heads only {self._custom_heads}")
     
@@ -1097,7 +1196,8 @@ def load_checkpoint(
         config = json.load(f)
     
     custom_heads = config['custom_heads']
-    save_full_model = config['save_full_model']
+    save_full_model = config.get('save_full_model', False)
+    save_minimal_model = config.get('save_minimal_model', False)
     
     # Re-register custom heads from config
     from . import custom_heads as custom_heads_module
@@ -1106,7 +1206,12 @@ def load_checkpoint(
     
     print(f"Loading checkpoint from {checkpoint_dir}")
     print(f"  Custom heads: {custom_heads}")
-    print(f"  Full model: {save_full_model}")
+    if save_minimal_model:
+        print(f"  Model type: Minimal (encoder + heads only)")
+    elif save_full_model:
+        print(f"  Model type: Full model")
+    else:
+        print(f"  Model type: Heads only")
     
     for head_name, head_config_dict in config['head_configs'].items():
         # Check if head is already registered
@@ -1161,6 +1266,77 @@ def load_checkpoint(
                 for name in custom_heads
             },
         )
+    elif save_minimal_model:
+        # Minimal model checkpoint - encoder + custom heads only
+        # Need to load base model and merge encoder + head params
+        print("Loading minimal model from checkpoint (encoder + custom heads only)...")
+        if base_checkpoint_path is not None:
+            print(f"  Using local base checkpoint at: {base_checkpoint_path}")
+            base_model = dna_model.create(
+                base_checkpoint_path,
+                organism_settings=organism_settings,
+                device=device,
+            )
+        else:
+            base_model = dna_model.create_from_kaggle(
+                base_model_version,
+                organism_settings=organism_settings,
+                device=device,
+            )
+        
+        # Merge minimal params (encoder + heads) with base model params
+        # Keep transformer/decoder from base model, use saved encoder + heads
+        def merge_minimal_params(base_params, minimal_params):
+            """Merge minimal params (encoder + heads) into base params."""
+            merged = jax.tree_util.tree_map(lambda x: x, base_params)  # Deep copy
+            
+            # Helper to set nested value
+            def set_nested(d, path_parts, value):
+                current = d
+                for part in path_parts[:-1]:
+                    if part not in current:
+                        current[part] = {}
+                    current = current[part]
+                current[path_parts[-1]] = value
+            
+            # Merge encoder parameters
+            if 'alphagenome' in minimal_params and 'sequence_encoder' in minimal_params['alphagenome']:
+                if 'alphagenome' not in merged:
+                    merged['alphagenome'] = {}
+                merged['alphagenome']['sequence_encoder'] = minimal_params['alphagenome']['sequence_encoder']
+            
+            # Merge custom head parameters
+            if 'alphagenome' in minimal_params and 'head' in minimal_params['alphagenome']:
+                if 'alphagenome' not in merged:
+                    merged['alphagenome'] = {}
+                if 'head' not in merged['alphagenome']:
+                    merged['alphagenome']['head'] = {}
+                for head_name in minimal_params['alphagenome']['head']:
+                    merged['alphagenome']['head'][head_name] = minimal_params['alphagenome']['head'][head_name]
+            
+            # Also handle flat structure
+            for key, value in minimal_params.items():
+                key_str = str(key)
+                if 'sequence_encoder' in key_str or any(head_name in key_str for head_name in custom_heads):
+                    merged[key] = value
+            
+            return merged
+        
+        merged_params = merge_minimal_params(base_model._params, loaded_params)
+        merged_state = merge_minimal_params(base_model._state, loaded_state) if loaded_state else base_model._state
+        
+        # Create custom model with merged parameters
+        custom_model = CustomAlphaGenomeModel(
+            base_model,
+            merged_params,
+            merged_state,
+            custom_heads_list=custom_heads,
+            head_configs={
+                name: custom_heads_module.get_custom_head_config(name)
+                for name in custom_heads
+            },
+        )
+        print("✓ Minimal model loaded (encoder + custom heads, transformer/decoder from base model)")
     else:
         # Heads-only checkpoint - need to merge with base model
         print(f"Loading base model '{base_model_version}'...")
