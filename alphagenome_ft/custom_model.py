@@ -1422,6 +1422,7 @@ class CustomAlphaGenomeModel:
         threshold: float = 0.0,
         logo_type: str = 'information',
         mask_to_sequence: bool = True,
+        use_absolute: bool = False,
     ) -> None:
         """Plot a sequence logo-style visualization of attribution scores using logomaker.
         
@@ -1444,6 +1445,10 @@ class CustomAlphaGenomeModel:
                 show the present nucleotide at each position. This is standard for 
                 DeepSHAP/DeepLIFT logos.
                 Default: True.
+            use_absolute: If True (default), use absolute attribution values for the logo
+                heights (standard magnitudes-only view). If False, keep signed
+                attributions so positive/negative contributions are preserved (useful
+                for DeepSHAP-style signed logos).
         
         Raises:
             ImportError: If matplotlib or logomaker is not installed.
@@ -1517,16 +1522,19 @@ class CustomAlphaGenomeModel:
             grad_np = grad_np * seq_np
         
         # Prepare data for logomaker
-        # Convert gradients/attributions to a DataFrame with columns A, T, C, G
-        # For DeepSHAP and other attribution methods, values can be positive or negative.
-        # For sequence logos, we typically use absolute values to show magnitude of importance.
-        # Alternatively, we could use signed values, but absolute is more standard for logos.
-        grad_abs = np.abs(grad_np)
+        # Convert gradients/attributions to a DataFrame with columns A, T, C, G.
+        # For many attribution use-cases, absolute values are standard to show
+        # magnitude of importance, but some analyses (e.g. DeepSHAP) benefit from
+        # preserving the sign. This is controlled via use_absolute.
+        if use_absolute:
+            values_np = np.abs(grad_np)
+        else:
+            values_np = grad_np
         
         # Create DataFrame for logomaker
         import pandas as pd
         logo_df = pd.DataFrame(
-            grad_abs,
+            values_np,
             columns=['A', 'T', 'C', 'G']
         )
         
