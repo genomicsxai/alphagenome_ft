@@ -358,12 +358,19 @@ def register_predefined_head(
     *,
     metadata: Mapping | None = None,
 ) -> None:
-    """Register a predefined head config under an instance name."""
+    """Register a predefined head config under an instance name.
+
+    The registered ``head_name`` is also used as the Haiku module name so
+    parameter paths consistently include the user-facing alias.
+    """
     normalized_name = normalize_head_name(head_name)
-    if not _normalize_predefined_head_name(config.name):
+    kind_name = _normalize_predefined_head_name(config.name)
+    if kind_name is None and config.name != normalized_name:
         raise ValueError(
-            f"Config name '{config.name}' is not a known predefined head kind."
+            f"Config name '{config.name}' is not a known predefined head kind "
+            f"and does not match registered alias '{normalized_name}'."
         )
+    config_with_alias_name = replace(config, name=normalized_name)
 
     def _predefined_factory(
         cfg: HeadConfigLike,
@@ -377,7 +384,7 @@ def register_predefined_head(
         return predefined_heads.create_head(cfg, metadata)
 
     _HEAD_REGISTRY[normalized_name] = _predefined_factory
-    _HEAD_CONFIG_REGISTRY[normalized_name] = config
+    _HEAD_CONFIG_REGISTRY[normalized_name] = config_with_alias_name
     _HEAD_METADATA_REGISTRY[normalized_name] = metadata
 
 
