@@ -7,6 +7,9 @@ from alphagenome_ft import (
     CustomHead,
     HeadConfig,
     HeadType,
+    get_predefined_head_config,
+    get_registered_head_config,
+    register_predefined_head,
     register_custom_head,
     is_custom_head,
     get_custom_head_config,
@@ -134,4 +137,26 @@ class TestCustomHeadBase:
         
         assert len(custom_head_params) > 0, "Custom head was not properly initialized"
 
+
+class TestPredefinedHeadAliases:
+    """Test predefined head registration with aliases."""
+
+    def test_register_predefined_head_uses_alias_as_name(self):
+        alias = 'test_rna_alias_head'
+        cfg = get_predefined_head_config('rna_seq', num_tracks=2)
+
+        register_predefined_head(alias, cfg)
+        registered = get_registered_head_config(alias)
+
+        assert registered.name == alias
+
+    def test_register_predefined_head_accepts_alias_named_config(self):
+        alias = 'test_atac_alias_head'
+        cfg = get_predefined_head_config('atac', num_tracks=1)
+        cfg = type(cfg)(**{**cfg.__dict__, 'name': alias})
+
+        register_predefined_head(alias, cfg)
+        registered = get_registered_head_config(alias)
+
+        assert registered.name == alias
 
