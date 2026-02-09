@@ -1246,6 +1246,197 @@ class CustomAlphaGenomeModel:
         attributions = jnp.stack(all_attributions)  # (batch, seq_len, 4)
         return attributions
     
+    def compute_ism_attributions(
+        self,
+        sequence: Float[Array, 'B S 4'],
+        organism_index: Int[Array, 'B'],
+        *,
+        head_name: str | None = None,
+        output_index: int | None = None,
+    ) -> Float[Array, 'B S 4']:
+        """Compute ISM (in silico mutagenesis) attributions, returning wildtype-base importance.
+        
+        This method performs in silico mutagenesis by systematically mutating each position
+        to each possible base (A/T/C/G), computing the change in model output, and then
+        collapsing alternative SNP effects back onto the wildtype base at each position.
+        
+        The attribution for the wildtype base at position i is computed as:
+            WT_importance[i] = -mean_{alt != WT} (f(mutate to alt) - f(reference))
+        
+        This means:
+        - If most alternative mutations are deleterious (reduce output), the wildtype
+          gets a positive attribution (it's important for maintaining the prediction).
+        - If alternatives tend to increase output, the wildtype gets a negative attribution
+          (it's disfavored relative to alternatives).
+        
+        Args:
+            sequence: Input DNA sequence (one-hot encoded), shape (batch, seq_len, 4).
+                Currently supports batch_size=1 only.
+            organism_index: Organism indices for each batch element, shape (batch,).
+            head_name: Name of the custom head to compute attributions for. If None and
+                there's only one custom head, uses that head. If None and there are
+                multiple heads, raises ValueError.
+            output_index: Index of the output track to compute attributions for (for
+                multi-track outputs). If None, computes attributions for the mean of all tracks.
+        
+        Returns:
+            Attributions with shape (batch, seq_len, 4), where only the wildtype base
+            channel is non-zero at each position.
+        """
+        import numpy as np
+        
+        # Validate head_name (same logic as other attribution methods)
+        if head_name is None:
+            if len(self._custom_heads) == 0:
+                raise ValueError(
+                    "No custom heads found. Cannot compute attributions without a head."
+                )
+            elif len(self._custom_heads) == 1:
+                head_name = self._custom_heads[0]
+            else:
+                raise ValueError(
+                    f"Multiple custom heads found: {self._custom_heads}. "
+                    "Please specify head_name."
+                )
+        elif head_name not in self._custom_heads:
+            raise ValueError(
+                f"Head '{head_name}' not found. Available heads: {self._custom_heads}"
+            )
+        
+        # Ensure batch dimension
+        sequence = jnp.array(sequence)
+        if sequence.ndim == 2:
+            sequence = sequence[None, :, :]
+        organism_index = jnp.array(organism_index)
+        if organism_index.ndim == 0:
+            organism_index = organism_index[None]
+        
+        batch_size, seq_len, num_bases = sequence.shape
+        
+        if batch_size != 1:
+            raise ValueError(
+                f"ISM currently supports batch_size=1 only. Got batch_size={batch_size}"
+            )
+        if num_bases != 4:
+            raise ValueError(
+                f"Expected 4 channels for DNA one-hot (A/T/C/G), got {num_bases}"
+            )
+        
+        # Set default values for optional arguments
+        negative_strand_mask = jnp.zeros((sequence.shape[0],), dtype=jnp.bool_)
+        if hasattr(self._base_model, '_metadata'):
+            first_org = list(self._base_model._metadata.keys())[0]
+            strand_reindexing = jax.device_put(
+                self._base_model._metadata[first_org].strand_reindexing
+            )
+        else:
+            strand_reindexing = jnp.array([], dtype=jnp.int32)
+        
+        # Helper function to get head output without summing (for ISM)
+        def get_head_output(seq):
+            """Get head output without any reduction (for ISM computation)."""
+            if hasattr(self, '_custom_forward_fn') and self._custom_forward_fn is not None:
+                rng_key = jax.random.PRNGKey(0)
+                result = self._custom_forward_fn(
+                    self._params,
+                    self._state,
+                    rng_key,
+                    seq,
+                    organism_index,
+                )
+                if isinstance(result, tuple):
+                    predictions_dict, _ = result
+                else:
+                    predictions_dict = result
+                if isinstance(predictions_dict, dict):
+                    output = predictions_dict.get(head_name)
+                else:
+                    output = predictions_dict
+            else:
+                predictions = self._predict(
+                    self._params,
+                    self._state,
+                    seq,
+                    organism_index,
+                    negative_strand_mask=negative_strand_mask,
+                    strand_reindexing=strand_reindexing,
+                )
+                # Extract output for the specified head
+                from alphagenome_research.model import model as model_lib
+                _PredictionsDict = getattr(model_lib, "_PredictionsDict", None)
+                if _PredictionsDict is not None and isinstance(predictions, _PredictionsDict):
+                    output = predictions._custom.get(head_name)
+                elif hasattr(predictions, 'get'):
+                    output = predictions.get(head_name)
+                else:
+                    output = predictions[head_name] if head_name in predictions else None
+            
+            if output is None:
+                raise ValueError(f"Output for head '{head_name}' not found")
+            
+            # Handle multi-track outputs
+            if output_index is not None:
+                if output.ndim > 1:
+                    output = output[..., output_index]
+                else:
+                    raise ValueError(
+                        f"output_index specified but output is 1D. "
+                        f"Output shape: {output.shape}"
+                    )
+            else:
+                # Use mean of all tracks if multi-dimensional
+                if output.ndim > 1 and output.shape[-1] > 1:
+                    output = jnp.mean(output, axis=-1)
+            
+            return output
+        
+        # Get base prediction for the original sequence
+        base_output = get_head_output(sequence)
+        base_scalar = jnp.mean(base_output)  # Reduce to scalar for comparison
+        
+        # Convert to numpy for easier mutation
+        seq_np = np.asarray(sequence[0])  # (seq_len, 4)
+        
+        # Store full ISM matrix: for each position and each base, compute Δ = f(mut) - f(ref)
+        ism_full = np.zeros((seq_len, num_bases), dtype=np.float32)
+        
+        # For each position and each base, compute delta prediction
+        for pos in range(seq_len):
+            for b_idx in range(num_bases):
+                # Create mutated sequence
+                mut_seq_np = np.array(seq_np, copy=True)
+                mut_seq_np[pos, :] = 0.0
+                mut_seq_np[pos, b_idx] = 1.0
+                mut_seq = jnp.asarray(mut_seq_np)[None, :, :]  # Add batch dimension
+                
+                # Compute prediction for mutated sequence
+                mut_output = get_head_output(mut_seq)
+                mut_scalar = jnp.mean(mut_output)
+                
+                # Δ = mutated_prediction - reference_prediction
+                ism_full[pos, b_idx] = float(mut_scalar - base_scalar)
+        
+        # Collapse alternative SNP effects back onto the wildtype base
+        # For each position: WT_importance = -mean_{alt != ref} Δ_alt
+        ism_wt = np.zeros_like(ism_full, dtype=np.float32)
+        wt_indices = np.argmax(seq_np, axis=-1)  # (seq_len,) - wildtype base index at each position
+        
+        for pos in range(seq_len):
+            wt_idx = wt_indices[pos]
+            # Collect alternative deltas (exclude WT channel)
+            alt_mask = np.ones(num_bases, dtype=bool)
+            alt_mask[wt_idx] = False
+            alt_deltas = ism_full[pos, alt_mask]
+            if alt_deltas.size > 0:
+                wt_importance = -float(np.mean(alt_deltas))
+            else:
+                wt_importance = 0.0
+            # Assign to wildtype channel only, others remain 0
+            ism_wt[pos, wt_idx] = wt_importance
+        
+        # Return with batch dimension
+        return jnp.asarray(ism_wt)[None, :, :]  # (1, seq_len, 4)
+    
     def plot_attribution_map(
         self,
         sequence: Float[Array, 'B S 4'],
@@ -1330,8 +1521,11 @@ class CustomAlphaGenomeModel:
         
         # Decode sequence string if not provided (need seq_len for validation)
         if sequence_str is None:
-            base_map = {0: 'A', 1: 'T', 2: 'C', 3: 'G'}
-            sequence_str = ''.join([base_map[np.argmax(seq_np[i])] for i in range(seq_np.shape[0])])
+            # Match AlphaGenome's canonical channel order: A, C, G, T
+            base_map = {0: 'A', 1: 'C', 2: 'G', 3: 'T'}
+            sequence_str = ''.join(
+                [base_map[np.argmax(seq_np[i])] for i in range(seq_np.shape[0])]
+            )
         
         seq_len = len(sequence_str)
         expected_seq_len = seq_np.shape[0]
@@ -1366,7 +1560,8 @@ class CustomAlphaGenomeModel:
                         f"seq_np.shape={seq_np.shape}, expected (seq_len={expected_seq_len}, 4). "
                         f"Original gradients shape: {jnp.asarray(gradients).shape}"
                     )
-        bases = ['A', 'T', 'C', 'G']
+        # Y-axis base labels must match channel order used by DNAOneHotEncoder: A, C, G, T
+        bases = ['A', 'C', 'G', 'T']
         
         # Create figure with subplots
         fig, axes = plt.subplots(2, 1, figsize=figsize, height_ratios=[3, 1])
@@ -1568,10 +1763,11 @@ class CustomAlphaGenomeModel:
             values_np = grad_np
         
         # Create DataFrame for logomaker
+        # Columns must match the underlying one-hot channel order (A, C, G, T)
         import pandas as pd
         logo_df = pd.DataFrame(
             values_np,
-            columns=['A', 'T', 'C', 'G']
+            columns=['A', 'C', 'G', 'T'],
         )
         
         # Apply threshold
@@ -2700,7 +2896,7 @@ def load_checkpoint(
                             print(f"  Inferred original training sequence length: {inferred_seq_len}bp "
                                   f"(from {num_positions} encoder positions, input_size={input_size}, path={param_path})")
                             break
-            
+
             # Create model structure first with encoder-only forward function
             # This ensures the forward function is set up correctly from the start
             print(f"  Creating model structure with encoder-only forward (init_seq_len={inferred_seq_len}bp)...")
