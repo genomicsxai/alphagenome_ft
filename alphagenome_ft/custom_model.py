@@ -922,7 +922,7 @@ class CustomAlphaGenomeModel:
         Example:
             ```python
             from alphagenome_ft import load_checkpoint
-            from alphagenome_ft import register_custom_head, HeadConfig, HeadType
+            from alphagenome_ft import register_custom_head, CustomHeadConfig, CustomHeadType
             from alphagenome.models import dna_output
             import jax.numpy as jnp
 
@@ -931,9 +931,8 @@ class CustomAlphaGenomeModel:
             register_custom_head(
                 'mpra_head',
                 EncoderMPRAHead,
-                HeadConfig(
-                    type=HeadType.GENOME_TRACKS,
-                    name='mpra_head',
+                CustomHeadConfig(
+                    type=CustomHeadType.GENOME_TRACKS,
                     output_type=dna_output.OutputType.RNA_SEQ,
                     num_tracks=1,
                     metadata={}
@@ -1601,7 +1600,7 @@ class CustomAlphaGenomeModel:
             ```python
             from alphagenome_ft import load_checkpoint
             from src import EncoderMPRAHead
-            from alphagenome_ft import register_custom_head, HeadConfig, HeadType
+            from alphagenome_ft import register_custom_head, CustomHeadConfig, CustomHeadType
             from alphagenome.models import dna_output
             import jax.numpy as jnp
 
@@ -1809,7 +1808,7 @@ class CustomAlphaGenomeModel:
             ```python
             from alphagenome_ft import load_checkpoint
             from src import EncoderMPRAHead
-            from alphagenome_ft import register_custom_head, HeadConfig, HeadType
+            from alphagenome_ft import register_custom_head, CustomHeadConfig, CustomHeadType
             from alphagenome.models import dna_output
             import jax.numpy as jnp
 
@@ -2058,7 +2057,7 @@ def create_model_with_heads(
 
     Example:
         ```python
-        from alphagenome_ft import register_custom_head, CustomHead, HeadConfig, HeadType
+        from alphagenome_ft import register_custom_head, CustomHead, CustomHeadConfig, CustomHeadType
         from alphagenome.models import dna_output
 
         # 1. Define custom head
@@ -2074,9 +2073,8 @@ def create_model_with_heads(
         register_custom_head(
             'my_head',
             MyHead,
-            HeadConfig(
-                type=HeadType.GENOME_TRACKS,
-                name='my_head',
+            CustomHeadConfig(
+                type=CustomHeadType.GENOME_TRACKS,
                 output_type=dna_output.OutputType.RNA_SEQ,
                 num_tracks=1,
             )
@@ -2320,6 +2318,7 @@ def create_model_with_custom_heads(
     detach_backbone: bool = False,
     include_standard_heads: bool = False,
     init_seq_len: int = 2**20,
+    checkpoint_path: str | os.PathLike[str] | None = None,
 ) -> CustomAlphaGenomeModel:
     """Backward-compatible wrapper for create_model_with_heads()."""
     return create_model_with_heads(
@@ -2331,6 +2330,7 @@ def create_model_with_custom_heads(
         detach_backbone=detach_backbone,
         include_standard_heads=include_standard_heads,
         init_seq_len=init_seq_len,
+        checkpoint_path=checkpoint_path,
     )
 
 
@@ -2635,6 +2635,7 @@ def load_checkpoint(
 
     # Re-register custom heads from config
     from . import custom_heads as custom_heads_module
+    from .custom_heads import CustomHeadConfig, CustomHeadType
 
     print(f"Loading checkpoint from {checkpoint_dir}")
     print(f"  Custom heads: {custom_heads}")
@@ -2646,13 +2647,8 @@ def load_checkpoint(
         print(f"  Model type: Heads only")
 
     for head_name, head_config_dict in config['head_configs'].items():
-        # Re-register head with checkpoint's metadata to ensure correct configuration
-        # This is important because the head might have been registered with different metadata
-        # (e.g., empty metadata {} in tmp.py) which would use defaults that don't match the checkpoint
-        try:
-            # Get the head class from the registry
-            head_class = custom_heads_module._CUSTOM_HEAD_REGISTRY[head_name]
-        except KeyError:
+        # Verify head is already registered (required before loading checkpoint)
+        if not custom_heads_module.is_head_registered(head_name):
             raise RuntimeError(
                 f"Head '{head_name}' is not registered. "
                 f"Please import and register the head class before loading the checkpoint. "
@@ -2660,20 +2656,47 @@ def load_checkpoint(
                 f"  from your_module import {head_name.title().replace('_', '')}Head\n"
                 f"  register_custom_head('{head_name}', {head_name.title().replace('_', '')}Head, config)"
             )
-
-
-        # Create HeadConfig from checkpoint's saved config
-        checkpoint_head_config = HeadConfig(
-            type=HeadType[head_config_dict['type']],
-            name=head_config_dict['name'],
-            output_type=getattr(dna_output.OutputType, head_config_dict['output_type']),
-            num_tracks=head_config_dict['num_tracks'],
-            metadata=head_config_dict.get('metadata', {})
-        )
-
-        # Re-register with checkpoint's config (this overwrites any previous registration)
-        custom_heads_module.register_custom_head(head_name, head_class, checkpoint_head_config)
-        print(f"  Head '{head_name}' re-registered with checkpoint metadata")
+        
+        # Get the current config from registry
+        current_config = custom_heads_module.get_registered_head_config(head_name)
+        
+        # Handle both old format (direct config dict) and new format (with 'source' field)
+        # Old format: head_config_dict has 'type', 'name', 'output_type', 'num_tracks', 'metadata' directly
+        # New format: head_config_dict has 'source' plus serialized config fields
+        if 'source' in head_config_dict:
+            # New format - config fields are at top level (from _serialize_head_config)
+            config_type = head_config_dict.get('type')
+            config_name = head_config_dict.get('name') or head_name
+            config_output_type = head_config_dict.get('output_type')
+            config_num_tracks = head_config_dict.get('num_tracks')
+            config_metadata = head_config_dict.get('metadata', {})
+        else:
+            # Old format - config fields are directly in head_config_dict
+            config_type = head_config_dict.get('type')
+            config_name = head_config_dict.get('name') or head_name
+            config_output_type = head_config_dict.get('output_type')
+            config_num_tracks = head_config_dict.get('num_tracks')
+            config_metadata = head_config_dict.get('metadata', {})
+        
+        # Create HeadConfig from checkpoint's saved config (only for custom heads)
+        if isinstance(current_config, CustomHeadConfig):
+            checkpoint_head_config = CustomHeadConfig(
+                type=CustomHeadType[config_type] if isinstance(config_type, str) else config_type,
+                name=config_name,  # Ensure name is set
+                output_type=getattr(dna_output.OutputType, config_output_type) if isinstance(config_output_type, str) else config_output_type,
+                num_tracks=config_num_tracks,
+                metadata=config_metadata
+            )
+            
+            # Update the config in the registry if metadata differs
+            if current_config.metadata != checkpoint_head_config.metadata:
+                print(f"  Warning: Head '{head_name}' metadata differs between checkpoint and current registration.")
+                print(f"    Checkpoint metadata: {checkpoint_head_config.metadata}")
+                print(f"    Current metadata: {current_config.metadata}")
+                print(f"    Using current registration (head should be registered with correct metadata before loading)")
+        else:
+            # Predefined head - just verify it's registered
+            print(f"  Head '{head_name}' already registered (predefined head)")
 
     # Load checkpoint parameters
     checkpointer = ocp.StandardCheckpointer()
@@ -2871,14 +2894,14 @@ def load_checkpoint(
             )
         if use_encoder_output:
             # Encoder-only MPRA full model: recreate the encoder-only forward used in
-            # create_model_with_custom_heads(..., use_encoder_output=True,...).
+            # create_model_with_heads(..., use_encoder_output=True,...).
             from alphagenome_research.model import model as model_lib
             from alphagenome_research.model.metadata import metadata as metadata_lib
             from alphagenome_ft.embeddings_extended import ExtendedEmbeddings
             import jmp
             import haiku as hk
 
-            # Load metadata (same as in create_model_with_custom_heads).
+            # Load metadata (same as in create_model_with_heads).
             metadata = {}
             for organism in dna_model.Organism:
                 metadata[organism] = metadata_lib.load(organism)
@@ -3073,7 +3096,7 @@ def load_checkpoint(
     elif save_minimal_model:
         # Minimal model checkpoint - encoder + custom heads only
         # CRITICAL: For encoder-only models, create the model structure first with
-        # create_model_with_custom_heads to ensure the encoder-only forward function
+        # create_model_with_heads to ensure the encoder-only forward function
         # is set up correctly, then merge checkpoint parameters. This matches the
         # approach used in test scripts and ensures correct attribution computation.
         print("Loading minimal model from checkpoint (encoder + custom heads only)...")

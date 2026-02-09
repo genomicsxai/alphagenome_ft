@@ -14,7 +14,7 @@ from alphagenome_ft import (
     HeadConfig,
     HeadType,
     register_custom_head,
-    create_model_with_custom_heads,
+    create_model_with_heads,
 )
 
 
@@ -78,9 +78,9 @@ def encoder_head_registered():
 @pytest.fixture(scope="function")
 def encoder_only_model(encoder_head_registered, device):
     """Create model with encoder-only mode."""
-    return create_model_with_custom_heads(
+    return create_model_with_heads(
         'all_folds',
-        custom_heads=[encoder_head_registered],
+        heads=[encoder_head_registered],
         device=device,
         use_encoder_output=True,  # NEW: Encoder-only mode
     )

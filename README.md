@@ -8,6 +8,7 @@ A lightweight Python package for finetuning [Google DeepMind's AlphaGenome](http
 - **Parameter Freezing**: Flexible parameter management (freeze backbone, heads, or specific layers)
 - **Easy Integration**: Works seamlessly with pretrained AlphaGenome models (Simple wrapper classes)
 - **Parameter Inspection**: Utilities to explore and count model parameters
+- **Attribution Analysis**: Utilities to calculate attributions based on gradients or _in silico_ mutagenesis (ISM)
 - **JAX/Haiku Native**: Built on the same framework as AlphaGenome
 
 ## Installation
@@ -67,7 +68,7 @@ model.freeze_except_head("rna_seq_ft")
 
 ### Using Template Heads
 
-We provide ready-to-use template heads for common scenarios:
+We provide ready-to-use template heads for common scenarios, see `./alphagenome_ft/templates.py`:
 
 ```python
 from alphagenome.models import dna_output
@@ -105,9 +106,9 @@ model.freeze_except_head('my_head')
 Note if you have a local AlphaGenome weights version you want to use instead of getting the weights from Kaggle use:
 
 ```
-model = create_model_with_custom_heads(
+model = create_model_with_heads(
     'all_folds',
-    custom_heads=['my_head'],
+    heads=['my_head'],
     checkpoint_path="full/path/to/weights",
 )
 ```

@@ -244,6 +244,9 @@ def create_registered_head(
             f"Available heads: {list_registered_heads()}"
         )
     config = get_registered_head_config(normalized)
+    # Ensure config.name is set (use normalized name if None)
+    if isinstance(config, CustomHeadConfig) and config.name is None:
+        config = replace(config, name=normalized)
     factory = _HEAD_REGISTRY[normalized]
     return factory(config, metadata, num_organisms)
 
@@ -291,8 +294,10 @@ def register_custom_head(
             raise TypeError(
                 f"Expected custom head config for '{normalized_name}', got {type(config)!r}."
             )
+        # Ensure name is set - use normalized_name if config.name is None
+        head_name = config.name if config.name is not None else normalized_name
         return head_class(
-            name=config.name,
+            name=head_name,
             output_type=config.output_type,
             num_tracks=config.num_tracks,
             num_organisms=num_organisms,

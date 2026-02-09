@@ -10,7 +10,7 @@ import jax.numpy as jnp
 
 from alphagenome_ft import (
     register_custom_head,
-    create_model_with_custom_heads,
+    create_model_with_heads,
     load_checkpoint,
     get_custom_head_config,
 )
@@ -31,9 +31,9 @@ class TestCheckpointSaveLoad:
     @pytest.fixture
     def trained_model(self, registered_mpra_head, device):
         """Create a model that simulates being trained."""
-        model = create_model_with_custom_heads(
+        model = create_model_with_heads(
             'all_folds',
-            custom_heads=[registered_mpra_head],
+            heads=[registered_mpra_head],
             device=device,
         )
         # Freeze backbone to simulate finetuning setup

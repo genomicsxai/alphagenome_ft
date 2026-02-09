@@ -15,8 +15,8 @@ from alphagenome_ft import (
     HeadType,
     register_custom_head,
     wrap_pretrained_model,
-    add_custom_heads_to_model,
-    create_model_with_custom_heads,
+    add_heads_to_model,
+    create_model_with_heads,
 )
 
 
@@ -128,16 +128,16 @@ def registered_mpra_head(mpra_head_config):
 def wrapped_model_with_head(base_model, registered_mpra_head):
     """Create wrapped model with custom head."""
     wrapped = wrap_pretrained_model(base_model)
-    wrapped = add_custom_heads_to_model(wrapped, custom_heads=[registered_mpra_head])
+    wrapped = add_heads_to_model(wrapped, heads=[registered_mpra_head])
     return wrapped
 
 
 @pytest.fixture(scope="function")
 def custom_only_model(registered_mpra_head, device):
     """Create model with only custom head."""
-    return create_model_with_custom_heads(
+    return create_model_with_heads(
         'all_folds',
-        custom_heads=[registered_mpra_head],
+        heads=[registered_mpra_head],
         device=device,
     )
 
