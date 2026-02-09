@@ -463,7 +463,11 @@ model.freeze_parameters(freeze_paths=['alphagenome/encoder/...'])
 model.unfreeze_parameters(unfreeze_prefixes=['alphagenome/head/'])
 
 # Convenient presets
-model.freeze_backbone()                    # Freeze encoder/transformer/decoder
+model.freeze_backbone()                    # Freeze all backbone components (default)
+model.freeze_backbone(freeze_prefixes=['sequence_encoder'])  # Freeze only encoder
+model.freeze_backbone(freeze_prefixes=['transformer_tower'])  # Freeze only transformer
+model.freeze_backbone(freeze_prefixes=['sequence_decoder'])  # Freeze only decoder
+model.freeze_backbone(freeze_prefixes=['sequence_encoder', 'transformer_tower'])  # Freeze encoder + transformer
 model.freeze_all_heads(except_heads=['my_head'])  # Freeze all heads except one
 model.freeze_except_head('my_head')        # Freeze everything except one head
 
@@ -472,6 +476,28 @@ paths = model.get_parameter_paths()        # All parameter paths
 head_paths = model.get_head_parameter_paths()     # Just head parameters
 backbone_paths = model.get_backbone_parameter_paths()  # Just backbone
 count = model.count_parameters()           # Total parameter count
+```
+
+**Modular Backbone Freezing:**
+
+The `freeze_backbone()` method now supports modular freezing of backbone components. This allows you to selectively freeze only specific parts of the backbone (encoder, transformer, or decoder) while keeping others trainable. This is useful for progressive finetuning strategies:
+
+```python
+# Example: Progressive finetuning strategy
+# 1. Start with only head trainable
+model.freeze_backbone()  # Freeze all backbone
+
+# 2. Unfreeze decoder for fine-grained adaptation
+model.unfreeze_parameters(unfreeze_prefixes=['sequence_decoder'])
+
+# 3. Later, unfreeze transformer for global context adaptation
+model.unfreeze_parameters(unfreeze_prefixes=['transformer_tower'])
+
+# 4. Finally, unfreeze encoder for full finetuning
+model.unfreeze_parameters(unfreeze_prefixes=['sequence_encoder'])
+
+# Or use freeze_backbone with specific prefixes from the start:
+model.freeze_backbone(freeze_prefixes=['sequence_encoder', 'transformer_tower'])  # Only decoder trainable
 ```
 
 ### Training with Custom Heads
@@ -604,6 +630,157 @@ register_custom_head('my_head', MyCustomHead, config)
 # Now load checkpoint
 model = load_checkpoint('checkpoints/my_model')
 ```
+
+## Attribution Analysis
+
+After training, you can compute attributions to understand which sequence features drive your model's predictions. The package supports multiple attribution methods:
+
+- **DeepSHAP**: Reference-based attribution using gradient differences
+- **Gradient × Input**: Gradient multiplied by input (standard gradient-based attribution)
+- **Gradient**: Raw gradients (information content)
+- **ISM** (_in silico_ mutagenesis): Importance scores from single-nucleotide variants
+
+### Basic Attribution Example
+
+```python
+import jax.numpy as jnp
+from alphagenome_ft import load_checkpoint
+
+# Load trained model
+model = load_checkpoint('checkpoints/my_model', base_model_version='all_folds')
+
+# Prepare a sequence (one-hot encoded, shape: (batch, length, 4))
+sequence = jnp.array([...])  # Your sequence here
+organism_index = jnp.array([0])  # Organism index (0 = human)
+
+# Compute DeepSHAP attributions
+attributions = model.compute_deepshap_attributions(
+    sequence=sequence,
+    organism_index=organism_index,
+    head_name='my_head',
+    n_references=20,  # Number of reference sequences
+    reference_type='shuffle',  # 'shuffle', 'uniform', or 'gc_match'
+    random_state=42,
+)
+
+# Attributions shape: (batch, seq_len, 4) - one score per base per position
+print(f"Attributions shape: {attributions.shape}")
+
+# Alternative: Gradient × Input attributions
+attributions_grad = model.compute_input_gradients(
+    sequence=sequence,
+    organism_index=organism_index,
+    head_name='my_head',
+    gradients_x_input=True,  # Multiply gradient by input
+)
+
+# Alternative: ISM attributions (wildtype-base importance)
+attributions_ism = model.compute_ism_attributions(
+    sequence=sequence,
+    organism_index=organism_index,
+    head_name='my_head',
+)
+```
+
+### Visualization
+
+Generate attribution maps and sequence logos:
+
+```python
+# Decode sequence to string for visualization
+sequence_str = "ATCGATCG..."  # Your sequence as string
+
+# Plot attribution heatmap
+model.plot_attribution_map(
+    sequence=sequence,
+    gradients=attributions,  # Attributions from above
+    sequence_str=sequence_str,
+    save_path='attribution_map.png'
+)
+
+# Plot sequence logo (shows base preferences)
+model.plot_sequence_logo(
+    sequence=sequence,
+    gradients=attributions,
+    save_path='sequence_logo.png',
+    logo_type='weight',  # 'weight' for raw scores, 'information' for bits
+    mask_to_sequence=False,  # Show all bases or only input sequence
+    use_absolute=False,  # Preserve signed values
+)
+```
+
+### Complete Example: Analyzing a Single Sequence
+
+```python
+import jax.numpy as jnp
+from alphagenome_ft import load_checkpoint
+
+# Helper function to encode DNA sequence (AlphaGenome order: A, C, G, T)
+def one_hot_encode(sequence: str) -> jnp.ndarray:
+    """Convert DNA sequence string to one-hot encoding."""
+    base_map = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+    seq_len = len(sequence)
+    one_hot = jnp.zeros((1, seq_len, 4), dtype=jnp.float32)
+    for i, base in enumerate(sequence.upper()):
+        if base in base_map:
+            one_hot = one_hot.at[0, i, base_map[base]].set(1.0)
+    return one_hot
+
+# 1. Load model
+model = load_checkpoint('checkpoints/my_model', base_model_version='all_folds')
+
+# 2. Prepare sequence
+sequence_str = "ATCGATCGATCG..."  # Your DNA sequence
+sequence_onehot = one_hot_encode(sequence_str)  # Convert to one-hot
+organism_index = jnp.array([0])  # Human
+
+# 3. Compute attributions
+attributions = model.compute_deepshap_attributions(
+    sequence=sequence_onehot,
+    organism_index=organism_index,
+    head_name='my_head',
+    n_references=20,
+)
+
+# 4. Visualize
+model.plot_attribution_map(
+    sequence=sequence_onehot,
+    gradients=attributions,
+    sequence_str=sequence_str,
+    save_path='attribution_map.png'
+)
+
+model.plot_sequence_logo(
+    sequence=sequence_onehot,
+    gradients=attributions,
+    save_path='sequence_logo.png',
+    logo_type='weight',
+    mask_to_sequence=False,
+)
+```
+
+### Attribution Methods Comparison
+
+| Method | Use Case | Notes |
+|--------|----------|-------|
+| **DeepSHAP** | General-purpose, robust | Reference-based, handles non-linearities well |
+| **Gradient × Input** | Fast, interpretable | Standard gradient-based method |
+| **Gradient** | Information content | Shows relative importance, not signed |
+| **ISM** | Variant effect prediction | Computes importance from SNP effects |
+
+**Note:** For multi-track outputs, use `output_index` to specify which track to attribute:
+
+```python
+# For a head with 2 tracks, attribute to track 0
+attributions = model.compute_deepshap_attributions(
+    sequence=sequence,
+    organism_index=organism_index,
+    head_name='my_head',
+    output_index=0,  # Attribute to first track
+)
+```
+
+For complete examples with motif analysis, background shuffling, and batch processing, see the [MPRA attribution script](../alphagenome_FT_MPRA/scripts/compute_attributions.py) and [DeepSTARR attribution script](../alphagenome_FT_MPRA/scripts/compute_attributions_starrseq.py).
 
 ## Testing
 

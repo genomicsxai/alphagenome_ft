@@ -36,7 +36,7 @@ Core Functions:
 1. `_keypath_to_str(path_tuple)` - Converts JAX keypath tuples to readable strings.
 2. `freeze_parameters(params, freeze_paths, freeze_prefixes)` - Freeze specific parameters by applying `jax.lax.stop_gradient`.
 3. `unfreeze_parameters(params, unfreeze_paths, unfreeze_prefixes)` - Remove stop_gradient from parameters (make them trainable again).
-4. `freeze_backbone(params)` - Freeze encoder, transformer, and decoder (the backbone).
+4. `freeze_backbone(params, freeze_prefixes)` - Freeze backbone components modularly (encoder, transformer, decoder).
 5. `freeze_all_heads(params, except_heads)` - Freeze all heads except specified ones.
 6. `freeze_except_head(params, trainable_head)` - Freeze everything except a specific head (common finetuning pattern).
 7. `get_parameter_paths(params)` - Get all parameter paths in the tree.
@@ -164,18 +164,39 @@ def unfreeze_parameters(
     return jax.tree_util.tree_map_with_path(unfreeze_fn, params)
 
 
-def freeze_backbone(params: PyTree) -> PyTree:
+def freeze_backbone(params: PyTree, freeze_prefixes=['sequence_encoder', 'transformer_tower', 'sequence_decoder']) -> PyTree:
     """Freeze the backbone (encoder, transformer, decoder) but keep heads trainable.
+    
+    This function allows modular freezing of backbone components. By default, it freezes
+    all backbone components (encoder, transformer, decoder). You can selectively freeze
+    only specific components by passing a subset of prefixes.
     
     Args:
         params: Parameter tree to modify.
+        freeze_prefixes: List of component prefixes to freeze. Defaults to all backbone
+            components: ['sequence_encoder', 'transformer_tower', 'sequence_decoder'].
+            To freeze only specific components, pass a subset:
+            - ['sequence_encoder'] - Freeze only the encoder
+            - ['transformer_tower'] - Freeze only the transformer
+            - ['sequence_decoder'] - Freeze only the decoder
+            - ['sequence_encoder', 'transformer_tower'] - Freeze encoder and transformer
         
     Returns:
-        Parameter tree with frozen backbone.
+        Parameter tree with frozen backbone components.
+        
+    Examples:
+        >>> # Freeze all backbone components (default)
+        >>> params = freeze_backbone(params)
+        
+        >>> # Freeze only the encoder
+        >>> params = freeze_backbone(params, freeze_prefixes=['sequence_encoder'])
+        
+        >>> # Freeze encoder and transformer (but not decoder)
+        >>> params = freeze_backbone(params, freeze_prefixes=['sequence_encoder', 'transformer_tower'])
     """
     return freeze_parameters(
         params,
-        freeze_prefixes=['sequence_encoder', 'transformer_tower', 'sequence_decoder']
+        freeze_prefixes=freeze_prefixes
     )
 
 

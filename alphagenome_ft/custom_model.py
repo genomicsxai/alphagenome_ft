@@ -343,9 +343,23 @@ class CustomAlphaGenomeModel:
             self._params, unfreeze_paths, unfreeze_prefixes
         )
 
-    def freeze_backbone(self) -> None:
-        """Freeze the backbone (encoder, transformer, decoder) but keep heads trainable."""
-        self._params = parameter_utils.freeze_backbone(self._params)
+    def freeze_backbone(self, freeze_prefixes: Sequence[str] | None = None) -> None:
+        """Freeze the backbone (encoder, transformer, decoder) but keep heads trainable.
+        
+        Allows modular freezing of backbone components. By default, freezes all backbone
+        components. Pass a subset of prefixes to freeze only specific components.
+        
+        Args:
+            freeze_prefixes: List of component prefixes to freeze. Defaults to all backbone
+                components: ['sequence_encoder', 'transformer_tower', 'sequence_decoder'].
+                To freeze only specific components, pass a subset:
+                - ['sequence_encoder'] - Freeze only the encoder
+                - ['transformer_tower'] - Freeze only the transformer
+                - ['sequence_decoder'] - Freeze only the decoder
+        """
+        if freeze_prefixes is None:
+            freeze_prefixes = ['sequence_encoder', 'transformer_tower', 'sequence_decoder']
+        self._params = parameter_utils.freeze_backbone(self._params, freeze_prefixes=freeze_prefixes)
 
     def freeze_all_heads(self, except_heads: Sequence[str] | None = None) -> None:
         """Freeze all heads except specified ones.
