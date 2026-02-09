@@ -87,7 +87,6 @@ register_custom_head(
     templates.StandardHead,  # Choose template: StandardHead, TransformerHead, EncoderOnlyHead
     CustomHeadConfig(
         type=CustomHeadType.GENOME_TRACKS,
-        name='my_head',
         output_type=dna_output.OutputType.RNA_SEQ,
         num_tracks=1,
     )
@@ -105,7 +104,7 @@ model.freeze_except_head('my_head')
 
 Note if you have a local AlphaGenome weights version you want to use instead of getting the weights from Kaggle use:
 
-```
+```python
 model = create_model_with_heads(
     'all_folds',
     heads=['my_head'],
@@ -145,7 +144,6 @@ register_custom_head(
     templates.StandardHead,
     CustomHeadConfig(
         type=CustomHeadType.GENOME_TRACKS,
-        name='my_head',
         output_type=dna_output.OutputType.RNA_SEQ,
         num_tracks=1,
     )
@@ -364,7 +362,6 @@ register_custom_head(
     templates.EncoderOnlyHead,  # Encoder only (no transformer/decoder)
     CustomHeadConfig(
         type=CustomHeadType.GENOME_TRACKS,
-        name='mpra_head',
         output_type=dna_output.OutputType.RNA_SEQ,
         num_tracks=1,
     )
