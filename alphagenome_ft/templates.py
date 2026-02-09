@@ -16,6 +16,7 @@ import jax
 import jax.numpy as jnp
 import haiku as hk
 from alphagenome_ft import CustomHead
+from alphagenome_research.model import layers
 
 
 class StandardHead(CustomHead):
@@ -114,7 +115,7 @@ class TransformerHead(CustomHead):
         # KEY: Access 128bp resolution embeddings (transformer output)
         x = embeddings.get_sequence_embeddings(resolution=128)
         # Shape: (batch, sequence_length//128, 3072)
-        
+        x = layers.LayerNorm(name='norm')(x)
         # Simple architecture: Linear → ReLU → Linear
         x = hk.Linear(256, name='hidden')(x)
         x = jax.nn.relu(x)
@@ -183,7 +184,7 @@ class EncoderOnlyHead(CustomHead):
         # KEY: Access encoder output (raw CNN features, before transformer)
         x = embeddings.encoder_output
         # Shape: (batch, sequence_length//128, 1536)
-        
+        x = layers.LayerNorm(name='norm')(x)
         # Simple architecture: Linear → ReLU → Linear
         x = hk.Linear(256, name='hidden')(x)
         x = jax.nn.relu(x)
