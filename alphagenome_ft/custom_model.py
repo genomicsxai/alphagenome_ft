@@ -952,9 +952,27 @@ class CustomAlphaGenomeModel:
                 if output.ndim > 1:
                     output = jnp.mean(output, axis=-1)
             
-            # Return sum over batch and sequence for gradient computation
-            # This gives us gradients for each position in each sequence
-            return jnp.sum(output)
+            # For gradient computation with per-position outputs:
+            # Standard approach: sum over all positions to get scalar, then compute gradient.
+            # This gives gradients at each input position for the total output.
+            # 
+            # The gradient of the total output (sum over all positions) w.r.t. each input
+            # position tells us how much the total output changes when we change that input.
+            # This is the standard approach for attribution methods.
+            #
+            # Handle different output shapes:
+            if output.ndim == 1:
+                # Already 1D (e.g., (batch,) or (seq_len,)) - sum to scalar
+                return jnp.sum(output)
+            elif output.ndim == 2:
+                # (batch, positions) - sum over batch first, then positions
+                # This handles resolution mismatch: output at 128bp, input at 1bp
+                output = jnp.sum(output, axis=0)  # (batch, positions) -> (positions,)
+                return jnp.sum(output)  # (positions,) -> scalar
+            else:
+                # 3D or higher: (batch, positions, tracks) or similar
+                # Flatten and sum everything to scalar
+                return jnp.sum(output)
         
         # Compute gradients using JAX
         # jax.grad computes gradients with respect to the first argument (sequence)
@@ -1188,7 +1206,21 @@ class CustomAlphaGenomeModel:
                     if output.ndim > 1:
                         output = jnp.mean(output, axis=-1)
                 
-                return jnp.sum(output)
+                # For gradient computation: sum over batch first if 2D, then sum all to scalar
+                # This matches the logic in compute_input_gradients
+                # Handle different output shapes:
+                if output.ndim == 1:
+                    # Already 1D (e.g., (batch,) or (seq_len,)) - sum to scalar
+                    return jnp.sum(output)
+                elif output.ndim == 2:
+                    # (batch, positions) - sum over batch first, then positions
+                    # This handles resolution mismatch: output at 128bp, input at 1bp
+                    output = jnp.sum(output, axis=0)  # (batch, positions) -> (positions,)
+                    return jnp.sum(output)  # (positions,) -> scalar
+                else:
+                    # 3D or higher: (batch, positions, tracks) or similar
+                    # Flatten and sum everything to scalar
+                    return jnp.sum(output)
             
             grad_fn = jax.grad(compute_output)
             
@@ -1423,6 +1455,7 @@ class CustomAlphaGenomeModel:
         logo_type: str = 'information',
         mask_to_sequence: bool = True,
         use_absolute: bool = False,
+        title: str | None = None,
     ) -> None:
         """Plot a sequence logo-style visualization of attribution scores using logomaker.
         
@@ -1449,6 +1482,9 @@ class CustomAlphaGenomeModel:
                 heights (standard magnitudes-only view). If False, keep signed
                 attributions so positive/negative contributions are preserved (useful
                 for DeepSHAP-style signed logos).
+            title: Optional custom title for the plot. If None, a default title is
+                generated based on logo_type and mask_to_sequence.
+                Default: None.
         
         Raises:
             ImportError: If matplotlib or logomaker is not installed.
@@ -1615,19 +1651,32 @@ class CustomAlphaGenomeModel:
         
         # Customize appearance
         ax.set_xlabel('Position in Sequence', fontsize=12)
+        
+        # Set title - use provided title if given, otherwise infer from context
+        if title is not None:
+            plot_title = title
+        elif mask_to_sequence:
+            # When masked to sequence, default to generic attribution title
+            # (caller should provide specific title for DeepSHAP vs gradient×input)
+            plot_title = 'Sequence Logo: Attributions'
+        elif logo_type == 'information':
+            plot_title = 'Sequence Logo: Attribution Scores (Information Content)'
+        elif logo_type == 'probability':
+            plot_title = 'Sequence Logo: Attribution Scores (Probability)'
+        else:
+            plot_title = 'Sequence Logo: Attribution Scores'
+        
+        # Set ylabel based on logo_type
         if mask_to_sequence:
-            # When masked to sequence, we're using raw attribution values
             ax.set_ylabel('Attribution', fontsize=12)
-            ax.set_title('Sequence Logo: DeepSHAP Attributions', fontsize=14)
         elif logo_type == 'information':
             ax.set_ylabel('Information Content (bits)', fontsize=12)
-            ax.set_title('Sequence Logo: Attribution Scores (Information Content)', fontsize=14)
         elif logo_type == 'probability':
             ax.set_ylabel('Probability', fontsize=12)
-            ax.set_title('Sequence Logo: Attribution Scores (Probability)', fontsize=14)
         else:
             ax.set_ylabel('Attribution Score', fontsize=12)
-            ax.set_title('Sequence Logo: Attribution Scores', fontsize=14)
+        
+        ax.set_title(plot_title, fontsize=14)
         
         ax.grid(True, alpha=0.3, axis='y', linestyle='--')
         
@@ -2076,6 +2125,7 @@ def load_checkpoint(
     organism_settings: Mapping[dna_model.Organism, Any] | None = None,
     device: jax.Device | None = None,
     base_checkpoint_path: str | os.PathLike[str] | None = None,
+    init_seq_len: int | None = None,
 ) -> CustomAlphaGenomeModel:
     """Load a saved custom head checkpoint.
     
@@ -2090,6 +2140,9 @@ def load_checkpoint(
         base_checkpoint_path: Optional local checkpoint directory for the base
             AlphaGenome model. If provided, Kaggle will not be used when
             instantiating the base model.
+        init_seq_len: Optional sequence length for model initialization. If None and
+            use_encoder_output=True, will be inferred from checkpoint parameters.
+            This is critical for encoder-only models with flatten pooling.
         
     Returns:
         CustomAlphaGenomeModel with loaded parameters.
@@ -2596,90 +2649,23 @@ def load_checkpoint(
             )
     elif save_minimal_model:
         # Minimal model checkpoint - encoder + custom heads only
-        # Need to load base model and merge encoder + head params
+        # CRITICAL: For encoder-only models, create the model structure first with
+        # create_model_with_custom_heads to ensure the encoder-only forward function
+        # is set up correctly, then merge checkpoint parameters. This matches the
+        # approach used in test scripts and ensures correct attribution computation.
         print("Loading minimal model from checkpoint (encoder + custom heads only)...")
-        if base_checkpoint_path is not None:
-            print(f"  Using local base checkpoint at: {base_checkpoint_path}")
-            base_model = dna_model.create(
-                base_checkpoint_path,
-                organism_settings=organism_settings,
-                device=device,
-            )
-        else:
-            base_model = dna_model.create_from_kaggle(
-                base_model_version,
-                organism_settings=organism_settings,
-                device=device,
-            )
-        
-        # Merge minimal params (encoder + heads) with base model params
-        # Keep transformer/decoder from base model, use saved encoder + heads
-        def merge_minimal_params(base_params, minimal_params):
-            """Merge minimal params (encoder + heads) into base params."""
-            merged = jax.tree_util.tree_map(lambda x: x, base_params)  # Deep copy
-            
-            # Helper to set nested value
-            def set_nested(d, path_parts, value):
-                current = d
-                for part in path_parts[:-1]:
-                    if part not in current:
-                        current[part] = {}
-                    current = current[part]
-                current[path_parts[-1]] = value
-            
-            # Merge encoder parameters
-            if 'alphagenome' in minimal_params and 'sequence_encoder' in minimal_params['alphagenome']:
-                if 'alphagenome' not in merged:
-                    merged['alphagenome'] = {}
-                merged['alphagenome']['sequence_encoder'] = minimal_params['alphagenome']['sequence_encoder']
-            
-            # Merge custom head parameters
-            if 'alphagenome' in minimal_params and 'head' in minimal_params['alphagenome']:
-                if 'alphagenome' not in merged:
-                    merged['alphagenome'] = {}
-                if 'head' not in merged['alphagenome']:
-                    merged['alphagenome']['head'] = {}
-                for head_name in minimal_params['alphagenome']['head']:
-                    merged['alphagenome']['head'][head_name] = minimal_params['alphagenome']['head'][head_name]
-            
-            # Also handle flat structure
-            for key, value in minimal_params.items():
-                key_str = str(key)
-                if 'sequence_encoder' in key_str or any(head_name in key_str for head_name in custom_heads):
-                    merged[key] = value
-            
-            return merged
-        
-        merged_params = merge_minimal_params(base_model._params, loaded_params)
-        merged_state = merge_minimal_params(base_model._state, loaded_state) if loaded_state else base_model._state
         
         # Check if this is an encoder-only model (use_encoder_output=True)
-        # If so, we must recreate the encoder-only forward function
+        # If so, create model structure first with correct forward function
         if use_encoder_output:
-            # Encoder-only MPRA minimal model: recreate the encoder-only forward used in
-            # create_model_with_custom_heads(..., use_encoder_output=True,...).
-            from alphagenome_research.model import model as model_lib
-            from alphagenome_research.model.metadata import metadata as metadata_lib
-            from alphagenome_ft.embeddings_extended import ExtendedEmbeddings
-            import jmp
-            import haiku as hk
-
-            # Load metadata (same as in create_model_with_custom_heads).
-            metadata = {}
-            for organism in dna_model.Organism:
-                metadata[organism] = metadata_lib.load(organism)
-
             # Infer original training sequence length from checkpoint parameters
-            # For flatten pooling, check the first hidden layer's input size
-            inferred_seq_len = None
+            # Use provided init_seq_len if available, otherwise infer from checkpoint
+            inferred_seq_len = init_seq_len
             encoder_feature_size = 1536  # Standard encoder output feature size per position
             
-            # Try to find hidden_0/w parameter using JAX tree utilities to flatten and search
-            for head_name in custom_heads:
-                param_value = None
-                param_path = None
-                
-                # Flatten the parameter tree to get all (path, value) pairs
+            # If init_seq_len not provided, try to infer from checkpoint parameters
+            if inferred_seq_len is None:
+                # Try to find hidden_0/w parameter to infer sequence length
                 def flatten_with_paths(tree, path=()):
                     """Flatten tree and return (path_tuple, value) pairs."""
                     if isinstance(tree, dict):
@@ -2688,148 +2674,156 @@ def load_checkpoint(
                     else:
                         yield (path, tree)
                 
-                # Search through all flattened parameters
-                for params_dict in [merged_params, loaded_params]:
-                    for path_tuple, value in flatten_with_paths(params_dict):
-                        # Convert path tuple to string
-                        path_str = '/'.join(str(p) for p in path_tuple)
-                        # Check if this is hidden_0/w
-                        if 'hidden_0' in path_str and path_str.endswith('/w'):
-                            if isinstance(value, (jnp.ndarray, jax.Array)) and len(value.shape) == 2:
-                                param_value = value
-                                param_path = path_str
-                                break
-                    if param_value is not None:
-                        break
-                
-                if param_value is not None and isinstance(param_value, (jnp.ndarray, jax.Array)) and len(param_value.shape) == 2:
-                    # Found the weight matrix
-                    input_size = param_value.shape[0]
-                    # For flatten pooling: input_size = num_positions * encoder_feature_size
-                    # Check if this looks like flatten pooling (divisible by encoder_feature_size)
-                    if input_size % encoder_feature_size == 0:
-                        num_positions = input_size // encoder_feature_size
-                        # Encoder has 128bp resolution per position
-                        inferred_seq_len = num_positions * 128
-                        print(f"  Inferred original training sequence length: {inferred_seq_len}bp "
-                              f"(from {num_positions} encoder positions, input_size={input_size}, path={param_path})")
-                        break
-
-            # Mixed precision policy (match training).
-            policy = jmp.get_policy('params=float32,compute=bfloat16,output=bfloat16')
-            hk.mixed_precision.set_policy(model_lib.AlphaGenome, policy)
-            
-            # Store inferred_seq_len in a way that will be captured by closure
-            # Calculate expected positions once here to ensure it's captured correctly
-            # Use a sentinel value of -1 to indicate "no padding needed" (JAX-friendly)
-            if inferred_seq_len is not None and inferred_seq_len > 0:
-                _expected_positions = (inferred_seq_len + 127) // 128  # Ceiling division
-            else:
-                _expected_positions = -1  # Use -1 as sentinel (JAX-friendly, not None)
-
-            @hk.transform_with_state
-            def _forward_with_custom_heads(dna_sequence, organism_index):
-                    """Encoder-only forward: SequenceEncoder -> ExtendedEmbeddings -> custom heads."""
-                    with hk.mixed_precision.push_policy(model_lib.AlphaGenome, policy):
-                        with hk.mixed_precision.push_policy(model_lib.SequenceEncoder, policy):
-                            with hk.name_scope('alphagenome'):
-                                # Run encoder ONLY (no transformer/decoder).
-                                trunk, intermediates = model_lib.SequenceEncoder()(dna_sequence)
-                                encoder_output = trunk  # Shape: (batch, num_positions, encoder_feature_size)
-                                
-                                # Pad or truncate encoder_output to match expected size (for flatten pooling)
-                                # Note: Encoder outputs positions at 128bp resolution (S//128)
-                                # CRITICAL: Always pad/truncate to match checkpoint's expected size for flatten pooling
-                                # This ensures the head sees the correct input size (num_positions * 1536)
-                                if _expected_positions > 0:
-                                    current_pos = encoder_output.shape[1]
-                                    batch_size = encoder_output.shape[0]
-                                    feature_size = encoder_output.shape[2]
-                                    
-                                    # Convert to JAX ints for comparison
-                                    current_pos_jax = jnp.int32(current_pos)
-                                    expected_pos_jax = jnp.int32(_expected_positions)
-                                    
-                                    # Always pad to exactly _expected_positions
-                                    # Use dynamic_update_slice - it correctly handles smaller source arrays
-                                    def pad_impl():
-                                        # Create a zero array of the exact target size
-                                        padded_output = jnp.zeros((batch_size, _expected_positions, feature_size), dtype=encoder_output.dtype)
-                                        
-                                        # Insert encoder_output at the beginning
-                                        # dynamic_update_slice will copy as much as fits, leaving the rest as zeros
-                                        padded_output = jax.lax.dynamic_update_slice(
-                                            padded_output,
-                                            encoder_output,
-                                            (0, 0, 0)  # Start indices for (batch, position, feature)
-                                        )
-                                        
-                                        return padded_output
-                                    
-                                    def truncate_impl():
-                                        return jax.lax.dynamic_slice_in_dim(
-                                            encoder_output, 0, _expected_positions, axis=1
-                                        )
-                                    
-                                    def no_change_impl():
-                                        return encoder_output
-                                    
-                                    encoder_output = jax.lax.cond(
-                                        current_pos_jax < expected_pos_jax,
-                                        pad_impl,
-                                        lambda: jax.lax.cond(
-                                            current_pos_jax > expected_pos_jax,
-                                            truncate_impl,
-                                            no_change_impl
-                                        )
-                                    )
-                                # Wrap into ExtendedEmbeddings with encoder_output only.
-                                embeddings = ExtendedEmbeddings(
-                                    embeddings_1bp=None,
-                                    embeddings_128bp=None,
-                                    encoder_output=encoder_output,
-                                )
+                for head_name in custom_heads:
+                    param_value = None
+                    param_path = None
                     
-                    # Run custom heads outside the alphagenome scope.
-                    predictions = {}
-                    num_organisms = len(metadata)
-                    with hk.name_scope('head'):
-                        for head_name in custom_heads:
-                            head = custom_heads_module.create_custom_head(
-                                head_name, metadata=None, num_organisms=num_organisms
-                            )
-                            predictions[head_name] = head(embeddings, organism_index)
-
-                    return predictions, embeddings
-
-            # JIT-compiled wrapper that matches the interface expected by CustomAlphaGenomeModel.
-            @jax.jit
-            def custom_forward(params, state, rng, dna_sequence, organism_index):
-                (predictions, _), _ = _forward_with_custom_heads.apply(
-                    params, state, None, dna_sequence, organism_index
-                )
-                return predictions
-
-            custom_forward_fn = custom_forward
-        else:
-            # Standard minimal model: use base model's existing forward function.
-            custom_forward_fn = None
-        
-        # Create custom model with merged parameters
-        custom_model = CustomAlphaGenomeModel(
-            base_model,
-            merged_params,
-            merged_state,
-            custom_forward_fn=custom_forward_fn,
-            custom_heads_list=custom_heads,
-            head_configs={
-                name: custom_heads_module.get_custom_head_config(name)
-                for name in custom_heads
-            },
-        )
-        if use_encoder_output:
+                    # Search through all flattened parameters
+                    for params_dict in [loaded_params]:
+                        for path_tuple, value in flatten_with_paths(params_dict):
+                            path_str = '/'.join(str(p) for p in path_tuple)
+                            # Check if this is hidden_0/w
+                            if 'hidden_0' in path_str and path_str.endswith('/w'):
+                                if isinstance(value, (jnp.ndarray, jax.Array)) and len(value.shape) == 2:
+                                    param_value = value
+                                    param_path = path_str
+                                    break
+                        if param_value is not None:
+                            break
+                    
+                    if param_value is not None and isinstance(param_value, (jnp.ndarray, jax.Array)) and len(param_value.shape) == 2:
+                        input_size = param_value.shape[0]
+                        # For flatten pooling: input_size = num_positions * encoder_feature_size
+                        if input_size % encoder_feature_size == 0:
+                            num_positions = input_size // encoder_feature_size
+                            inferred_seq_len = num_positions * 128
+                            print(f"  Inferred original training sequence length: {inferred_seq_len}bp "
+                                  f"(from {num_positions} encoder positions, input_size={input_size}, path={param_path})")
+                            break
+            
+            # Create model structure first with encoder-only forward function
+            # This ensures the forward function is set up correctly from the start
+            print(f"  Creating model structure with encoder-only forward (init_seq_len={inferred_seq_len}bp)...")
+            model = create_model_with_custom_heads(
+                base_model_version,
+                custom_heads=custom_heads,
+                organism_settings=organism_settings,
+                device=device,
+                checkpoint_path=base_checkpoint_path,
+                use_encoder_output=True,
+                init_seq_len=inferred_seq_len,
+            )
+            
+            # Now merge minimal params (encoder + heads) into the model structure
+            def merge_minimal_params(base_params, minimal_params):
+                """Merge minimal params (encoder + heads) into base params."""
+                import copy
+                merged = copy.deepcopy(base_params)
+                
+                # Merge encoder parameters (nested structure)
+                if (
+                    isinstance(minimal_params, dict)
+                    and 'alphagenome' in minimal_params
+                    and isinstance(minimal_params['alphagenome'], dict)
+                    and 'sequence_encoder' in minimal_params['alphagenome']
+                ):
+                    if 'alphagenome' not in merged or not isinstance(merged.get('alphagenome'), dict):
+                        merged['alphagenome'] = {}
+                    merged['alphagenome']['sequence_encoder'] = minimal_params['alphagenome']['sequence_encoder']
+                
+                # Merge custom head parameters (nested structure)
+                if (
+                    isinstance(minimal_params, dict)
+                    and 'alphagenome' in minimal_params
+                    and isinstance(minimal_params['alphagenome'], dict)
+                    and 'head' in minimal_params['alphagenome']
+                ):
+                    if 'alphagenome' not in merged or not isinstance(merged.get('alphagenome'), dict):
+                        merged['alphagenome'] = {}
+                    if 'head' not in merged['alphagenome']:
+                        merged['alphagenome']['head'] = {}
+                    for head_name, head_params in minimal_params['alphagenome']['head'].items():
+                        merged['alphagenome']['head'][head_name] = head_params
+                
+                # Also handle flat structure (use_encoder_output=True mode)
+                if isinstance(minimal_params, dict):
+                    for key, value in minimal_params.items():
+                        key_str = str(key)
+                        if 'sequence_encoder' in key_str or key_str.startswith('head/'):
+                            merged[key] = value
+                
+                return merged
+            
+            model._params = merge_minimal_params(model._params, loaded_params)
+            if loaded_state:
+                model._state = merge_minimal_params(model._state, loaded_state)
+            
+            # Ensure parameters and state are on the correct device
+            device = model._device_context._device
+            model._params = jax.device_put(model._params, device)
+            model._state = jax.device_put(model._state, device)
+            
+            custom_model = model
             print("✓ Minimal model loaded (encoder + custom heads, encoder-only forward)")
         else:
+            # Standard minimal model (not encoder-only): load base model and merge params
+            if base_checkpoint_path is not None:
+                print(f"  Using local base checkpoint at: {base_checkpoint_path}")
+                base_model = dna_model.create(
+                    base_checkpoint_path,
+                    organism_settings=organism_settings,
+                    device=device,
+                )
+            else:
+                base_model = dna_model.create_from_kaggle(
+                    base_model_version,
+                    organism_settings=organism_settings,
+                    device=device,
+                )
+            
+            # Merge minimal params (encoder + heads) with base model params
+            def merge_minimal_params(base_params, minimal_params):
+                """Merge minimal params (encoder + heads) into base params."""
+                merged = jax.tree_util.tree_map(lambda x: x, base_params)  # Deep copy
+                
+                # Merge encoder parameters
+                if 'alphagenome' in minimal_params and 'sequence_encoder' in minimal_params['alphagenome']:
+                    if 'alphagenome' not in merged:
+                        merged['alphagenome'] = {}
+                    merged['alphagenome']['sequence_encoder'] = minimal_params['alphagenome']['sequence_encoder']
+                
+                # Merge custom head parameters
+                if 'alphagenome' in minimal_params and 'head' in minimal_params['alphagenome']:
+                    if 'alphagenome' not in merged:
+                        merged['alphagenome'] = {}
+                    if 'head' not in merged['alphagenome']:
+                        merged['alphagenome']['head'] = {}
+                    for head_name in minimal_params['alphagenome']['head']:
+                        merged['alphagenome']['head'][head_name] = minimal_params['alphagenome']['head'][head_name]
+                
+                # Also handle flat structure
+                for key, value in minimal_params.items():
+                    key_str = str(key)
+                    if 'sequence_encoder' in key_str or any(head_name in key_str for head_name in custom_heads):
+                        merged[key] = value
+                
+                return merged
+            
+            merged_params = merge_minimal_params(base_model._params, loaded_params)
+            merged_state = merge_minimal_params(base_model._state, loaded_state) if loaded_state else base_model._state
+            
+            # Create custom model with merged parameters (no custom forward - uses base model's forward)
+            custom_model = CustomAlphaGenomeModel(
+                base_model,
+                merged_params,
+                merged_state,
+                custom_forward_fn=None,
+                custom_heads_list=custom_heads,
+                head_configs={
+                    name: custom_heads_module.get_custom_head_config(name)
+                    for name in custom_heads
+                },
+            )
             print("✓ Minimal model loaded (encoder + custom heads, transformer/decoder from base model)")
     else:
         # Heads-only checkpoint - need to merge with base model
