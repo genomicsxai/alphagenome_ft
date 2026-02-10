@@ -62,8 +62,8 @@ rna_config = get_predefined_head_config(
 register_predefined_head("K562_rna_seq", rna_config)
 
 # 3. Create a model that uses the registered instance
-model = create_model_with_heads("all_folds", heads=["rna_seq_ft"])
-model.freeze_except_head("rna_seq_ft")
+model = create_model_with_heads("all_folds", heads=["K562_rna_seq"])
+model.freeze_except_head("K562_rna_seq")
 ```
 
 ### Using Template Heads
