@@ -3,20 +3,19 @@
 Expected YAML/JSON format:
 
 heads:
-  - name: my_custom_head
+  - id: my_custom_head
     source: custom
     bigwigs:
       - /data/tracks/track1.bw
       - /data/tracks/track2.bw
     # Custom heads must be registered in code before loading this config.
 
-  - name: my_rna_instance  # instance name
+  - id: my_rna_instance  # instance alias used for training/checkpoints
     source: predefined
-    config:
-      name: rna_seq  # predefined head kind
-      # Optional overrides:
-      # resolutions: [1, 128]
-      # apply_squashing: true # true for RNA-seq, false for the others
+    kind: rna_seq         # predefined head kind
+    # Optional predefined-head overrides:
+    # resolutions: [1, 128]
+    # apply_squashing: true # true for RNA-seq, false for the others
     # Use either `targets` with metadata or `bigwigs` without metadata. 
     targets:
       - bigwig: /data/rnaseq/track_001.bw
@@ -64,8 +63,9 @@ class TrackInfo:
 class HeadSpec:
     """Configuration for a finetuning head."""
 
-    head_name: str
+    head_id: str
     source: str
+    kind: str | None
     tracks: Sequence[TrackInfo]
     config: Any | None = None
     metadata: Mapping[dna_client.Organism, pd.DataFrame] | None = None
@@ -156,70 +156,81 @@ def build_head_specs(
             raise ValueError(f'Unknown organism "{organism}".') from exc
 
     specs: list[HeadSpec] = []
-    seen_names: set[str] = set()
+    seen_ids: set[str] = set()
     for entry in heads_cfg:
-        if 'name' not in entry:
-            raise ValueError('Each head entry must include a "name".')
+        if 'id' not in entry:
+            raise ValueError('Each head entry must include an "id".')
         if 'source' not in entry:
             raise ValueError(
-                f'Head "{entry["name"]}" must include a "source" (custom|predefined).'
+                f'Head "{entry["id"]}" must include a "source" (custom|predefined).'
             )
 
-        head_name = normalize_head_name(entry['name'])
-        if head_name in seen_names:
-            raise ValueError(f'Duplicate head name "{head_name}" in config.')
-        seen_names.add(head_name)
+        head_id = normalize_head_name(entry['id'])
+        if head_id in seen_ids:
+            raise ValueError(f'Duplicate head id "{head_id}" in config.')
+        seen_ids.add(head_id)
 
         source = str(entry['source']).lower()
         targets = entry.get('targets')
         bigwigs = entry.get('bigwigs')
         if targets is not None and bigwigs is not None:
             raise ValueError(
-                f'Head "{head_name}" must use only one of "targets" or "bigwigs".'
+                f'Head "{head_id}" must use only one of "targets" or "bigwigs".'
             )
         if targets is None and bigwigs is None:
             raise ValueError(
-                f'Head "{head_name}" must include "targets" (preferred) or "bigwigs".'
+                f'Head "{head_id}" must include "targets" (preferred) or "bigwigs".'
             )
         if targets is not None:
             tracks = parse_targets(targets)
         else:
             tracks = parse_bigwigs(bigwigs)
-        config_block = entry.get('config')
-        if config_block is not None and not isinstance(config_block, Mapping):
-            raise ValueError(f'Head "{head_name}" config must be a mapping.')
-
         if source == 'custom':
-            if not is_custom_head(head_name):
+            if 'config' in entry:
                 raise ValueError(
-                    f'Custom head "{head_name}" is not registered. '
+                    f'Custom head "{head_id}" does not accept a "config" block.'
+                )
+            if not is_custom_head(head_id):
+                raise ValueError(
+                    f'Custom head "{head_id}" is not registered. '
                     'Register it before loading this config.'
                 )
-            if config_block:
-                raise ValueError(
-                    f'Custom head "{head_name}" does not accept a config block.'
-                )
-            head_config = get_custom_head_config(head_name)
+            head_config = get_custom_head_config(head_id)
             if head_config is not None and len(tracks) != head_config.num_tracks:
                 raise ValueError(
-                    f'Custom head "{head_name}" expects {head_config.num_tracks} '
+                    f'Custom head "{head_id}" expects {head_config.num_tracks} '
                     f'target tracks, got {len(tracks)}.'
                 )
             specs.append(
                 HeadSpec(
-                    head_name=head_name,
+                    head_id=head_id,
                     source='custom',
+                    kind=None,
                     tracks=tracks,
                 )
             )
         elif source == 'predefined':
-            if not config_block or 'name' not in config_block:
+            kind_name = entry.get('kind')
+            if not kind_name:
                 raise ValueError(
-                    f'Predefined head "{head_name}" must include config.name.'
+                    f'Predefined head "{head_id}" must include "kind".'
                 )
-            kind_name = config_block['name']
-            overrides = dict(config_block)
-            overrides.pop('name', None)
+            if 'config' in entry:
+                raise ValueError(
+                    f'Predefined head "{head_id}" no longer accepts nested "config". '
+                    'Move override fields to the head entry.'
+                )
+            overrides = {
+                field: entry.get(field)
+                for field in (
+                    'resolutions',
+                    'apply_squashing',
+                    'embedding_channels',
+                    'num_tissues',
+                    'num_tracks',
+                )
+                if field in entry
+            }
             if not is_predefined_head(kind_name):
                 raise ValueError(
                     f'Unknown predefined head kind "{kind_name}".'
@@ -234,13 +245,13 @@ def build_head_specs(
             unknown = set(overrides) - allowed_fields
             if unknown:
                 raise ValueError(
-                    f'Unknown config field(s) for predefined head "{head_name}": '
+                    f'Unknown config field(s) for predefined head "{head_id}": '
                     f'{sorted(unknown)}'
                 )
             if 'num_tracks' in overrides:
                 if int(overrides['num_tracks']) != len(tracks):
                     raise ValueError(
-                        f'Predefined head "{head_name}" num_tracks '
+                        f'Predefined head "{head_id}" num_tracks '
                         f'{overrides["num_tracks"]} does not match bigwigs '
                         f'({len(tracks)}).'
                     )
@@ -255,8 +266,9 @@ def build_head_specs(
             metadata = _build_track_metadata(tracks, organism_enum)
             specs.append(
                 HeadSpec(
-                    head_name=head_name,
+                    head_id=head_id,
                     source='predefined',
+                    kind=str(kind_name),
                     tracks=tracks,
                     config=head_config,
                     metadata=metadata,
@@ -264,7 +276,7 @@ def build_head_specs(
             )
         else:
             raise ValueError(
-                f'Head "{head_name}" has invalid source "{source}" (custom|predefined).'
+                f'Head "{head_id}" has invalid source "{source}" (custom|predefined).'
             )
 
     if not specs:
@@ -278,11 +290,11 @@ def validate_heads(specs: Sequence[HeadSpec]) -> None:
         if spec.source != 'custom':
             if spec.source == 'predefined' and spec.config is None:
                 raise ValueError(
-                    f'Predefined head "{spec.head_name}" missing config.'
+                    f'Predefined head "{spec.head_id}" missing config.'
                 )
             continue
-        if not is_custom_head(spec.head_name):
+        if not is_custom_head(spec.head_id):
             raise ValueError(
-                f'Custom head "{spec.head_name}" is not registered. '
+                f'Custom head "{spec.head_id}" is not registered. '
                 'Register it before loading this config.'
             )

@@ -15,6 +15,11 @@ from alphagenome_ft.finetune.data import (
     load_intervals,
     prepare_batch,
 )
+from alphagenome_ft.finetune.train import (
+    register_predefined_heads,
+    create_optimizer,
+    train,
+)
 
 __all__ = [
     'TrackInfo',
@@ -28,4 +33,7 @@ __all__ = [
     'build_interval',
     'load_intervals',
     'prepare_batch',
+    'register_predefined_heads',
+    'create_optimizer',
+    'train',
 ]

@@ -59,7 +59,7 @@ class BigWigDataModule:
                 handles = []
                 for track in spec.tracks:
                     handles.append(stack.enter_context(pyBigWig.open(str(track.path))))
-                head_handles[spec.head_name] = handles
+                head_handles[spec.head_id] = handles
 
             batch_indices: list[int] = []
             for idx in order:
@@ -79,7 +79,7 @@ class BigWigDataModule:
         head_handles: Mapping[str, Sequence[pyBigWig.pyBigWig]],
     ) -> dict[str, np.ndarray]:
         sequences = []
-        targets: dict[str, list[np.ndarray]] = {spec.head_name: [] for spec in self._head_specs}
+        targets: dict[str, list[np.ndarray]] = {spec.head_id: [] for spec in self._head_specs}
 
         for idx in batch_indices:
             window = windows[idx]
@@ -90,11 +90,11 @@ class BigWigDataModule:
             seq_len = encoded.shape[0]
             for spec in self._head_specs:
                 channel_arrays = []
-                for handle in head_handles[spec.head_name]:
+                for handle in head_handles[spec.head_id]:
                     values = handle.values(window.chromosome, window.start, window.end)
                     track = self._prepare_track(values, seq_len)
                     channel_arrays.append(track)
-                targets[spec.head_name].append(np.stack(channel_arrays, axis=-1))
+                targets[spec.head_id].append(np.stack(channel_arrays, axis=-1))
 
         batch = {
             'sequences': np.stack(sequences, axis=0).astype(np.float32),
