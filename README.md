@@ -2,6 +2,11 @@
 
 A lightweight Python package for finetuning [Google DeepMind's AlphaGenome](https://github.com/google-deepmind/alphagenome_research/) model with custom prediction heads and parameter freezing capabilities, **without modifying the original codebase**.
 
+## Contributors
+
+* [Alan Murphy](https://al-murphy.github.io/)
+* [Masayuki (Moon) Nagai](https://masayukinagai.github.io/)
+
 ## Features
 
 - **Custom Prediction Heads**: Define and register your own task-specific prediction heads
