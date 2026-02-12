@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13"]
 
     steps:
       - uses: actions/checkout@v4
@@ -25,9 +25,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          pip install jax jaxlib dm-haiku orbax-checkpoint
           pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install git+https://github.com/google-deepmind/alphagenome.git
+          pip install git+https://github.com/google-deepmind/alphagenome_research.git
           pip install -e ".[test]"
 
       - name: Run unit tests
         run: |
-          pytest -m unit --tb=short
+          pytest
