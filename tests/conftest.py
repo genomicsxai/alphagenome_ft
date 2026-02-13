@@ -63,6 +63,33 @@ class MPRAHeadForTesting(CustomHead):
 
 
 # ============================================================================
+# Kaggle credential helpers
+# ============================================================================
+
+
+def _has_kaggle_credentials() -> bool:
+    """Return True if Kaggle API credentials are configured in the environment."""
+    return bool(
+        os.environ.get("KAGGLE_USERNAME") and os.environ.get("KAGGLE_KEY")
+    )
+
+
+def require_kaggle_credentials() -> None:
+    """Skip the current test if Kaggle credentials are not available.
+
+    Many tests rely on ``dna_model.create_from_kaggle``, which triggers an
+    interactive kagglehub login when credentials are missing. In CI / non‑TTY
+    environments this causes hangs and getpass errors, so we proactively
+    skip such tests unless the necessary environment variables are set.
+    """
+    if not _has_kaggle_credentials():
+        pytest.skip(
+            "Kaggle credentials not configured (KAGGLE_USERNAME/KAGGLE_KEY). "
+            "Skipping tests that require downloading the AlphaGenome model."
+        )
+
+
+# ============================================================================
 # Pytest Fixtures
 # ============================================================================
 
@@ -74,20 +101,8 @@ def device():
 
 @pytest.fixture(scope="session")
 def base_model(device):
-    """Load pretrained AlphaGenome model (reused across tests).
-
-    In CI or other non-interactive environments without Kaggle credentials,
-    we skip tests that require downloading the pretrained model rather than
-    hanging on an interactive login prompt.
-    """
-    has_kaggle_creds = bool(
-        os.environ.get("KAGGLE_USERNAME") and os.environ.get("KAGGLE_KEY")
-    )
-    if not has_kaggle_creds:
-        pytest.skip(
-            "Kaggle credentials not configured (KAGGLE_USERNAME/KAGGLE_KEY). "
-            "Skipping tests that require downloading the AlphaGenome model."
-        )
+    """Load pretrained AlphaGenome model (reused across tests)."""
+    require_kaggle_credentials()
     return dna_model.create_from_kaggle('all_folds', device=device)
 
 
@@ -150,6 +165,7 @@ def wrapped_model_with_head(base_model, registered_mpra_head):
 @pytest.fixture(scope="function")
 def custom_only_model(registered_mpra_head, device):
     """Create model with only custom head."""
+    require_kaggle_credentials()
     return create_model_with_heads(
         'all_folds',
         heads=[registered_mpra_head],
