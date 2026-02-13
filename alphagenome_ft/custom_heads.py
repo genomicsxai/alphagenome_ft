@@ -413,7 +413,17 @@ def get_predefined_head_config(
     if kind_enum is None:
         raise ValueError(f"Head '{head_name}' is not a predefined head.")
     base_config = predefined_heads.get_head_config(kind_enum)
-    overrides: dict[str, Any] = {"num_tracks": int(num_tracks)}
+    # Start with an empty override dict. Older AlphaGenome configs exposed
+    # ``num_tracks`` directly on the dataclass, but newer versions (e.g.
+    # GenomeTracksHeadConfig) do not accept it as an __init__ argument.
+    # We therefore only override fields that actually exist on the base
+    # config to stay compatible across versions.
+    overrides: dict[str, Any] = {}
+
+    # If the underlying config supports ``num_tracks``, respect the user
+    # provided value; otherwise we rely on the library default.
+    if hasattr(base_config, "num_tracks"):
+        overrides["num_tracks"] = int(num_tracks)
 
     def _maybe_override(field: str, value: Any) -> None:
         if value is None:

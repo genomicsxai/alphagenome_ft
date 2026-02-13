@@ -1,6 +1,8 @@
 """
 Pytest configuration and fixtures for alphagenome_ft tests.
 """
+import os
+
 import pytest
 import jax
 import jax.numpy as jnp
@@ -72,7 +74,20 @@ def device():
 
 @pytest.fixture(scope="session")
 def base_model(device):
-    """Load pretrained AlphaGenome model (reused across tests)."""
+    """Load pretrained AlphaGenome model (reused across tests).
+
+    In CI or other non-interactive environments without Kaggle credentials,
+    we skip tests that require downloading the pretrained model rather than
+    hanging on an interactive login prompt.
+    """
+    has_kaggle_creds = bool(
+        os.environ.get("KAGGLE_USERNAME") and os.environ.get("KAGGLE_KEY")
+    )
+    if not has_kaggle_creds:
+        pytest.skip(
+            "Kaggle credentials not configured (KAGGLE_USERNAME/KAGGLE_KEY). "
+            "Skipping tests that require downloading the AlphaGenome model."
+        )
     return dna_model.create_from_kaggle('all_folds', device=device)
 
 
