@@ -31,7 +31,12 @@ jobs:
           pip install git+https://github.com/google-deepmind/alphagenome.git
           pip install git+https://github.com/google-deepmind/alphagenome_research.git
           pip install -e ".[test]"
-
+      
+      - name: Debug environment
+        run: |
+          pip freeze
+          python -c "import optax; print('optax OK')"
+      
       - name: Run unit tests
         run: |
           pytest
