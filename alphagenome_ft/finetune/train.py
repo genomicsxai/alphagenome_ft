@@ -118,8 +118,36 @@ def train(
     early_stopping_patience: int = 0,
     early_stopping_min_delta: float = 0.0,
     verbose: bool = False,
+    use_wandb: bool = False,
+    wandb_project: str | None = None,
+    wandb_entity: str | None = None,
+    wandb_run_name: str | None = None,
+    wandb_config: dict | None = None,
 ) -> None:
     """Main training loop with JIT-compiled train/eval step functions."""
+    if use_wandb:
+        import wandb
+
+        wb_config = {
+            "learning_rate": learning_rate,
+            "weight_decay": weight_decay,
+            "num_epochs": num_epochs,
+            "batch_size": data_module._batch_size,
+            "heads_only": heads_only,
+            "organism": organism,
+            "best_metric": best_metric,
+            "best_metric_mode": best_metric_mode,
+            "early_stopping_patience": early_stopping_patience,
+            "seed": seed,
+            **(wandb_config or {}),
+        }
+        wandb.init(
+            project=wandb_project or "alphagenome-ft",
+            entity=wandb_entity,
+            name=wandb_run_name,
+            config=wb_config,
+        )
+
     head_names = [spec.head_id for spec in head_specs]
     if heads_only:
         model.freeze_backbone()
@@ -257,11 +285,16 @@ def train(
                         flush=True,
                     )
 
+                if use_wandb:
+                    wandb.log({"train/step_loss": loss_scalar, "epoch": epoch, "step": step})
+
             train_loss_avg = float(np.mean(train_losses)) if train_losses else None
             if verbose:
                 print()
             if train_loss_avg is not None:
                 print(f"  Train loss: {train_loss_avg:.4f}")
+                if use_wandb:
+                    wandb.log({"train/epoch_loss": train_loss_avg, "epoch": epoch})
 
             valid_metrics: Mapping[str, float] | None = None
             if "valid" in data_module._intervals and len(data_module._intervals["valid"]) > 0:
@@ -274,12 +307,19 @@ def train(
 
                 valid_metrics = {head: float(np.mean(values)) for head, values in losses.items() if values}
                 print("  Validation metrics:", ", ".join(f"{k}={v:.4f}" for k, v in valid_metrics.items()))
+                if use_wandb:
+                    valid_log = {f"valid/{head}": v for head, v in valid_metrics.items()}
+                    valid_log["valid/loss"] = float(sum(valid_metrics.values()))
+                    valid_log["epoch"] = epoch
+                    wandb.log(valid_log)
 
             metric_label, metric_value = resolve_metric(best_metric, train_loss_avg, valid_metrics)
             if metric_value is not None and math.isfinite(metric_value):
                 if is_improved(metric_value, best_value):
                     best_value = metric_value
                     epochs_since_improvement = 0
+                    if use_wandb:
+                        wandb.log({"best/" + metric_label: metric_value, "epoch": epoch})
                     if checkpoint_dir:
                         print(
                             f"  Metric improved ({metric_label} = {metric_value:.4f}) "
@@ -304,6 +344,9 @@ def train(
     print(f'\n{"=" * 60}')
     print("Training complete!")
     print(f'{"=" * 60}')
+
+    if use_wandb:
+        wandb.finish()
 
 
 __all__ = [
