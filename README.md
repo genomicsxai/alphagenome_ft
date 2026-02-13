@@ -6,6 +6,7 @@ A lightweight Python package for finetuning [Google DeepMind's AlphaGenome](http
 
 * [Alan Murphy](https://al-murphy.github.io/)
 * [Masayuki (Moon) Nagai](https://masayukinagai.github.io/)
+* [Alejandro Buendia](https://abuendia.github.io/)
 
 ## Features
 

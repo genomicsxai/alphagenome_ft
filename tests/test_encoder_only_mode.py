@@ -16,6 +16,7 @@ from alphagenome_ft import (
     register_custom_head,
     create_model_with_heads,
 )
+from tests.conftest import require_kaggle_credentials
 
 
 class SimpleEncoderHead(CustomHead):
@@ -78,6 +79,7 @@ def encoder_head_registered():
 @pytest.fixture(scope="function")
 def encoder_only_model(encoder_head_registered, device):
     """Create model with encoder-only mode."""
+    require_kaggle_credentials()
     return create_model_with_heads(
         'all_folds',
         heads=[encoder_head_registered],
