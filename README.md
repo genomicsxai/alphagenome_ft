@@ -2,17 +2,37 @@
 
 A lightweight Python package for finetuning [Google DeepMind's AlphaGenome](https://github.com/google-deepmind/alphagenome_research/) model with custom prediction heads and parameter freezing capabilities, **without modifying the original codebase**.
 
-## Contributors
+**Initial Creator - [Alan Murphy](https://al-murphy.github.io/)**
 
-* [Alan Murphy](https://al-murphy.github.io/)
-* [Masayuki (Moon) Nagai](https://masayukinagai.github.io/)
-* [Alejandro Buendia](https://abuendia.github.io/)
+
+## Contents
+
+- **Overview**
+  - [Features](#features)
+  - [Installation](#installation)
+  - [Quick Start](#quick-start)
+- **Tutorials**
+  - [Frozen backbone, new head (heads-only finetuning)](docs/frozen_backbone_new_head.md)
+  - [Full-model finetuning (unfreezing the backbone)](docs/full_model_finetuning.md)
+  - [Encoder-only finetuning for perturbation / MPRA data](docs/encoder_only_perturbation.md)
+  - [LoRA-style adapters on top of AlphaGenome](docs/lora_adapters.md)
+- **Architecture & API**
+  - [AlphaGenome Architecture](#alphagenome-architecture)
+  - [Custom Head Types Guide](#custom-head-types-guide)
+  - [Head Type Comparison](#head-type-comparison)
+  - [Complete Examples](#complete-examples)
+  - [API Reference](#api-reference)
+- **Advanced Usage**
+  - [Saving and Loading Checkpoints](#saving-and-loading-checkpoints)
+  - [Attribution Analysis](#attribution-analysis)
+  - [Testing](#testing)
+  - [Contributing](#contributing)
 
 ## Features
 
 - **Custom Prediction Heads**: Define and register your own task-specific prediction heads
 - **Parameter Freezing**: Flexible parameter management (freeze backbone, heads, or specific layers)
-- **Easy Integration**: Works seamlessly with pretrained AlphaGenome models (Simple wrapper classes)
+- **Easy Integration**: Works seamlessly with pretrained AlphaGenome models (simple wrapper classes)
 - **Parameter Inspection**: Utilities to explore and count model parameters
 - **Attribution Analysis**: Utilities to calculate attributions based on gradients or _in silico_ mutagenesis (ISM)
 - **JAX/Haiku Native**: Built on the same framework as AlphaGenome
@@ -43,6 +63,8 @@ pip install git+https://github.com/google-deepmind/alphagenome_research.git
 ```
 
 ## Quick Start
+
+If you want **step‑by‑step finetuning recipes**, see the tutorials in `docs/` (linked in the Contents above). The sections below focus on concise API examples.
 
 ### Using a Predefined AlphaGenome Head
 
@@ -563,7 +585,7 @@ for epoch in range(num_epochs):
 - The returned `loss_fn` automatically instantiates the head within a transform and calls its `loss()` method
 - Use this `loss_fn` inside your gradient computation
 
-For a complete working example with gradient accumulation and Weights & Biases integration, see the [MPRA finetuning example](../alphagenome_FT_MPRA/src/README.md).
+For a complete working example with gradient accumulation and Weights & Biases integration using encoder-only heads on perturbation data, see the `src/README.md` and training scripts in the separate MPRA finetuning repository.
 
 ### Head Registration
 
@@ -786,7 +808,7 @@ attributions = model.compute_deepshap_attributions(
 )
 ```
 
-For complete examples with motif analysis, background shuffling, and batch processing, see the [MPRA attribution script](../alphagenome_FT_MPRA/scripts/compute_attributions.py) and [DeepSTARR attribution script](../alphagenome_FT_MPRA/scripts/compute_attributions_starrseq.py).
+For complete examples with motif analysis, background shuffling, and batch processing, see the MPRA finetuning repository’s attribution scripts (for example `scripts/compute_attributions_lentimpra.py` and `scripts/compute_attributions_starrseq.py`).
 
 ## Testing
 
