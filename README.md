@@ -268,11 +268,14 @@ loss_fn = model.create_loss_fn_for_head('my_head')
 
 ### After training: Attribution analysis
 
-Compute attributions after training to see which sequence features drive predictions. **Methods:** DeepSHAP*, Gradient × Input, Gradient, ISM. Load a checkpoint, then use `compute_deepshap_attributions`, `compute_input_gradients`, or `compute_ism_attributions`; visualize with `plot_attribution_map` and `plot_sequence_logo`.
+Compute attributions after training to see which sequence features drive predictions.  
+**Methods:** DeepSHAP*, Gradient × Input, Gradient, ISM.  
+Load a checkpoint, then use `compute_deepshap_attributions`, `compute_input_gradients`, or `compute_ism_attributions`; visualize with `plot_attribution_map` and `plot_sequence_logo`.
 
 Full API, examples (basic, visualization, single-sequence pipeline), method comparison, and multi-track `output_index`: **[Attribution analysis](docs/attribution.md)**.
 
 **NOTE**: DeepSHAP* - The implementation is DeepSHAP-like in that it uses a reference sequence but is note a faithful reimplmenntation.
+
 ---
 
 ## References
@@ -296,7 +299,7 @@ DNA Sequence (B, S, 4)
 │  ├─ embeddings_1bp:   (B, S, 1536)             │
 │  ├─ embeddings_128bp: (B, S/128, 3072)         │
 │  ├─ embeddings_pair:  (B, S/2048, S/2048, 128) │
-│  └─ encoder_output*:  (B, S/128, D)            │
+│  └─ encoder_output:   (B, S/128, D)            │
 └────────────────────────────────────────────────┘
     ↓
 ┌─────────────────────────────────────┐
