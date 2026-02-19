@@ -10,6 +10,10 @@ For these settings, AlphaGenome’s full transformer stack is not needed and may
 - **Backbone**: AlphaGenome **encoder only** (CNN downsampling)
 - **Head**: Custom or template head on top of encoder embeddings
 
+**Why encoder-only mode?** Short sequences (< 1000 bp) in perturbation data like MPRA do not consider genomic contextso it doesn't make sense to 
+pass them through a transformer's attention mechanism. Encoder-only mode skips the transformer/decoder and uses only the convolution and pooling 
+features from the encoder - we have shown that this still captures complex _cis_-regultory logic.
+
 ### 1. When to Use Encoder-Only Mode
 
 Use encoder-only mode when:

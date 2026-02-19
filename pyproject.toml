@@ -43,9 +43,9 @@ test = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Al-Murphy/alphagenome_ft"
-Repository = "https://github.com/Al-Murphy/alphagenome_ft"
-Issues = "https://github.com/Al-Murphy/alphagenome_ft/issues"
+Homepage = "https://github.com/genomicsxai/alphagenome_ft"
+Repository = "https://github.com/genomicsxai/alphagenome_ft"
+Issues = "https://github.com/genomicsxai/alphagenome_ft/issues"
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
