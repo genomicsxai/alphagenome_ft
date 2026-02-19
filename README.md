@@ -6,8 +6,8 @@ A lightweight Python package for finetuning [Google DeepMind's AlphaGenome](http
 
 ## Use cases
 
-- If you want to apply AlphaGenome to your MPRA (or other perturbation) data of interest, see [Encoder-only / short sequences (MPRA)](#workflow-3-encoder-only--short-sequences-mpra).
-- If you want to apply AlphaGenome to your own genome-wide assay, start with [Heads-only finetuning (frozen backbone)](#workflow-1-heads-only-finetuning-frozen-backbone); then [LoRA-style adapters](#workflow-4-lora-style-adapters) or [Full-model finetuning](#workflow-2-full-model-finetuning) if needed.
+- If you want to apply AlphaGenome to your MPRA (or other perturbation) data of interest, see [Encoder-only / short sequences (MPRA)](#workflow-1-encoder-only--short-sequences-mpra).
+- If you want to apply AlphaGenome to your own genome-wide assay, start with [Heads-only finetuning (frozen backbone)](#workflow-2-heads-only-finetuning-frozen-backbone); then [LoRA-style adapters](#workflow-3-lora-style-adapters) or [Full-model finetuning](#workflow-4-full-model-finetuning) if needed.
 
 ## Contents
 
@@ -15,11 +15,11 @@ A lightweight Python package for finetuning [Google DeepMind's AlphaGenome](http
   - [Features](#features)
   - [Installation](#installation)
   - [Quick Start](#quick-start)
-- **Workflows** (in recommended run order)
-  1. [Heads-only finetuning (frozen backbone)](#workflow-1-heads-only-finetuning-frozen-backbone) — train a new head on top of a frozen model
-  2. [Full-model finetuning](#workflow-2-full-model-finetuning) — unfreeze the backbone (e.g. progressive unfreezing)
-  3. [Encoder-only / short sequences (MPRA)](#workflow-3-encoder-only--short-sequences-mpra) — finetune on short sequences (&lt; 1 kb)
-  4. [LoRA-style adapters](#workflow-4-lora-style-adapters) — low-rank adapter layers
+- **Workflows**
+  1. [Encoder-only / short sequences (MPRA)](#workflow-1-encoder-only--short-sequences-mpra) — finetune on short sequences (&lt; 1 kb)
+  2. [Heads-only finetuning (frozen backbone)](#workflow-2-heads-only-finetuning-frozen-backbone) — train a new head on top of a frozen model
+  3. [LoRA-style adapters](#workflow-3-lora-style-adapters) — low-rank adapter layers
+  4. [Full-model finetuning](#workflow-4-full-model-finetuning) — unfreeze the backbone (e.g. progressive unfreezing)
   5. [Attribution analysis](#after-training-attribution-analysis) — interpret predictions after training
 - **Reference**
   - [AlphaGenome Architecture](#alphagenome-architecture)
@@ -45,7 +45,7 @@ A lightweight Python package for finetuning [Google DeepMind's AlphaGenome](http
 
 ## Installation
 
-### From PyPI (when published)
+### From PyPI
 ```bash
 pip install alphagenome-ft
 ```
@@ -439,6 +439,29 @@ Contributions welcome! Please:
 3. **Add tests for new functionality** (see [`tests/README.md`](tests/README.md))
 4. Ensure tests pass: `pytest`
 5. Submit a pull request
+
+## Publishing (maintainers)
+
+Releases are published to PyPI via GitHub Actions using [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (no API token stored in the repo).
+
+### One-time setup on PyPI
+
+1. Open [PyPI → alphagenome-ft → Publishing](https://pypi.org/manage/project/alphagenome-ft/settings/publishing/).
+2. Add a trusted publisher:
+   - **Owner:** your GitHub user or org (e.g. `genomicsxai`)
+   - **Repository:** `alphagenome_ft`
+   - **Workflow name:** `publish.yml`
+   - **Environment (optional):** `pypi` if you create that environment in the repo
+
+If you use the `pypi` environment, create it in the repo under Settings → Environments so the workflow can run.
+
+### Releasing a new version
+
+1. Bump `version` in `pyproject.toml` (e.g. `0.1.2`).
+2. Commit and push.
+3. Create and push a tag matching the version:  
+   `git tag v0.1.2 && git push origin v0.1.2`
+4. The [Publish to PyPI](.github/workflows/publish.yml) workflow runs and uploads to PyPI.
 
 ## License
 
