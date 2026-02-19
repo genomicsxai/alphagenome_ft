@@ -7,6 +7,7 @@ requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [
     {name = "Alan Murphy", email = "amurphy@cshl.edu"}
+    {name = "Masayuki Nagai", email = "nagai@cshl.edu"}
 ]
 keywords = ["alphagenome", "genomics", "deep-learning", "finetuning", "jax"]
 classifiers = [
