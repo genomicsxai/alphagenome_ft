@@ -37,13 +37,14 @@ pip install git+https://github.com/google-deepmind/alphagenome_research.git
 ```
 
 ## Quick Start
+There are three options to add new heads to AlphaGenome.
 
-### Using a Predefined AlphaGenome Head
+### Option A: Use a Predefined AlphaGenome Head
 
 You can reuse the predefined head kinds from `alphagenome_research` without importing
 `HeadName` by passing the string value. Supported strings are:
 `atac`, `dnase`, `procap`, `cage`, `rna_seq`, `chip_tf`, `chip_histone`, `contact_maps`,
-`splice_sites_classification`, `splice_sites_usage`, `splice_sites_junction`.
+`splice_sites_classification`, `splice_sites_usage`, `splice_sites_junction`. For the details of each head, refer to [alphagenome_research](https://github.com/google-deepmind/alphagenome_research/blob/main/src/alphagenome_research/model/heads.py).
 
 ```python
 from alphagenome_ft import (
@@ -52,7 +53,7 @@ from alphagenome_ft import (
     create_model_with_heads,
 )
 
-# 1. Build a predefined head config (num_tracks must match your targets)
+# 1. Build a predefined head config (num_tracks must match the number of your target tracks)
 rna_config = get_predefined_head_config(
     "rna_seq",
     num_tracks=4,
@@ -66,7 +67,17 @@ model = create_model_with_heads("all_folds", heads=["K562_rna_seq"])
 model.freeze_except_head("K562_rna_seq")
 ```
 
-### Using Template Heads
+Note if you have a local AlphaGenome weights version you want to use instead of getting the weights from Kaggle use:
+
+```python
+model = create_model_with_heads(
+    'all_folds',
+    heads=['my_head'],
+    checkpoint_path="full/path/to/weights",
+)
+```
+
+### Option B: Use Template Heads
 
 We provide ready-to-use template heads for common scenarios, see `./alphagenome_ft/templates.py`:
 
@@ -102,16 +113,6 @@ model = create_model_with_heads(
 model.freeze_except_head('my_head')
 ```
 
-Note if you have a local AlphaGenome weights version you want to use instead of getting the weights from Kaggle use:
-
-```python
-model = create_model_with_heads(
-    'all_folds',
-    heads=['my_head'],
-    checkpoint_path="full/path/to/weights",
-)
-```
-
 **Available Templates:**
 - `templates.StandardHead` - Uses 1bp embeddings (decoder output: local + global features)
 - `templates.TransformerHead` - Uses 128bp embeddings (transformer output: pure attention)
@@ -121,51 +122,9 @@ All templates use simple architecture: **Linear → ReLU → Linear**
 
 The key difference is **which embeddings** they access. See [`alphagenome_ft/templates.py`](alphagenome_ft/templates.py) for code.
 
-### Alternative: Add Custom Head to Existing Model (Keep Standard Heads)
+### Option C: Define Custom Head from Scratch
 
-If you want to **keep the standard AlphaGenome heads** (ATAC, RNA-seq, etc.) and add your custom head:
-
-```python
-from alphagenome_research.model import dna_model
-from alphagenome_ft import (
-    templates,
-    CustomHeadConfig,
-    CustomHeadType,
-    register_custom_head,
-    add_heads_to_model,
-)
-
-# 1. Load pretrained model (includes standard heads)
-base_model = dna_model.create_from_kaggle('all_folds')
-
-# 2. Register custom head
-register_custom_head(
-    'my_head',
-    templates.StandardHead,
-    CustomHeadConfig(
-        type=CustomHeadType.GENOME_TRACKS,
-        output_type=dna_output.OutputType.RNA_SEQ,
-        num_tracks=1,
-    )
-)
-
-# 3. Add custom head to model (keeps ALL standard heads)
-model = add_heads_to_model(base_model, heads=['my_head'])
-
-# 4. Freeze backbone + standard heads, train only custom head
-model.freeze_except_head('my_head')
-
-# 5. Create loss function for training (see "Training with Custom Heads" section)
-loss_fn = model.create_loss_fn_for_head('my_head')
-```
-
-**When to use each approach:**
-- `create_model_with_heads()` - Heads **only** (faster, smaller)
-- `add_heads_to_model()` - Added heads **+ standard heads** (useful for multi-task)
-
-### Custom Head from Scratch
-
-Define your own head for specialized tasks:
+Define your own head when you need specific head architectures and/or loss:
 
 ```python
 import jax
@@ -195,15 +154,59 @@ class MyCustomHead(CustomHead):
         mse = jnp.mean((predictions - targets) ** 2)
         return {'loss': mse, 'mse': mse}
 
-# Register and use as shown above
+# Register and use in the same way as Option B
 ```
+
+### Note: Add Custom Head to Existing Model (Keep pre-trained Heads)
+
+The three approaches above create models that include only the heads you explicitly provide. If you want to **keep AlphaGenome's pre-trained heads** (ATAC, RNA-seq, etc.) alongside your custom head:
+
+```python
+from alphagenome.models import dna_output
+from alphagenome_research.model import dna_model
+from alphagenome_ft import (
+    templates,
+    CustomHeadConfig,
+    CustomHeadType,
+    register_custom_head,
+    add_heads_to_model,
+)
+
+# 1. Load pretrained model (includes standard heads)
+base_model = dna_model.create_from_kaggle('all_folds')
+
+# 2. Register custom or predefined head
+register_custom_head(
+    'my_head',
+    templates.StandardHead,
+    CustomHeadConfig(
+        type=CustomHeadType.GENOME_TRACKS,
+        output_type=dna_output.OutputType.RNA_SEQ,
+        num_tracks=1,
+    )
+)
+
+# 3. Add custom head to model (keeps ALL standard heads)
+model = add_heads_to_model(base_model, heads=['my_head'])
+
+# 4. Freeze backbone + standard heads, train only custom head
+model.freeze_except_head('my_head')
+
+# 5. Create loss function for training (see "Training with Custom Heads" section)
+loss_fn = model.create_loss_fn_for_head('my_head')
+```
+
+**When to use each approach:**
+- `create_model_with_heads()` - Heads **only** (faster, smaller)
+- `add_heads_to_model()` - Added heads **+ pre-trained heads** (useful when referring to the original tracks)
+
 
 ## AlphaGenome Architecture
 
 Understanding the architecture helps design custom heads:
 
 ```
-DNA Sequence (B, S, 4)
+DNA Sequence (B, L, 4)
     ↓
 ┌─────────────────────────────────────┐
 │ BACKBONE (can be frozen)            │
@@ -212,13 +215,13 @@ DNA Sequence (B, S, 4)
 │  └─ SequenceDecoder              │  │
 └──────────────────────────────────┼──┘
     ↓                              │
-┌──────────────────────────────────┼──┐
-│ EMBEDDINGS (multi-resolution)    │  │
-│  ├─ embeddings_1bp:   (B, S, 1536)  │
-│  ├─ embeddings_128bp: (B, S/128, 3072) │
-│  ├─ embeddings_pair:  (B, S/2048, S/2048, 128) │
-│  └─ encoder_output*:  (B, S/128, D)  │  *Advanced
-└─────────────────────────────────────┘
+┌──────────────────────────────────┼─────────────┐
+│ EMBEDDINGS (multi-resolution)    │             │
+│  ├─ embeddings_1bp:   (B, L, 1536)             │
+│  ├─ embeddings_128bp: (B, L/128, 3072)         │
+│  ├─ embeddings_pair:  (B, L/2048, S/2048, 128) │
+│  └─ encoder_output:   (B, L/128, D)            │
+└────────────────────────────────────────────────┘
     ↓
 ┌─────────────────────────────────────┐
 │ HEADS (task-specific)               │
@@ -316,7 +319,7 @@ x_encoder = embeddings.encoder_output
 
 ## Complete Examples
 
-### Example 1: ChIP-seq Peak Prediction (Standard Head)
+### Example 1: ChIP-seq Peak Prediction
 
 ```python
 from alphagenome_ft import (
@@ -327,16 +330,16 @@ from alphagenome_ft import (
 
 # Build and register a predefined ChIP head (num_tracks must match targets)
 chip_config = get_predefined_head_config("chip_tf", num_tracks=1)
-register_predefined_head("chipseq_head", chip_config)
+register_predefined_head("my_chipseq_head", chip_config)
 
 # Create model
-model = create_model_with_heads('all_folds', heads=['chipseq_head'])
-model.freeze_except_head('chipseq_head')
+model = create_model_with_heads('all_folds', heads=['my_chipseq_head'])
+model.freeze_except_head('my_chipseq_head')
 
 # Now train on your ChIP-seq data!
 ```
 
-### Example 2: Gene Expression Prediction (Transformer Head)
+### Example 2: Gene Expression Prediction
 
 ```python
 from alphagenome_ft import (
@@ -347,10 +350,10 @@ from alphagenome_ft import (
 
 # Build and register a predefined RNA-seq head (num_tracks must match targets)
 rna_config = get_predefined_head_config("rna_seq", num_tracks=1)
-register_predefined_head("expression_head", rna_config)
+register_predefined_head("my_expression_head", rna_config)
 
-model = create_model_with_heads('all_folds', heads=['expression_head'])
-model.freeze_except_head('expression_head')
+model = create_model_with_heads('all_folds', heads=['my_expression_head'])
+model.freeze_except_head('my_expression_head')
 ```
 
 ### Example 3: MPRA Activity Prediction (Encoder-Only, Short Sequences)
@@ -426,6 +429,7 @@ model = create_model_with_heads('all_folds', heads=['attention_head'])
 ### Custom Head Base Class
 
 ```python
+# alphagenome_ft/custom_heads.py
 class CustomHead:
     def predict(self, embeddings, organism_index, **kwargs):
         """Generate predictions from embeddings.
@@ -438,7 +442,7 @@ class CustomHead:
             organism_index: (B,) array of organism indices
 
         Returns:
-            dict: Must contain 'predictions' key
+            PyTree: Any prediction structure consumed by your loss function
         """
         raise NotImplementedError
 
@@ -563,20 +567,30 @@ For a complete working example with gradient accumulation and Weights & Biases i
 
 ```python
 from alphagenome_ft import (
+    get_predefined_head_config,
+    register_predefined_head,
     register_custom_head,
-    is_custom_head,
-    get_custom_head_config,
+    is_head_registered,
+    get_registered_head_config,
     list_custom_heads,
 )
 
-# Register
+# Register predefined head
+head_config = get_predefined_head_config(
+    "atac",
+    num_tracks=4,
+)
+register_predefined_head("my_head", head_config)
+
+# OR register custom head
 register_custom_head('my_head', MyHeadClass, head_config)
 
-# Query
-if is_custom_head('my_head'):
-    config = get_custom_head_config('my_head')
 
-# List all
+# Query
+if is_head_registered('my_head'):
+    config = get_registered_head_config('my_head')
+
+# List registered custom heads
 all_heads = list_custom_heads()
 ```
 
