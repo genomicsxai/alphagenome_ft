@@ -1,6 +1,6 @@
 [project]
 name = "alphagenome-ft"
-version = "0.1.1"
+version = "0.1.2"
 description = "Finetuning utilities for AlphaGenome with custom heads and parameter freezing"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -24,7 +24,11 @@ classifiers = [
 
 dependencies = [
     "aiohttp>=3.0.0",
+    "dm-haiku>=0.0.10",
+    "jaxtyping>=0.2.0",
     "optax>=0.2.7",
+    "orbax-checkpoint>=0.4.0",
+    "pandas>=2.0.0",
     "requests>=2.0.0",
 ]
 
