@@ -14,7 +14,7 @@ from alphagenome_ft import (
     load_checkpoint,
     get_custom_head_config,
 )
-from tests.conftest import MPRAHeadForTesting
+from tests.conftest import MPRAHeadForTesting, require_kaggle_credentials
 
 
 class TestCheckpointSaveLoad:
@@ -31,6 +31,7 @@ class TestCheckpointSaveLoad:
     @pytest.fixture
     def trained_model(self, registered_mpra_head, device):
         """Create a model that simulates being trained."""
+        require_kaggle_credentials()
         model = create_model_with_heads(
             'all_folds',
             heads=[registered_mpra_head],

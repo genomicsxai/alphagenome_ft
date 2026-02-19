@@ -2210,8 +2210,9 @@ def create_model_with_heads(
             """Forward pass with requested heads only."""
             # Create AlphaGenome trunk (encoder, transformer, decoder)
             # This will use pretrained params for the backbone
-            standard_heads = None if include_standard_heads else ()
-            alphagenome = model_lib.AlphaGenome(metadata, heads=standard_heads)
+            # Note: AlphaGenome always creates standard heads based on metadata,
+            # but we only use the embeddings, not the standard head predictions
+            alphagenome = model_lib.AlphaGenome(metadata)
 
             # Get embeddings from the backbone (without running standard heads)
             # We only need the embeddings, not the standard predictions
