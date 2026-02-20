@@ -6,7 +6,7 @@ A lightweight Python package for finetuning [Google DeepMind's AlphaGenome](http
 
 ## Use cases
 
-- If you want to apply AlphaGenome to your MPRA (or other perturbation) data of interest, see [Encoder-only / short sequences (MPRA)](#workflow-1-encoder-only--short-sequences-mpra).
+- If you want to apply AlphaGenome to your MPRA (or other perturbation) data of interest, see [Encoder-only / short sequences (MPRA)](#workflow-1-encoder-only--short-sequences-mpra). [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/colab_encoder_only_mpra_finetune.ipynb) · [Open notebook in Colab](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/colab_encoder_only_mpra_finetune.ipynb).
 - If you want to apply AlphaGenome to your own genome-wide assay, start with [Heads-only finetuning (frozen backbone)](#workflow-2-heads-only-finetuning-frozen-backbone); then [LoRA-style adapters](#workflow-3-lora-style-adapters) or [Full-model finetuning](#workflow-4-full-model-finetuning) if needed.
 
 ## Contents
@@ -247,8 +247,10 @@ loss_fn = model.create_loss_fn_for_head('my_head')
 
 ### Workflow 1: Encoder-only / short sequences (MPRA)
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/colab_encoder_only_mpra_finetune.ipynb) · [Open notebook in Colab](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/colab_encoder_only_mpra_finetune.ipynb)
+
 **When to use:** Short sequences (&lt; ~1 kb): MPRA, promoters, enhancers. Uses encoder (CNN) only.  
-**Tutorial:** [Encoder-only finetuning](docs/encoder_only_perturbation.md). Use `templates.EncoderOnlyHead` and **`use_encoder_output=True`** in `create_model_with_heads(...)`. Run zero-shot after training; see [MPRA repo](https://github.com/genomicsxai/alphagenome_FT_MPRA).
+**Tutorial:** [Encoder-only finetuning](docs/encoder_only_perturbation.md). Use `templates.EncoderOnlyHead` and **`use_encoder_output=True`** in `create_model_with_heads(...)`. See the application repo [AlpahGenome MPRA repo](https://github.com/genomicsxai/alphagenome_FT_MPRA) for more details.
 
 ---
 
