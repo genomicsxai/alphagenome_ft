@@ -249,14 +249,14 @@ loss_fn = model.create_loss_fn_for_head('my_head')
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/colab_encoder_only_mpra_finetune.ipynb)
 
-**When to use:** Short sequences (&lt; ~1 kb): MPRA, promoters, enhancers. Uses encoder (CNN) only.  
+**When to use:** Short sequences (&lt; ~1 kb): MPRA, promoters, enhancers. Uses encoder (CNN) only.
 **Tutorial:** [Encoder-only finetuning](docs/encoder_only_perturbation.md). Use `templates.EncoderOnlyHead` and **`use_encoder_output=True`** in `create_model_with_heads(...)`. See the application repo [AlpahGenome MPRA repo](https://github.com/genomicsxai/alphagenome_FT_MPRA) for more details.
 
 ---
 
 ### Workflow 2: Heads-only finetuning (frozen backbone)
 
-**When to use:** New task (ChIP-seq, gene expression, etc.) on standard-length sequences; train only a new head, backbone frozen.  
+**When to use:** New task (ChIP-seq, gene expression, etc.) on standard-length sequences; train only a new head, backbone frozen.
 **Tutorial:** [Frozen backbone, new head](docs/frozen_backbone_new_head.md).
 
 ---
@@ -269,15 +269,15 @@ loss_fn = model.create_loss_fn_for_head('my_head')
 
 ### Workflow 4: Full-model finetuning
 
-**When to use:** Adapt the backbone (e.g. after heads-only or for a different distribution).  
+**When to use:** Adapt the backbone (e.g. after heads-only or for a different distribution).
 **Tutorial:** [Full-model finetuning (unfreezing the backbone)](docs/full_model_finetuning.md). Unfreeze via `unfreeze_parameters(unfreeze_prefixes=[...])` or `freeze_backbone(freeze_prefixes=[...])`; save with `save_checkpoint(..., save_full_model=True)`.
 
 ---
 
 ### After training: Attribution analysis
 
-Compute attributions after training to see which sequence features drive predictions.  
-**Methods:** DeepSHAP*, Gradient × Input, Gradient, ISM.  
+Compute attributions after training to see which sequence features drive predictions.
+**Methods:** DeepSHAP*, Gradient × Input, Gradient, ISM.
 Load a checkpoint, then use `compute_deepshap_attributions`, `compute_input_gradients`, or `compute_ism_attributions`; visualize with `plot_attribution_map` and `plot_sequence_logo`.
 
 Full API, examples (basic, visualization, single-sequence pipeline), method comparison, and multi-track `output_index`: **[Attribution analysis](docs/attribution.md)**.
@@ -293,21 +293,21 @@ Full API, examples (basic, visualization, single-sequence pipeline), method comp
 Understanding the architecture helps design custom heads:
 
 ```
-DNA Sequence (B, S, 4)
+DNA Sequence (B, L, 4)
     ↓
 ┌─────────────────────────────────────┐
 │ BACKBONE (can be frozen)            │
-│  ├─ SequenceEncoder ←────────────┐  │
-│  ├─ TransformerTower (9 blocks)  │  │
-│  └─ SequenceDecoder              │  │
-└──────────────────────────────────┼──┘
-    ↓                              │
-┌──────────────────────────────────┼─────────────┐
-│ EMBEDDINGS (multi-resolution)    │             │
-│  ├─ embeddings_1bp:   (B, S, 1536)             │
-│  ├─ embeddings_128bp: (B, S/128, 3072)         │
-│  ├─ embeddings_pair:  (B, S/2048, S/2048, 128) │
-│  └─ encoder_output:   (B, S/128, D)            │
+│  ├─ SequenceEncoder                 │
+│  ├─ TransformerTower (9 blocks)     │
+│  └─ SequenceDecoder                 │
+└─────────────────────────────────────┘
+    ↓
+┌────────────────────────────────────────────────┐
+│ EMBEDDINGS (multi-resolution)                  │
+│  ├─ embeddings_1bp:   (B, L, 1536)             │ # from SequenceDecoder
+│  ├─ embeddings_128bp: (B, L/128, 1536)         │ # from TransformerTower
+│  ├─ embeddings_pair:  (B, L/2048, L/2048, 128) │ # from TransformerTower
+│  └─ encoder_output:   (B, L/128, 1536)         │ # from SequenceEncoder
 └────────────────────────────────────────────────┘
     ↓
 ┌─────────────────────────────────────┐
@@ -470,7 +470,7 @@ If you use the `pypi` environment, create it in the repo under Settings → Envi
 
 1. Bump `version` in `pyproject.toml` (e.g. `0.1.2`).
 2. Commit and push.
-3. Create and push a tag matching the version:  
+3. Create and push a tag matching the version:
    `git tag v0.1.2 && git push origin v0.1.2`
 4. The [Publish to PyPI](.github/workflows/publish.yml) workflow runs and uploads to PyPI.
 
