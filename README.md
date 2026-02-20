@@ -293,7 +293,7 @@ Full API, examples (basic, visualization, single-sequence pipeline), method comp
 Understanding the architecture helps design custom heads:
 
 ```
-DNA Sequence (B, L, 4)
+DNA Sequence (B, S, 4)
     ↓
 ┌─────────────────────────────────────┐
 │ BACKBONE (can be frozen)            │
@@ -304,10 +304,10 @@ DNA Sequence (B, L, 4)
     ↓
 ┌────────────────────────────────────────────────┐
 │ EMBEDDINGS (multi-resolution)                  │
-│  ├─ embeddings_1bp:   (B, L, 1536)             │ # from SequenceDecoder
-│  ├─ embeddings_128bp: (B, L/128, 1536)         │ # from TransformerTower
-│  ├─ embeddings_pair:  (B, L/2048, L/2048, 128) │ # from TransformerTower
-│  └─ encoder_output:   (B, L/128, 1536)         │ # from SequenceEncoder
+│  ├─ embeddings_1bp:   (B, S, 1536)             │ # from SequenceDecoder
+│  ├─ embeddings_128bp: (B, S/128, 1536)         │ # from TransformerTower
+│  ├─ embeddings_pair:  (B, S/2048, S/2048, 128) │ # from TransformerTower
+│  └─ encoder_output:   (B, S/128, 1536)         │ # from SequenceEncoder
 └────────────────────────────────────────────────┘
     ↓
 ┌─────────────────────────────────────┐
