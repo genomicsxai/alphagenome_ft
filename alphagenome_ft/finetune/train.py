@@ -124,7 +124,61 @@ def train(
     wandb_run_name: str | None = None,
     wandb_config: dict | None = None,
 ) -> None:
-    """Main training loop with JIT-compiled train/eval step functions."""
+    """Run fine-tuning with JIT-compiled train/eval steps.
+
+    Args:
+        model: Initialized AlphaGenome model wrapper to fine-tune.
+        data_module: Batch provider with train/valid intervals and BigWig targets.
+        head_specs: Head definitions used to build losses and optimizer filters.
+        learning_rate: Base AdamW learning rate.
+        weight_decay: AdamW weight decay.
+        num_epochs: Maximum number of epochs to run.
+        seed: Base RNG seed used for per-epoch training shuffles.
+        max_train_steps: Optional global cap on optimizer updates across all epochs.
+        heads_only: If True, freeze backbone and optimize selected heads only.
+        checkpoint_dir: Optional output directory for ``best``/``last`` checkpoints.
+        organism: Organism enum name used for model organism indexing.
+        best_metric: Metric name used for best-checkpoint and early-stopping tracking.
+        best_metric_mode: Improvement direction for ``best_metric`` (``min`` or ``max``).
+        early_stopping_patience: Stop after this many non-improving epochs (0 disables).
+        early_stopping_min_delta: Minimum metric change required to count as improvement.
+        verbose: If True, print per-step progress and extra diagnostics.
+        use_wandb: If True, log metrics to Weights & Biases.
+        wandb_project: Optional W&B project name override.
+        wandb_entity: Optional W&B entity/team override.
+        wandb_run_name: Optional W&B run-name override.
+        wandb_config: Optional extra config keys to merge into W&B config.
+
+    Notes:
+        Total planned steps are computed before training from train-set size and
+        batch settings as ``steps_per_epoch * num_epochs`` (or capped by
+        ``max_train_steps`` when provided). Progress is reported with a global
+        counter in ``current/total`` format.
+    """
+    train_intervals = list(data_module._intervals.get("train", ()))
+    num_train_examples = len(train_intervals)
+    if num_train_examples == 0:
+        raise ValueError("No train intervals available for training.")
+
+    if data_module._drop_last:
+        steps_per_epoch = num_train_examples // data_module._batch_size
+    else:
+        steps_per_epoch = math.ceil(num_train_examples / data_module._batch_size)
+    if steps_per_epoch == 0:
+        raise ValueError(
+            "Computed zero training steps per epoch. Check batch size, drop_last, and train intervals."
+        )
+
+    planned_steps = steps_per_epoch * num_epochs
+    total_train_steps = (
+        min(planned_steps, max_train_steps) if max_train_steps is not None else planned_steps
+    )
+    step_width = len(str(steps_per_epoch))
+
+    if checkpoint_dir is not None:
+        checkpoint_dir = Path(checkpoint_dir).expanduser().resolve()
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
     if use_wandb:
         import wandb
 
@@ -133,6 +187,8 @@ def train(
             "weight_decay": weight_decay,
             "num_epochs": num_epochs,
             "batch_size": data_module._batch_size,
+            "steps_per_epoch": steps_per_epoch,
+            "total_train_steps": total_train_steps,
             "heads_only": heads_only,
             "organism": organism,
             "best_metric": best_metric,
@@ -221,7 +277,7 @@ def train(
         return head_losses
 
     if verbose:
-        print("  JIT-compiling step functions (first call will be slow)...")
+        print("JIT-compiling step functions (first call will be slow)...")
 
     def aggregate_valid_loss(metrics: Mapping[str, float]) -> float | None:
         return float(sum(metrics.values())) if metrics else None
@@ -251,8 +307,18 @@ def train(
 
     best_value: float | None = None
     epochs_since_improvement = 0
+    global_step = 0
+
+    print(
+        "Train plan: "
+        f"{num_train_examples} examples | "
+        f"{steps_per_epoch} step(s)/epoch | "
+        f"{num_epochs} epoch(s) | "
+        f"total step(s) {total_train_steps}"
+    )
 
     with model._device_context:
+        stop_training = False
         for epoch in range(1, num_epochs + 1):
             if verbose:
                 print(f'\n{"=" * 60}')
@@ -261,7 +327,7 @@ def train(
             else:
                 print(f"Epoch {epoch}/{num_epochs}")
 
-            step = 0
+            epoch_step = 0
             train_losses: list[float] = []
             for batch_np in data_module.iter_batches("train", seed=seed + epoch):
                 batch = prepare_batch(batch_np, organism_index_value, head_names)
@@ -273,20 +339,32 @@ def train(
                 )
                 loss_scalar = float(loss_value)
                 train_losses.append(loss_scalar)
-                step += 1
-
-                if max_train_steps and step >= max_train_steps:
-                    break
+                epoch_step += 1
+                global_step += 1
 
                 if verbose:
                     print(
-                        f"  step {step:04d} | loss {loss_scalar:.4f}",
+                        # f"  step {global_step:0{step_width}d}/{total_train_steps:0{step_width}d}"
+                        # f" | epoch_step {epoch_step:04d} | loss {loss_scalar:.4f}",
+                        f"  step {epoch_step:0{step_width}d}/{steps_per_epoch:0{step_width}d}"
+                        f" | loss {loss_scalar:.4f}",
                         end="\r",
                         flush=True,
                     )
 
                 if use_wandb:
-                    wandb.log({"train/step_loss": loss_scalar, "epoch": epoch, "step": step})
+                    wandb.log(
+                        {
+                            "train/step_loss": loss_scalar,
+                            "epoch": epoch,
+                            "step": global_step,
+                            # "epoch_step": epoch_step,
+                        }
+                    )
+
+                if global_step >= total_train_steps:
+                    stop_training = True
+                    break
 
             train_loss_avg = float(np.mean(train_losses)) if train_losses else None
             if verbose:
@@ -336,6 +414,9 @@ def train(
 
             if early_stopping_patience > 0 and epochs_since_improvement >= early_stopping_patience:
                 print(f"\n  Early stopping: no improvement for {epochs_since_improvement} epoch(s)")
+                break
+            if stop_training:
+                print(f"  Reached requested training steps: {global_step}/{total_train_steps}")
                 break
 
     if checkpoint_dir and not (checkpoint_dir / "last").exists():
