@@ -576,7 +576,7 @@ class CustomAlphaGenomeModel:
             )
             ```
         """
-        checkpoint_dir = Path(checkpoint_dir)
+        checkpoint_dir = Path(checkpoint_dir).expanduser().resolve()
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         def _serialize_value(value):
             if isinstance(value, enum.Enum):
