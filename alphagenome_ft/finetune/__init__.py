@@ -10,9 +10,11 @@ from alphagenome_ft.finetune.config import (
     validate_heads,
 )
 from alphagenome_ft.finetune.data import (
+    get_fold_intervals,
     BigWigDataModule,
     build_interval,
-    load_intervals,
+    load_intervals_from_bed,
+    load_intervals_from_dataframe,
     prepare_batch,
 )
 from alphagenome_ft.finetune.train import (
@@ -22,6 +24,7 @@ from alphagenome_ft.finetune.train import (
 )
 
 __all__ = [
+    # config
     'TrackInfo',
     'HeadSpec',
     'load_targets_config',
@@ -29,10 +32,14 @@ __all__ = [
     'parse_targets',
     'build_head_specs',
     'validate_heads',
+    # data
+    'get_fold_intervals',
     'BigWigDataModule',
     'build_interval',
-    'load_intervals',
+    'load_intervals_from_bed',
+    'load_intervals_from_dataframe',
     'prepare_batch',
+    # train
     'register_predefined_heads',
     'create_optimizer',
     'train',

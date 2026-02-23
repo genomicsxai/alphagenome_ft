@@ -1,0 +1,11 @@
+heads:
+  - id: my_rna_head
+    source: predefined
+    kind: rna_seq
+    resolutions: [1, 128]
+    apply_squashing: true
+    targets:
+      - bigwig: ../data/example_rna_rep1_chr1.bw
+        label: rep1
+      - bigwig: ../data/example_rna_rep2_chr1.bw
+        label: rep2
