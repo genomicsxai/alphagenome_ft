@@ -6,8 +6,8 @@ A lightweight Python package for finetuning [Google DeepMind's AlphaGenome](http
 
 ## Use cases
 
-- If you want to apply AlphaGenome to your MPRA (or other perturbation) data of interest, see [Encoder-only / short sequences (MPRA)](#workflow-1-encoder-only--short-sequences-mpra). [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/colab_encoder_only_mpra_finetune.ipynb).
-- If you want to apply AlphaGenome to your own genome-wide assay, start with [Heads-only finetuning (frozen backbone)](#workflow-2-heads-only-finetuning-frozen-backbone); then [LoRA-style adapters](#workflow-3-lora-style-adapters) or [Full-model finetuning](#workflow-4-full-model-finetuning) if needed.
+- If you want to apply AlphaGenome to your MPRA (or other perturbation) data of interest, see [Encoder-only / short sequences (MPRA)](#workflow-1-encoder-only--short-sequences-mpra). [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/finetune_encoder_only_mpra.ipynb).
+- If you want to apply AlphaGenome to your own genome-wide assay, start with [Heads-only finetuning (frozen backbone)](#workflow-2-heads-only-finetuning-frozen-backbone); then [LoRA-style adapters](#workflow-3-lora-style-adapters) or [Full-model finetuning](#workflow-4-full-model-finetuning) if needed. [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/finetune_rna_head_only.ipynb).
 
 ## Contents
 
@@ -247,7 +247,7 @@ loss_fn = model.create_loss_fn_for_head('my_head')
 
 ### Workflow 1: Encoder-only / short sequences (MPRA)
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/colab_encoder_only_mpra_finetune.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/finetune_encoder_only_mpra.ipynb)
 
 **When to use:** Short sequences (&lt; ~1 kb): MPRA, promoters, enhancers. Uses encoder (CNN) only.
 **Tutorial:** [Encoder-only finetuning](docs/encoder_only_perturbation.md). Use `templates.EncoderOnlyHead` and **`use_encoder_output=True`** in `create_model_with_heads(...)`. See the application repo [AlpahGenome MPRA repo](https://github.com/genomicsxai/alphagenome_FT_MPRA) for more details.
@@ -255,6 +255,8 @@ loss_fn = model.create_loss_fn_for_head('my_head')
 ---
 
 ### Workflow 2: Heads-only finetuning (frozen backbone)
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/finetune_rna_head_only.ipynb).
 
 **When to use:** New task (ChIP-seq, gene expression, etc.) on standard-length sequences; train only a new head, backbone frozen.
 **Tutorial:** [Frozen backbone, new head](docs/frozen_backbone_new_head.md).
