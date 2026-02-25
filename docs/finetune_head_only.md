@@ -122,13 +122,12 @@ model = create_model_with_heads(
     heads=head_ids,
 )
 
-# Freeze everything except the new heads
-for head_name in head_ids:
-    model.freeze_except_head(head_name)
+model.freeze_backbone()
 ```
 
 - Internally this uses the same AlphaGenome backbone, but keeps only your custom/predefined heads.
-- `freeze_except_head` uses `parameter_utils` to freeze backbone + other heads.
+- `freeze_backbone` is optional since `train` runs it internally.
+- To freeze specific heads, use `model.freeze_all_heads(except_heads=head_ids)`
 
 ### 6. Run Heads-Only Training
 
