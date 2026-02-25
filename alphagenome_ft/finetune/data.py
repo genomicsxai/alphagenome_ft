@@ -758,6 +758,45 @@ class BigWigDataModule:
         return padded
 
 
+def build_fasta_index(fasta_path: Path) -> dict[str, int]:
+    """Ensure ``<fasta>.fai`` exists and return chromosome sizes from the index.
+
+    Args:
+        fasta_path: Path to an uncompressed reference FASTA (for example,
+            ``hg38.fa``).
+
+    Raises:
+        FileNotFoundError: If ``fasta_path`` does not exist.
+        ValueError: If input is gzipped FASTA or index contents are invalid.
+        ModuleNotFoundError: If ``pyfaidx`` is unavailable when index creation
+            is needed.
+    """
+    fasta_path = Path(fasta_path)
+    if not fasta_path.exists():
+        raise FileNotFoundError(f"FASTA file not found: {fasta_path}")
+    if fasta_path.suffix == ".gz":
+        raise ValueError(
+            f"Expected uncompressed FASTA, got gzipped file: {fasta_path}. "
+            "Please decompress before indexing."
+        )
+
+    fai_path = Path(f"{fasta_path}.fai")
+    if not fai_path.exists():
+        try:
+            from pyfaidx import Fasta  # type: ignore
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "pyfaidx is required to build FASTA indexes. Install `pyfaidx` "
+                "or provide an existing .fai file."
+            ) from exc
+
+        fasta = Fasta(str(fasta_path))
+        fasta.close()
+
+    if not fai_path.exists():
+        raise FileNotFoundError(f"Failed to create FASTA index: {fai_path}")
+
+
 def prepare_batch(
     batch: Mapping[str, np.ndarray],
     organism_index_value: int,

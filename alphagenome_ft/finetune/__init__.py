@@ -15,6 +15,7 @@ from alphagenome_ft.finetune.data import (
     load_intervals_from_dataframe,
     prepare_intervals_from_fold,
     prepare_intervals_from_split,
+    build_fasta_index,
     prepare_batch,
 )
 from alphagenome_ft.finetune.train import (
@@ -38,6 +39,7 @@ __all__ = [
     'load_intervals_from_dataframe',
     'prepare_intervals_from_fold',
     'prepare_intervals_from_split',
+    'build_fasta_index',
     'prepare_batch',
     # train
     'register_predefined_heads',
