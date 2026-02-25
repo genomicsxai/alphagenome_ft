@@ -5,7 +5,7 @@ Expected YAML/JSON format:
 heads:
   - id: my_custom_head
     source: custom
-    bigwigs:
+    targets:
       - /data/tracks/track1.bw
       - /data/tracks/track2.bw
     # Custom heads must be registered in code before loading this config.
@@ -16,12 +16,12 @@ heads:
     # Optional predefined-head overrides:
     # resolutions: [1, 128]
     # apply_squashing: true # true for RNA-seq, false for the others
-    # Use either `targets` with metadata or `bigwigs` without metadata. 
+    # Use `targets` for all track definitions.
     targets:
-      - bigwig: /data/rnaseq/track_001.bw
+      - path: /data/rnaseq/track_001.bw
         label: track_001  # optional; defaults to filename stem
         nonzero_mean: 0.8  # optional; defaults to 1.0 if any are provided
-      - bigwig: /data/rnaseq/track_002.bw
+      - path: /data/rnaseq/track_002.bw
       # Must include one entry per track.
 """
 
@@ -46,6 +46,7 @@ from alphagenome_ft import (
     get_predefined_head_config,
     is_custom_head,
     is_predefined_head,
+    list_predefined_heads,
     normalize_head_name,
 )
 
@@ -61,58 +62,166 @@ class TrackInfo:
 
 @dataclasses.dataclass(frozen=True)
 class HeadSpec:
-    """Configuration for a finetuning head."""
+    """Parsed head definition used by training, registration, and validation."""
 
-    head_id: str
-    source: str
-    kind: str | None
-    tracks: Sequence[TrackInfo]
-    config: Any | None = None
-    metadata: Mapping[dna_client.Organism, pd.DataFrame] | None = None
+    head_id: str  # Unique head instance identifier used in training/checkpoints.
+    source: str  # Head source type: "custom" or "predefined".
+    kind: str | None  # Predefined head kind (e.g., "rna_seq"); None for custom.
+    tracks: Sequence[TrackInfo]  # Target tracks used as supervision for this head.
+    config: Any | None = None  # Runtime predefined-head config object when applicable.
+    metadata: Mapping[dna_client.Organism, pd.DataFrame] | None = None  # Optional per-organism track metadata.
 
 
-def load_targets_config(path: Path) -> Mapping[str, Any]:
+def _resolve_target_path(path_value: str, base_dir: Path | None) -> str:
+    target_path = Path(path_value).expanduser()
+    if base_dir is not None and not target_path.is_absolute():
+        target_path = base_dir / target_path
+    return str(target_path)
+
+
+def _normalize_targets_config_paths(
+    config: Mapping[str, Any],
+    *,
+    base_dir: Path | None = None,
+) -> Mapping[str, Any]:
+    """Normalize target entries and resolve relative target paths.
+
+    Args:
+        config: Parsed config mapping that may include a ``heads`` list.
+        base_dir: Directory used to resolve relative target ``path`` values.
+
+    Returns:
+        A normalized config mapping where each ``targets`` entry is a mapping
+        with a resolved ``path`` string.
+    """
+    if config is None:
+        return {}
+
+    heads_cfg = config.get('heads')
+    if heads_cfg is None:
+        return config
+
+    if base_dir is not None:
+        base_dir = Path(base_dir).expanduser().resolve()
+
+    normalized_heads: list[dict[str, Any]] = []
+    for head in heads_cfg:
+        if not isinstance(head, Mapping):
+            raise ValueError(f'Each head entry must be a mapping: {head!r}')
+
+        head_dict = dict(head)
+        targets = head_dict.get('targets')
+        if targets is None:
+            normalized_heads.append(head_dict)
+            continue
+
+        if not isinstance(targets, Sequence) or isinstance(targets, (str, bytes)):
+            raise ValueError(
+                f'Head "{head_dict.get("id", "<unknown>")}" field "targets" '
+                'must be a list of track paths or target mappings.'
+            )
+
+        normalized_targets: list[dict[str, Any]] = []
+        for item in targets:
+            if isinstance(item, str):
+                normalized_targets.append(
+                    {'path': _resolve_target_path(item, base_dir)}
+                )
+                continue
+
+            if not isinstance(item, Mapping):
+                raise ValueError(
+                    f'Each target entry must be a string path or mapping: {item!r}'
+                )
+            if 'path' not in item:
+                raise ValueError(f'Each target must include "path": {item!r}')
+
+            target_item = dict(item)
+            target_item['path'] = _resolve_target_path(
+                str(target_item['path']), base_dir
+            )
+            normalized_targets.append(target_item)
+
+        head_dict['targets'] = normalized_targets
+        normalized_heads.append(head_dict)
+
+    normalized_config = dict(config)
+    normalized_config['heads'] = normalized_heads
+    return normalized_config
+
+
+def _load_targets_config_file(path: Path) -> Mapping[str, Any]:
+    """Load a YAML/JSON targets config file without path normalization.
+
+    Args:
+        path: Path to a YAML or JSON config file.
+
+    Returns:
+        Parsed config mapping.
+    """
     if not path.exists():
         raise FileNotFoundError(f'Target config not found: {path}')
     text = path.read_text()
     if path.suffix.lower() in {'.yml', '.yaml'}:
         if yaml is None:
             raise ImportError('pyyaml is required to parse YAML configs.')
-        return yaml.safe_load(text)
-    return json.loads(text)
+        config = yaml.safe_load(text)
+    else:
+        config = json.loads(text)
+    return config
 
 
-def parse_bigwigs(entries: Sequence[str]) -> list[TrackInfo]:
-    tracks: list[TrackInfo] = []
-    for item in entries:
-        if not isinstance(item, str):
-            raise ValueError(
-                "Entries under 'bigwigs' must be file paths (strings). "
-                "Use 'targets' for metadata."
-            )
-        path = Path(item)
-        if not path.exists():
-            raise FileNotFoundError(f'BigWig not found: {path}')
-        tracks.append(TrackInfo(name=path.stem, path=path))
-    return tracks
+def load_targets_config(
+    source: Path | Mapping[str, Any],
+    base_dir: Path | None = None,
+) -> Mapping[str, Any]:
+    """Load/normalize targets config from a path or in-memory mapping.
+
+    Args:
+        source: Either a path to targets config file or a parsed config mapping.
+        base_dir: Optional base directory used for relative target paths.
+
+    Returns:
+        A normalized config mapping.
+    """
+    if isinstance(source, Mapping):
+        return _normalize_targets_config_paths(
+            source,
+            base_dir=base_dir,
+        )
+    if isinstance(source, Path):
+        resolved_source = source.expanduser().resolve()
+        effective_base_dir = (
+            base_dir.expanduser().resolve()
+            if base_dir is not None
+            else resolved_source.parent
+        )
+        return _normalize_targets_config_paths(
+            _load_targets_config_file(resolved_source),
+            base_dir=effective_base_dir,
+        )
+    raise TypeError(
+        f'load_targets_config expected Path or Mapping, got {type(source)!r}.'
+    )
 
 
-def parse_targets(entries: Sequence[Mapping[str, Any]]) -> list[TrackInfo]:
+def _parse_targets(entries: Sequence[Mapping[str, Any]]) -> list[TrackInfo]:
+    """Convert normalized target entries into validated TrackInfo objects."""
     tracks: list[TrackInfo] = []
     for item in entries:
         if not isinstance(item, Mapping):
             raise ValueError(
-                "Entries under 'targets' must be mappings with a 'bigwig' path."
+                "Entries under 'targets' must be mappings with a 'path'."
             )
-        if 'bigwig' not in item:
-            raise ValueError(f'Each target must include "bigwig": {item!r}')
-        path = Path(item['bigwig'])
+        if 'path' not in item:
+            raise ValueError(f'Each target must include "path": {item!r}')
+        path = Path(str(item['path']))
         name = str(item.get('label') or path.stem)
         nonzero_mean = item.get('nonzero_mean')
         if nonzero_mean is not None:
             nonzero_mean = float(nonzero_mean)
         if not path.exists():
-            raise FileNotFoundError(f'BigWig not found: {path}')
+            raise FileNotFoundError(f'Target file not found: {path}')
         tracks.append(TrackInfo(name=name, path=path, nonzero_mean=nonzero_mean))
     return tracks
 
@@ -138,12 +247,11 @@ def _build_track_metadata(
     return {org: df for org in dna_client.Organism}
 
 
-def build_head_specs(
-    targets_config: Path,
+def prepare_head_specs(
+    config: Mapping[str, Any],
     *,
     organism: str | None = None,
 ) -> list[HeadSpec]:
-    config = load_targets_config(targets_config)
     heads_cfg = config.get('heads')
     if not heads_cfg:
         raise ValueError('Config must define a non-empty "heads" list.')
@@ -172,24 +280,10 @@ def build_head_specs(
 
         source = str(entry['source']).lower()
         targets = entry.get('targets')
-        bigwigs = entry.get('bigwigs')
-        if targets is not None and bigwigs is not None:
-            raise ValueError(
-                f'Head "{head_id}" must use only one of "targets" or "bigwigs".'
-            )
-        if targets is None and bigwigs is None:
-            raise ValueError(
-                f'Head "{head_id}" must include "targets" (preferred) or "bigwigs".'
-            )
-        if targets is not None:
-            tracks = parse_targets(targets)
-        else:
-            tracks = parse_bigwigs(bigwigs)
+        if targets is None:
+            raise ValueError(f'Head "{head_id}" must include "targets".')
+        tracks = _parse_targets(targets)
         if source == 'custom':
-            if 'config' in entry:
-                raise ValueError(
-                    f'Custom head "{head_id}" does not accept a "config" block.'
-                )
             if not is_custom_head(head_id):
                 raise ValueError(
                     f'Custom head "{head_id}" is not registered. '
@@ -215,11 +309,6 @@ def build_head_specs(
                 raise ValueError(
                     f'Predefined head "{head_id}" must include "kind".'
                 )
-            if 'config' in entry:
-                raise ValueError(
-                    f'Predefined head "{head_id}" no longer accepts nested "config". '
-                    'Move override fields to the head entry.'
-                )
             overrides = {
                 field: entry.get(field)
                 for field in (
@@ -232,27 +321,16 @@ def build_head_specs(
                 if field in entry
             }
             if not is_predefined_head(kind_name):
+                valid_kinds = ", ".join(sorted(list_predefined_heads()))
                 raise ValueError(
-                    f'Unknown predefined head kind "{kind_name}".'
-                )
-            allowed_fields = {
-                'resolutions',
-                'apply_squashing',
-                'embedding_channels',
-                'num_tissues',
-                'num_tracks',
-            }
-            unknown = set(overrides) - allowed_fields
-            if unknown:
-                raise ValueError(
-                    f'Unknown config field(s) for predefined head "{head_id}": '
-                    f'{sorted(unknown)}'
+                    f'Unknown predefined head kind "{kind_name}". '
+                    f"Available kinds: {valid_kinds}"
                 )
             if 'num_tracks' in overrides:
                 if int(overrides['num_tracks']) != len(tracks):
                     raise ValueError(
                         f'Predefined head "{head_id}" num_tracks '
-                        f'{overrides["num_tracks"]} does not match bigwigs '
+                        f'{overrides["num_tracks"]} does not match targets '
                         f'({len(tracks)}).'
                     )
             head_config = get_predefined_head_config(
@@ -284,17 +362,62 @@ def build_head_specs(
     return specs
 
 
-def validate_heads(specs: Sequence[HeadSpec]) -> None:
-    """Validate that required custom heads are registered before training."""
+def validate_head_specs(specs: Sequence[HeadSpec]) -> None:
+    """Optional sanity-check pass for HeadSpec sequences before training."""
+    seen_ids: set[str] = set()
     for spec in specs:
-        if spec.source != 'custom':
-            if spec.source == 'predefined' and spec.config is None:
+        if not spec.head_id:
+            raise ValueError('Head spec has empty "head_id".')
+        if spec.head_id in seen_ids:
+            raise ValueError(f'Duplicate head id "{spec.head_id}" in head specs.')
+        seen_ids.add(spec.head_id)
+
+        if not spec.tracks:
+            raise ValueError(
+                f'Head "{spec.head_id}" must include at least one target track.'
+            )
+        for track in spec.tracks:
+            if not track.path.exists():
+                raise FileNotFoundError(
+                    f'Head "{spec.head_id}" target file not found: {track.path}'
+                )
+
+        if spec.source == 'custom':
+            if not is_custom_head(spec.head_id):
+                raise ValueError(
+                    f'Custom head "{spec.head_id}" is not registered. '
+                    'Register it before loading this config.'
+                )
+            custom_config = get_custom_head_config(spec.head_id)
+            if custom_config is not None and len(spec.tracks) != custom_config.num_tracks:
+                raise ValueError(
+                    f'Custom head "{spec.head_id}" expects {custom_config.num_tracks} '
+                    f'target tracks, got {len(spec.tracks)}.'
+                )
+        elif spec.source == 'predefined':
+            if not spec.kind:
+                raise ValueError(
+                    f'Predefined head "{spec.head_id}" missing kind.'
+                )
+            if not is_predefined_head(spec.kind):
+                raise ValueError(
+                    f'Predefined head "{spec.head_id}" has unknown kind '
+                    f'"{spec.kind}".'
+                )
+            if spec.config is None:
                 raise ValueError(
                     f'Predefined head "{spec.head_id}" missing config.'
                 )
-            continue
-        if not is_custom_head(spec.head_id):
+            if hasattr(spec.config, 'num_tracks'):
+                expected_num_tracks = int(spec.config.num_tracks)
+                if expected_num_tracks != len(spec.tracks):
+                    raise ValueError(
+                        f'Predefined head "{spec.head_id}" expects '
+                        f'{expected_num_tracks} target tracks, got '
+                        f'{len(spec.tracks)}.'
+                    )
+        else:
             raise ValueError(
-                f'Custom head "{spec.head_id}" is not registered. '
-                'Register it before loading this config.'
+                f'Head "{spec.head_id}" has invalid source "{spec.source}" '
+                '(custom|predefined).'
             )
