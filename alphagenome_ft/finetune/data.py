@@ -202,7 +202,7 @@ def _has_training_overlap(
     return False
 
 
-def get_fold_intervals(
+def get_fold_split(
     fold: str | int,
     window_size: int = WINDOW_SIZE,
     organism: str = "HOMO_SAPIENS",
@@ -293,6 +293,289 @@ def get_fold_intervals(
         print(f"Filtered out {num_filtered} intervals from valid/test sets due to training overlap.")
 
     return pd.DataFrame(filtered, columns=["chromosome", "start", "end", "split"])
+
+
+def build_interval(
+    *, chromosome: str, start: int, end: int, window_size: int | None = None
+) -> genome.Interval:
+    if start >= end:
+        raise ValueError(f'Invalid interval ({chromosome}, {start}, {end}).')
+    if window_size is not None:
+        center = (start + end) // 2
+        half = window_size // 2
+        start = max(0, center - half)
+        end = start + window_size
+    return genome.Interval(start=start, end=end, chromosome=chromosome)
+
+
+def _maybe_limit(intervals: list[genome.Interval], limit: int | None) -> None:
+    if limit is not None and len(intervals) > limit:
+        del intervals[limit:]
+
+
+def _finalize_splits(
+    splits: dict[str, list[genome.Interval]],
+    *,
+    limit_train: int | None,
+    limit_valid: int | None,
+    limit_test: int | None,
+    empty_train_error: str,
+) -> Mapping[str, list[genome.Interval]]:
+    if not splits['train']:
+        raise ValueError(empty_train_error)
+
+    _maybe_limit(splits['train'], limit_train)
+    _maybe_limit(splits['valid'], limit_valid)
+    _maybe_limit(splits['test'], limit_test)
+
+    for key in list(splits.keys()):
+        if not splits[key]:
+            splits.pop(key)
+    return splits
+
+
+def load_intervals_from_dataframe(
+    intervals_df: pd.DataFrame,
+    window_size: int | None = None,
+    *,
+    limit_train: int | None = None,
+    limit_valid: int | None = None,
+    limit_test: int | None = None,
+) -> Mapping[str, list[genome.Interval]]:
+    """Load ``train``/``valid``/``test`` intervals from a DataFrame.
+
+    Args:
+        intervals_df: Input table. If named columns ``chromosome``, ``start``,
+            ``end``, ``split`` are present, they are used. Otherwise, the first
+            four columns are interpreted in that order.
+        window_size: Optional target window size; if set, intervals are recentered
+            and resized via ``build_interval``.
+        limit_train: Optional maximum number of train intervals to keep.
+        limit_valid: Optional maximum number of valid intervals to keep.
+        limit_test: Optional maximum number of test intervals to keep.
+
+    Returns:
+        Mapping from split name to list of ``genome.Interval`` objects.
+
+    Raises:
+        ValueError: If fewer than four columns are provided or no training
+            intervals remain.
+    """
+    splits: dict[str, list[genome.Interval]] = defaultdict(list)
+    required_cols = {"chromosome", "start", "end", "split"}
+    has_named_cols = required_cols.issubset(set(intervals_df.columns))
+    if not has_named_cols and intervals_df.shape[1] < 4:
+        raise ValueError(
+            "intervals_df must include columns {chromosome,start,end,split} "
+            "or have at least 4 columns in that order."
+        )
+
+    if has_named_cols:
+        row_iter = (
+            (
+                str(getattr(row, "chromosome")),
+                int(float(getattr(row, "start"))),
+                int(float(getattr(row, "end"))),
+                str(getattr(row, "split")).lower(),
+            )
+            for row in intervals_df.itertuples(index=False)
+        )
+    else:
+        row_iter = (
+            (
+                str(row[0]),
+                int(float(row[1])),
+                int(float(row[2])),
+                str(row[3]).lower(),
+            )
+            for row in intervals_df.iloc[:, :4].itertuples(index=False, name=None)
+        )
+
+    for chrom, start, end, label in row_iter:
+        if label not in {'train', 'valid', 'test'}:
+            continue
+        interval = build_interval(
+            chromosome=chrom,
+            start=start,
+            end=end,
+            window_size=window_size,
+        )
+        splits[label].append(interval)
+
+    return _finalize_splits(
+        splits,
+        limit_train=limit_train,
+        limit_valid=limit_valid,
+        limit_test=limit_test,
+        empty_train_error='No training intervals found in generated fold intervals.',
+    )
+
+
+def load_intervals_from_bed(
+    bed_path: Path,
+    window_size: int | None = None,
+    *,
+    limit_train: int | None = None,
+    limit_valid: int | None = None,
+    limit_test: int | None = None,
+) -> Mapping[str, list[genome.Interval]]:
+    """Load ``train``/``valid``/``test`` intervals from a BED or BED.GZ file.
+
+    The BED is expected to provide at least four fields per row:
+    ``chrom start end split``. Rows with unknown split labels are skipped.
+
+    Args:
+        bed_path: Path to input BED/BED.GZ.
+        window_size: Optional target window size; if set, intervals are recentered
+            and resized via ``build_interval``.
+        limit_train: Optional maximum number of train intervals to keep.
+        limit_valid: Optional maximum number of valid intervals to keep.
+        limit_test: Optional maximum number of test intervals to keep.
+
+    Returns:
+        Mapping from split name to list of ``genome.Interval`` objects.
+
+    Raises:
+        ValueError: If no training intervals are present after parsing/limits.
+    """
+    splits: dict[str, list[genome.Interval]] = defaultdict(list)
+    opened = gzip.open if bed_path.suffix == '.gz' else open
+    mode = 'rt'
+    with opened(bed_path, mode) as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            chrom, start_str, end_str, split = parts[:4]
+            label = split.lower()
+            if label not in {'train', 'valid', 'test'}:
+                continue
+            interval = build_interval(
+                chromosome=chrom,
+                start=int(float(start_str)),
+                end=int(float(end_str)),
+                window_size=window_size,
+            )
+            splits[label].append(interval)
+
+    return _finalize_splits(
+        splits,
+        limit_train=limit_train,
+        limit_valid=limit_valid,
+        limit_test=limit_test,
+        empty_train_error='No training intervals found in --bed file.',
+    )
+
+
+def prepare_intervals_from_fold(
+    fold: str | int,
+    window_size: int | None = WINDOW_SIZE,
+    organism: str = "HOMO_SAPIENS",
+    *,
+    bed_path: str | None = None,
+    limit_train: int | None = None,
+    limit_valid: int | None = None,
+    limit_test: int | None = None,
+) -> Mapping[str, list[genome.Interval]]:
+    """Build split intervals by deriving ``train``/``valid``/``test`` from a fold.
+
+    Use this when you want to use the same fold-split as AlphaGenome.
+    This function:
+    1. Calls ``get_fold_split`` to map fold labels into ``train/valid/test``.
+    2. Applies fold-generation logic (window construction + overlap filtering).
+    3. Converts the generated split DataFrame into ``genome.Interval`` objects.
+
+    Args:
+        fold: Fold identifier (0, 1, 2, 3).
+        window_size: Target fold window size. If ``None``, defaults to ``WINDOW_SIZE``.
+        organism: Organism key/alias used for default fold BED and chromosome sizes.
+        bed_path: Optional override for the fold BED/BED.GZ source.
+        limit_train: Optional maximum number of train intervals.
+        limit_valid: Optional maximum number of valid intervals.
+        limit_test: Optional maximum number of test intervals.
+
+    Returns:
+        Mapping from split name to list of ``genome.Interval`` objects.
+
+    Note:
+        - Optionally, pass bed_path to override the default fold source.
+        - ``prepare_intervals_from_split`` is different: it expects split labels to
+          already exist in the input data (DataFrame/BED with ``split`` column).
+    """
+    fold_window_size = window_size if window_size is not None else WINDOW_SIZE
+    split_df = get_fold_split(
+        fold=fold,
+        window_size=fold_window_size,
+        organism=organism,
+        bed_path=bed_path,
+    )
+    return load_intervals_from_dataframe(
+        intervals_df=split_df,
+        window_size=None,
+        limit_train=limit_train,
+        limit_valid=limit_valid,
+        limit_test=limit_test,
+    )
+
+
+def prepare_intervals_from_split(
+    intervals_df: pd.DataFrame | None = None,
+    *,
+    bed_path: Path | None = None,
+    window_size: int | None = WINDOW_SIZE,
+    limit_train: int | None = None,
+    limit_valid: int | None = None,
+    limit_test: int | None = None,
+) -> Mapping[str, list[genome.Interval]]:
+    """Build split intervals from an input that already defines ``split`` labels.
+
+    Use this when your input is already split into ``train/valid/test``:
+    - ``intervals_df``: DataFrame with split labels (chr, start, end, and split columns).
+    - ``bed_path``: BED/BED.GZ with at least ``chrom start end split`` columns.
+
+    Exactly one source must be provided: ``intervals_df`` or ``bed_path``.
+
+    Behavior:
+    - Keeps only ``train``, ``valid``, and ``test`` rows.
+    - Optionally recenters/resizes intervals via ``window_size``.
+    - Applies optional per-split limits.
+
+    Returns:
+        Mapping from split name to list of ``genome.Interval`` objects.
+
+    Note:
+        ``prepare_intervals_from_fold`` is different: it derives split labels from
+        fold labels using ``FOLD_MAPPING`` before interval conversion.
+    """
+    sources = (
+        intervals_df is not None,
+        bed_path is not None,
+    )
+    if sum(sources) != 1:
+        raise ValueError(
+            "prepare_intervals_from_split requires exactly one input source: "
+            "one of intervals_df or bed_path."
+        )
+
+    if bed_path is not None:
+        return load_intervals_from_bed(
+            bed_path=bed_path,
+            window_size=window_size,
+            limit_train=limit_train,
+            limit_valid=limit_valid,
+            limit_test=limit_test,
+        )
+
+    return load_intervals_from_dataframe(
+        intervals_df=intervals_df,
+        window_size=window_size,
+        limit_train=limit_train,
+        limit_valid=limit_valid,
+        limit_test=limit_test,
+    )
 
 
 class BigWigDataModule:
@@ -473,181 +756,6 @@ class BigWigDataModule:
         limit = min(target_len, arr.shape[0])
         padded[:limit] = arr[:limit]
         return padded
-
-
-def load_intervals_from_bed(
-    bed: Path,
-    window_size: int | None = None,
-    *,
-    limit_train: int | None = None,
-    limit_valid: int | None = None,
-    limit_test: int | None = None,
-) -> Mapping[str, list[genome.Interval]]:
-    """Load ``train``/``valid``/``test`` intervals from a BED or BED.GZ file.
-
-    The BED is expected to provide at least four fields per row:
-    ``chrom start end split``. Rows with unknown split labels are skipped.
-
-    Args:
-        bed: Path to input BED/BED.GZ.
-        window_size: Optional target window size; if set, intervals are recentered
-            and resized via ``build_interval``.
-        limit_train: Optional maximum number of train intervals to keep.
-        limit_valid: Optional maximum number of valid intervals to keep.
-        limit_test: Optional maximum number of test intervals to keep.
-
-    Returns:
-        Mapping from split name to list of ``genome.Interval`` objects.
-
-    Raises:
-        ValueError: If no training intervals are present after parsing/limits.
-    """
-    splits: dict[str, list[genome.Interval]] = defaultdict(list)
-    opened = gzip.open if bed.suffix == '.gz' else open
-    mode = 'rt'
-    with opened(bed, mode) as handle:
-        for raw in handle:
-            line = raw.strip()
-            if not line or line.startswith('#'):
-                continue
-            parts = line.split()
-            if len(parts) < 4:
-                continue
-            chrom, start_str, end_str, split = parts[:4]
-            label = split.lower()
-            if label not in {'train', 'valid', 'test'}:
-                continue
-            interval = build_interval(
-                chromosome=chrom,
-                start=int(float(start_str)),
-                end=int(float(end_str)),
-                window_size=window_size,
-            )
-            splits[label].append(interval)
-
-    return _finalize_splits(
-        splits,
-        limit_train=limit_train,
-        limit_valid=limit_valid,
-        limit_test=limit_test,
-        empty_train_error='No training intervals found in --bed file.',
-    )
-
-
-def load_intervals_from_dataframe(
-    intervals_df: pd.DataFrame,
-    window_size: int | None = None,
-    *,
-    limit_train: int | None = None,
-    limit_valid: int | None = None,
-    limit_test: int | None = None,
-) -> Mapping[str, list[genome.Interval]]:
-    """Load ``train``/``valid``/``test`` intervals from a DataFrame.
-
-    Args:
-        intervals_df: Input table. If named columns ``chromosome``, ``start``,
-            ``end``, ``split`` are present, they are used. Otherwise, the first
-            four columns are interpreted in that order.
-        window_size: Optional target window size; if set, intervals are recentered
-            and resized via ``build_interval``.
-        limit_train: Optional maximum number of train intervals to keep.
-        limit_valid: Optional maximum number of valid intervals to keep.
-        limit_test: Optional maximum number of test intervals to keep.
-
-    Returns:
-        Mapping from split name to list of ``genome.Interval`` objects.
-
-    Raises:
-        ValueError: If fewer than four columns are provided or no training
-            intervals remain.
-    """
-    splits: dict[str, list[genome.Interval]] = defaultdict(list)
-    required_cols = {"chromosome", "start", "end", "split"}
-    has_named_cols = required_cols.issubset(set(intervals_df.columns))
-    if not has_named_cols and intervals_df.shape[1] < 4:
-        raise ValueError(
-            "intervals_df must include columns {chromosome,start,end,split} "
-            "or have at least 4 columns in that order."
-        )
-
-    if has_named_cols:
-        row_iter = (
-            (
-                str(getattr(row, "chromosome")),
-                int(float(getattr(row, "start"))),
-                int(float(getattr(row, "end"))),
-                str(getattr(row, "split")).lower(),
-            )
-            for row in intervals_df.itertuples(index=False)
-        )
-    else:
-        row_iter = (
-            (
-                str(row[0]),
-                int(float(row[1])),
-                int(float(row[2])),
-                str(row[3]).lower(),
-            )
-            for row in intervals_df.iloc[:, :4].itertuples(index=False, name=None)
-        )
-
-    for chrom, start, end, label in row_iter:
-        if label not in {'train', 'valid', 'test'}:
-            continue
-        interval = build_interval(
-            chromosome=chrom,
-            start=start,
-            end=end,
-            window_size=window_size,
-        )
-        splits[label].append(interval)
-
-    return _finalize_splits(
-        splits,
-        limit_train=limit_train,
-        limit_valid=limit_valid,
-        limit_test=limit_test,
-        empty_train_error='No training intervals found in generated fold intervals.',
-    )
-
-
-def build_interval(
-    *, chromosome: str, start: int, end: int, window_size: int | None = None
-) -> genome.Interval:
-    if start >= end:
-        raise ValueError(f'Invalid interval ({chromosome}, {start}, {end}).')
-    if window_size is not None:
-        center = (start + end) // 2
-        half = window_size // 2
-        start = max(0, center - half)
-        end = start + window_size
-    return genome.Interval(start=start, end=end, chromosome=chromosome)
-
-
-def _maybe_limit(intervals: list[genome.Interval], limit: int | None) -> None:
-    if limit is not None and len(intervals) > limit:
-        del intervals[limit:]
-
-
-def _finalize_splits(
-    splits: dict[str, list[genome.Interval]],
-    *,
-    limit_train: int | None,
-    limit_valid: int | None,
-    limit_test: int | None,
-    empty_train_error: str,
-) -> Mapping[str, list[genome.Interval]]:
-    if not splits['train']:
-        raise ValueError(empty_train_error)
-
-    _maybe_limit(splits['train'], limit_train)
-    _maybe_limit(splits['valid'], limit_valid)
-    _maybe_limit(splits['test'], limit_test)
-
-    for key in list(splits.keys()):
-        if not splits[key]:
-            splits.pop(key)
-    return splits
 
 
 def prepare_batch(
