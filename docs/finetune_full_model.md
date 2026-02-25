@@ -152,7 +152,7 @@ This produces a self‑contained checkpoint that does not require reloading the 
 
 The same windowing logic from heads-only finetuning applies:
 
-- Use the `window_size` argument in `load_intervals` / `BigWigDataModule` to control sequence length.
+- Use the `window_size` argument in `prepare_intervals_from_split` to control sequence length.
 - Typical choices:
   - `32768` (32k)
   - `65536` (64k)
@@ -162,8 +162,8 @@ The same windowing logic from heads-only finetuning applies:
 Example:
 
 ```python
-intervals = load_intervals(
-    bed=Path("data/intervals_chr22.bed.gz"),
+intervals = prepare_intervals_from_split(
+    bed_path=Path("data/intervals_chr22.bed.gz"),
     window_size=65536,   # 64k windows
 )
 
@@ -173,7 +173,6 @@ data_module = BigWigDataModule(
     head_specs=head_specs,
     batch_size=2,
     shuffle=True,
-    window_size=65536,
 )
 ```
 
@@ -185,4 +184,3 @@ Consider full-model finetuning when:
 - You have sufficient data and compute to avoid overfitting.
 
 If you only want lightweight adaptation on top of a frozen backbone (e.g. for very small datasets), consider **LoRA-style adapters** (see the LoRA tutorial) or stick with heads-only finetuning.
-

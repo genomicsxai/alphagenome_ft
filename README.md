@@ -259,7 +259,7 @@ loss_fn = model.create_loss_fn_for_head('my_head')
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/finetune_rna_head_only.ipynb)
 
 **When to use:** New task (ChIP-seq, gene expression, etc.) on standard-length sequences; train only a new head, backbone frozen.
-**Tutorial:** [Frozen backbone, new head](docs/frozen_backbone_new_head.md).
+**Tutorial:** [Frozen backbone, new head](docs/finetune_head_only.md).
 
 ---
 
@@ -272,7 +272,7 @@ loss_fn = model.create_loss_fn_for_head('my_head')
 ### Workflow 4: Full-model finetuning
 
 **When to use:** Adapt the backbone (e.g. after heads-only or for a different distribution).
-**Tutorial:** [Full-model finetuning (unfreezing the backbone)](docs/full_model_finetuning.md). Unfreeze via `unfreeze_parameters(unfreeze_prefixes=[...])` or `freeze_backbone(freeze_prefixes=[...])`; save with `save_checkpoint(..., save_full_model=True)`.
+**Tutorial:** [Full-model finetuning (unfreezing the backbone)](docs/finetune_full_model.md). Unfreeze via `unfreeze_parameters(unfreeze_prefixes=[...])` or `freeze_backbone(freeze_prefixes=[...])`; save with `save_checkpoint(..., save_full_model=True)`.
 
 ---
 

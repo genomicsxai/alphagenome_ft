@@ -31,9 +31,9 @@ heads:
     source: predefined
     kind: rna_seq
     targets:
-      - bigwig: /path/to/K562_RNAseq_track1.bw
+      - path: /path/to/K562_RNAseq_track1.bw
         label: K562_RNA_1
-      - bigwig: /path/to/K562_RNAseq_track2.bw
+      - path: /path/to/K562_RNAseq_track2.bw
         label: K562_RNA_2
 ```
 
@@ -76,9 +76,9 @@ from pathlib import Path
 
 from alphagenome_ft import create_model_with_heads
 from alphagenome_ft.finetune import (
-    build_head_specs,
-    validate_heads,
-    load_intervals,
+    load_targets_config,
+    prepare_head_specs,
+    prepare_intervals_from_split,
     BigWigDataModule,
     register_predefined_heads,
     train,
@@ -86,23 +86,25 @@ from alphagenome_ft.finetune import (
 
 # 1. Parse target config and register predefined heads
 targets_config = Path("configs/targets_rna.yaml")
-head_specs = build_head_specs(targets_config, organism="HOMO_SAPIENS")
-validate_heads(head_specs)
+config = load_targets_config(targets_config)
+head_specs = prepare_head_specs(config, organism="HOMO_SAPIENS")
 register_predefined_heads(head_specs)
 
 # 2. Load genomic intervals and build data module
-intervals = load_intervals(
-    bed=Path("data/intervals_chr22.bed.gz"),
+intervals = prepare_intervals_from_fold(
+    fold=1,
     window_size=131072,          # 128k windows (can be 32k, 64k, 1M, etc.)
+    organism="HOMO_SAPIENS",
 )
 
+# 3. Set up data module
 data_module = BigWigDataModule(
     intervals=intervals,
     fasta_path=Path("data/hg38.fa"),
     head_specs=head_specs,
     batch_size=4,
     shuffle=True,
-    window_size=131072,
+    drop_last=True,
 )
 ```
 
@@ -165,7 +167,7 @@ What this does:
 
 To work with different sequence lengths (still below ~1 Mbp), adjust:
 
-- `window_size` in `load_intervals` and `BigWigDataModule`.
+- `window_size` in `prepare_intervals_from_fold`.
 - Your BED intervals if you want exact window boundaries.
 
 Examples:
@@ -211,4 +213,3 @@ Use this tutorial when:
 - You are adding a new track to an existing genome-wide prediction task.
 
 If you need the backbone to adapt (e.g. domain shift, very different assay), see the **Full-Model Finetuning** tutorial.
-
