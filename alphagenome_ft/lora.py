@@ -7,7 +7,7 @@ low-rank matrices to selected linear layers while keeping the backbone frozen.
 Typical usage pattern:
 1. Write custom Haiku modules/heads that use LoRALinear instead of hk.Linear.
 2. Pass frozen backbone embeddings as input to those modules.
-3. Freeze backbone parameters with parameter_utils.freeze_backbone_keep_lora.
+3. Freeze backbone parameters with parameter_utils.freeze_except_lora.
 4. Train only the LoRA parameters (lora_a, lora_b).
 """
 from __future__ import annotations

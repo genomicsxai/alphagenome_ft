@@ -50,7 +50,7 @@ from alphagenome_ft.lora import (
     get_lora_parameter_paths,
     count_lora_parameters,
 )
-from alphagenome_ft.parameter_utils import freeze_backbone_keep_lora
+from alphagenome_ft.parameter_utils import freeze_except_lora
 
 __all__ = [
     # Model classes
@@ -97,5 +97,5 @@ __all__ = [
     'LoRALinear',
     'get_lora_parameter_paths',
     'count_lora_parameters',
-    'freeze_backbone_keep_lora',
+    'freeze_except_lora',
 ]
