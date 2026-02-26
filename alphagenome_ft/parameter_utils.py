@@ -262,6 +262,34 @@ def freeze_except_head(params: PyTree, trainable_head: str) -> PyTree:
     return frozen
 
 
+def freeze_except_lora(
+    params: PyTree,
+    freeze_prefixes: Sequence[str] = ('sequence_encoder', 'transformer_tower', 'sequence_decoder'),
+) -> PyTree:
+    """Freeze backbone components while keeping LoRA adapter parameters trainable.
+
+    Args:
+        params: Parameter tree to modify.
+        freeze_prefixes: Backbone component prefixes to freeze.  Defaults to
+            all three components (encoder, transformer, decoder).
+
+    Returns:
+        Parameter tree with frozen backbone components (LoRA params excluded).
+    """
+    all_paths = get_parameter_paths(params)
+    backbone_paths_to_freeze = [
+        p for p in all_paths
+        if any(
+            p.startswith(prefix) or f'/{prefix}/' in p or p.endswith(f'/{prefix}')
+            for prefix in freeze_prefixes
+        )
+        and p.split('/')[-1] not in ('lora_a', 'lora_b')
+    ]
+    frozen = freeze_parameters(params, freeze_paths=backbone_paths_to_freeze)
+    
+    return frozen
+
+
 def get_parameter_paths(params: PyTree) -> list[str]:
     """Get all parameter paths in the tree.
     

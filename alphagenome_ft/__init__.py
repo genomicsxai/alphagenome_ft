@@ -43,6 +43,14 @@ from alphagenome_ft.custom_heads import (
 )
 from alphagenome_ft import templates
 from alphagenome_ft import finetune
+from alphagenome_ft import lora
+from alphagenome_ft.lora import (
+    LoRAConfig,
+    LoRALinear,
+    get_lora_parameter_paths,
+    count_lora_parameters,
+)
+from alphagenome_ft.parameter_utils import freeze_except_lora
 
 __all__ = [
     # Model classes
@@ -83,4 +91,11 @@ __all__ = [
     'templates',
     # Finetuning workflow module
     'finetune',
+    # LoRA utilities
+    'lora',
+    'LoRAConfig',
+    'LoRALinear',
+    'get_lora_parameter_paths',
+    'count_lora_parameters',
+    'freeze_except_lora',
 ]
