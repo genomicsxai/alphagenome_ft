@@ -79,7 +79,7 @@ pip install git+https://github.com/google-deepmind/alphagenome_research.git
 - AlphaGenome and AlphaGenome Research must be installed separately as above; they are not on PyPI.
 
 ## Quick Start
-There are three options to add new heads to AlphaGenome.
+There are two options to add new heads to AlphaGenome.
 
 ### Option A: Use a Predefined AlphaGenome Head
 
@@ -119,9 +119,9 @@ model = create_model_with_heads(
 )
 ```
 
-### Option B: Use Template Heads
+### Option B: Use Custom Heads with Guidance from Reference Templates
 
-We provide ready-to-use template heads for common scenarios, see `./alphagenome_ft/templates.py`:
+We provide template heads for guidance on accessing different embeddings, see `./alphagenome_ft/templates.py`:
 
 ```python
 from alphagenome.models import dna_output
@@ -164,9 +164,9 @@ All templates use simple architecture: **Linear → ReLU → Linear**
 
 The key difference is **which embeddings** they access. See [`alphagenome_ft/templates.py`](alphagenome_ft/templates.py) for code.
 
-### Option C: Define Custom Head from Scratch
+**Note**: Template heads are there as a guide for to how to set up your own custom head rather than a definitive ‘best’/‘standard’ option. You should update these with your own layer and loss function choices to fit your data needs.
 
-Define your own head when you need specific head architectures and/or loss:
+To define your own head:
 
 ```python
 import jax
