@@ -7,7 +7,7 @@ A lightweight Python package for finetuning [Google DeepMind's AlphaGenome](http
 ## Use cases
 
 - If you want to apply AlphaGenome to your MPRA (or other perturbation) data of interest, see [Encoder-only / short sequences (MPRA)](#workflow-1-encoder-only--short-sequences-mpra). [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/finetune_encoder_only_mpra.ipynb)
-- If you want to apply AlphaGenome to your own genome-wide assay, start with [Heads-only finetuning (frozen backbone)](#workflow-2-heads-only-finetuning-frozen-backbone) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/finetune_rna_head_only.ipynb); then [LoRA-style adapters](#workflow-3-lora-style-adapters) or [Full-model finetuning](#workflow-4-full-model-finetuning) if needed.
+- If you want to apply AlphaGenome to your own genome-wide assay, start with [Heads-only finetuning (frozen backbone)](#workflow-2-heads-only-finetuning-frozen-backbone) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/finetune_rna_head_only.ipynb); then [LoRA-style adapters](#workflow-3-lora-style-adapters) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/finetune_atac_lora.ipynb) or [Full-model finetuning](#workflow-4-full-model-finetuning) if needed.
 
 ## Contents
 
@@ -264,6 +264,8 @@ loss_fn = model.create_loss_fn_for_head('my_head')
 ---
 
 ### Workflow 3: LoRA-style adapters
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/finetune_atac_lora.ipynb)
 
 **When to use:** Low-rank adapters on the backbone. **Tutorial:** [LoRA-style adapters](docs/lora_adapters.md).
 

@@ -1,125 +1,187 @@
-## Tutorial: LoRA‑Style Adapters on Top of AlphaGenome
+## Tutorial: LoRA Adapters in `alphagenome-ft`
 
-This tutorial outlines how to use **LoRA‑style low‑rank adapters** with AlphaGenome models wrapped by `alphagenome-ft`.
+This tutorial explains how to use the **built‑in LoRA (Low‑Rank Adaptation) utilities** in `alphagenome-ft` to perform parameter‑efficient finetuning of AlphaGenome, and how this is instantiated in the ATAC demo notebook `notebooks/finetune_atac_lora.ipynb`.
 
-The package gives you:
-- A clean way to **inspect parameter paths** (via `parameter_utils`).
-- A simple wrapper (`CustomAlphaGenomeModel`) around the AlphaGenome backbone.
+The package now provides:
+- **LoRA building blocks** in `alphagenome_ft.lora` (`LoRAConfig`, `LoRALinear`, parameter‑count helpers).
+- **Parameter inspection and freezing utilities** in `alphagenome_ft.parameter_utils`.
+- A standard training loop (`alphagenome_ft.finetune.train.train`) that works with LoRA‑equipped heads.
 
-LoRA itself is implemented as **user code** in your project, on top of Haiku modules. This tutorial sketches a reference pattern.
+### 1. When to Use LoRA vs Heads‑Only Finetuning
 
-### 1. When to Use LoRA-Style Adapters
+**Heads‑only finetuning**:
+- Adds a new task‑specific head on top of frozen AlphaGenome embeddings.
+- Trains only the head parameters; the backbone remains frozen.
+- Works well when a shallow mapping from embeddings to targets is sufficient.
 
-LoRA‑style adapters are useful when:
-- You want to adapt AlphaGenome to a new domain with **very few trainable parameters**.
-- Full-model finetuning is too expensive.
-- Heads-only finetuning is not expressive enough.
+**LoRA finetuning**:
+- Still keeps the AlphaGenome backbone **frozen**, but adds small trainable low‑rank matrices inside your head’s linear projections.
+- Increases expressivity with **very few additional parameters**, often improving over heads‑only training while retaining low memory and compute cost.
 
-The idea:
-- Keep original backbone parameters **frozen**.
-- Add small **low-rank matrices** to selected layers (e.g. attention projections, MLPs).
+Use **LoRA** when:
+- Full‑model finetuning is too expensive.
+- Heads‑only finetuning has saturated and you need a richer adapter without unfreezing the backbone.
 
-### 2. Identify Target Layers with `parameter_utils`
+### 2. Built‑In LoRA Utilities (`alphagenome_ft.lora`)
 
-First, inspect parameter paths to decide where to attach LoRA adapters:
+`alphagenome_ft.lora` provides:
+
+- **`LoRAConfig`**  
+  - `rank`: low‑rank dimension (e.g. 4, 8, 16).  
+  - `alpha`: scaling factor; effective scale is \( \alpha / \text{rank} \). Setting `alpha == rank` yields scale 1.
+
+- **`LoRALinear`**  
+  - A Haiku module that augments a linear projection with a LoRA adapter.  
+  - Parameters:
+    - Base weight `w` (typically kept frozen).
+    - Low‑rank matrices `lora_a`, `lora_b` (trainable).  
+  - Optional bias term `b` controlled by `with_bias`.  
+  - Designed so that the parameters are named `w`, `lora_a`, `lora_b`, matching AlphaGenome’s linear‑layer conventions and integrating cleanly with checkpoints.
+
+- **`get_lora_parameter_paths(params)`**  
+  - Returns all parameter paths in a Haiku parameter tree whose leaf name is `lora_a` or `lora_b`.  
+  - Useful for verifying that LoRA adapters are present where you expect them.
+
+- **`count_lora_parameters(params)`**  
+  - Counts the total number of scalar parameters across all `lora_a` and `lora_b` arrays.  
+  - Lets you quantify how lightweight your adapters are compared to the full model.
+
+The underlying forward computation in `LoRALinear` is:
+
+\[
+  y = x W \;+\; (x A) B \cdot \frac{\alpha}{r},
+\]
+
+where:
+- \( W \) is the frozen base weight (`w`),
+- \( A \) is `lora_a` (shape \((\text{in\_dim}, r)\)),
+- \( B \) is `lora_b` (shape \((r, \text{out\_dim})\)),
+- \( r \) is the LoRA rank.
+
+In the reference implementation:
+- `lora_a` is initialised from a small normal distribution.
+- `lora_b` is initialised to zeros so the adapter starts as a **no‑op**, matching the frozen‑backbone baseline at step 0.
+
+### 3. Example: ATAC/RNA Head with LoRA
+
+The notebook `notebooks/finetune_atac_lora.ipynb` shows a concrete **LoRA head** that adapts AlphaGenome to ATAC tracks, but the same pattern applies to RNA or other genome‑track targets.
+
+Key ideas:
+- Use **1 bp embeddings** from the AlphaGenome decoder: `embeddings.get_sequence_embeddings(resolution=1)` giving shape `(B, S, 1536)`.
+- Apply a single `LoRALinear` to project from 1536 features to `NUM_TRACKS` outputs.
+- Wrap this in a `CustomHead` whose `predict` method uses `LoRALinear` and whose `loss` compares predictions to per‑base targets.
+- Register the head via `register_custom_head` and build `head_specs` with `source: "custom"`.
+
+Conceptually, the `predict` method of such a head looks like:
 
 ```python
-from alphagenome_ft import create_model_with_heads
+from alphagenome_ft import lora
+
+class LoRAHead(CustomHead):
+    def predict(self, embeddings, organism_index, **kwargs):
+        x   = embeddings.get_sequence_embeddings(resolution=1)          # (B, S, 1536)
+        cfg = lora.LoRAConfig(rank=LORA_RANK, alpha=LORA_ALPHA)
+        x   = lora.LoRALinear(self._num_tracks, cfg)(x)                 # (B, S, num_tracks)
+        return {"predictions": jax.nn.softplus(x)}
+```
+
+The notebook then:
+- Defines `TARGETS_CONFIG` for BigWig tracks and converts it to `head_specs`.
+- Creates a model with `create_model_with_heads(MODEL_VERSION, heads=[HEAD_NAME])`.
+
+### 4. Inspecting and Counting LoRA Parameters
+
+Before training, you can verify where LoRA lives and how large it is:
+
+- **Backbone paths**:  
+  `parameter_utils.get_backbone_parameter_paths(model._params)`  
+  lists all arrays belonging to the frozen AlphaGenome backbone.
+
+- **LoRA paths**:  
+  `lora.get_lora_parameter_paths(model._params)`  
+  returns all leaf paths ending in `lora_a` or `lora_b`.
+
+- **Parameter counts**:  
+  Combine `parameter_utils.count_parameters(model._params)` with  
+  `lora.count_lora_parameters(model._params)` to compute the **LoRA parameter fraction**:
+
+```python
+total_params = parameter_utils.count_parameters(model._params)
+lora_params  = lora.count_lora_parameters(model._params)
+print(f"LoRA fraction: {lora_params / total_params:.4%}")
+```
+
+This gives a quick sanity check that your adapters remain small relative to the backbone.
+
+### 5. Freezing the Backbone and Training Only LoRA
+
+Once the LoRA head is attached, the notebook freezes the backbone while keeping the LoRA adapters trainable:
+
+- **Freeze everything except LoRA**  
+  Use `parameter_utils.freeze_except_lora`:
+
+```python
 from alphagenome_ft import parameter_utils
 
-model = create_model_with_heads("all_folds", heads=["my_head"])
-
-paths = parameter_utils.get_backbone_parameter_paths(model._params)
-for p in paths[:40]:
-    print(p)
+model._params = parameter_utils.freeze_except_lora(model._params)
 ```
 
-**Caution about `all_folds` and benchmarks:** `"all_folds"` uses the AlphaGenome distilled model trained on all four genomic folds. This is ideal for practical adapter experiments, but if your task’s train/valid/test splits overlap AlphaGenome’s (and Borzoi’s) held‑out regions, you can get **data leakage and inflated test performance**. If you care about strict benchmarking that matches the splits used in [AlphaGenome](https://www.nature.com/articles/s41586-025-10014-0) and [Borzoi](https://www.nature.com/articles/s41588-024-02053-6), load one of the fold‑specific AlphaGenome models instead and align your train/valid/test partitions to those folds.
+This applies `jax.lax.stop_gradient` to all parameters except those whose leaf name is `lora_a` or `lora_b`. The LoRA matrices remain trainable; the backbone (and any non‑LoRA head weights) are frozen.
 
-Typical paths you might see:
-- `alphagenome/sequence_encoder/...`
-- `alphagenome/transformer_tower/block_0/attention/q_proj/w`
-- `alphagenome/transformer_tower/block_0/mlp/dense_0/w`
-
-Pick a small subset of these (e.g. Q/K/V projections or MLP layers) for LoRA.
-
-### 3. Define a Haiku LoRA Module
-
-Below is a **minimal Haiku module** that wraps a linear transformation with low-rank adapters:
+- **Train with `heads_only=True`**  
+  When calling `alphagenome_ft.finetune.train.train`, pass `heads_only=True`. This ensures the optimizer does not allocate state for frozen backbone parameters, and the existing freeze is respected:
 
 ```python
-import jax.numpy as jnp
-import haiku as hk
-
-class LoRALinear(hk.Module):
-    def __init__(self, out_dim: int, rank: int = 8, alpha: float = 1.0, name=None):
-        super().__init__(name=name)
-        self.out_dim = out_dim
-        self.rank = rank
-        self.alpha = alpha
-
-    def __call__(self, x):
-        in_dim = x.shape[-1]
-
-        # Base weight (will be frozen)
-        w = hk.get_parameter("w", shape=(in_dim, self.out_dim), init=hk.initializers.VarianceScaling())
-
-        # LoRA adapters (trainable, low rank)
-        a = hk.get_parameter("lora_a", shape=(in_dim, self.rank), init=hk.initializers.RandomNormal(0.01))
-        b = hk.get_parameter("lora_b", shape=(self.rank, self.out_dim), init=hk.initializers.RandomNormal(0.01))
-
-        base = x @ w
-        delta = (x @ a) @ b * (self.alpha / self.rank)
-        return base + delta
+train(
+    model,
+    data_module,
+    head_specs,
+    learning_rate=LEARNING_RATE,
+    weight_decay=WEIGHT_DECAY,
+    num_epochs=NUM_EPOCHS,
+    seed=SEED,
+    max_train_steps=MAX_TRAIN_STEPS,
+    heads_only=True,
+    checkpoint_dir=CHECKPOINT_DIR,
+    organism=ORGANISM,
+    best_metric=BEST_METRIC,
+    best_metric_mode=BEST_METRIC_MODE,
+    early_stopping_patience=EARLY_STOPPING_PATIENCE,
+    early_stopping_min_delta=EARLY_STOPPING_MIN_DELTA,
+    verbose=VERBOSE,
+)
 ```
 
-In practice you would integrate this into a custom attention/MLP block, reusing AlphaGenome embeddings as input.
+In the ATAC demo notebook this is combined with `BigWigDataModule` and fold‑based genomic intervals, but the same pattern works for other targets and loaders.
 
-### 4. Freeze Backbone, Train Only Adapters
+### 6. LoRA and Sequence Length (up to 1 Mbp)
 
-Once you have a model that includes LoRA modules (e.g. in your own wrapper around AlphaGenome embeddings), you can:
+LoRA operates on **weights**, not directly on sequence length, so you can reuse any of the sequence window sizes described elsewhere:
 
-1. **Freeze all original backbone parameters** using `parameter_utils.freeze_backbone`.
-2. Ensure only LoRA parameters (e.g. `lora_a`, `lora_b`) are trainable.
+- 32k, 64k, 128k, and up to ~1 Mbp windows.
+- Control sequence length via `window_size` in the finetuning data utilities (e.g. `prepare_intervals_from_fold`) or your own loaders.
 
-Example pattern:
+Your choice of **where** to place LoRA (which heads or layers) is independent of the chosen window size.
 
-```python
-from alphagenome_ft import parameter_utils
+### 7. Recommended Workflow
 
-# 1. Freeze standard AlphaGenome backbone params
-model._params = parameter_utils.freeze_backbone(model._params)
-
-# 2. Optionally freeze all heads except a specific one
-model._params = parameter_utils.freeze_all_heads(model._params, except_heads=["my_head"])
-```
-
-Your optimizer should then operate over the full parameter tree; frozen parameters will not receive gradients (and thus are effectively excluded).
-
-### 5. LoRA with Sequence Lengths up to 1 Mbp
-
-LoRA adapters operate on **layer weights**, not on sequence length. You can reuse any of the sequence window sizes described in other tutorials:
-
-- 32k, 64k, 128k, up to ~1 Mbp windows.
-- Control sequence length via `window_size` in the `finetune` data utilities, or in your own data loader.
-
-The LoRA strategy is orthogonal to window length; choose window sizes that match your task, then decide which layers to equip with adapters.
-
-### 6. Recommended Workflow
-
-1. **Start with heads-only finetuning** (frozen backbone).
-2. If performance plateaus and you suspect backbone limitations, try:
-   - Adding small LoRA adapters to a **few transformer blocks**.
-   - Training only those adapters + heads.
+1. **Start with heads‑only finetuning** on your task using the standard `GENOME_TRACKS` heads.
+2. If performance plateaus:
+   - Introduce a LoRA head (as in `finetune_atac_lora.ipynb`) for your task.
+   - Use `LoRAConfig` to keep the adapter small (e.g. rank 4–16).
 3. Monitor:
-   - Validation metrics.
-   - Parameter count (to confirm LoRA stays lightweight).
+   - Validation metrics (compare heads‑only vs LoRA).
+   - LoRA parameter fraction (via `count_lora_parameters`) to ensure parameter efficiency.
 
-### 7. Notes and Caveats
+### 8. Notes and Caveats (Model Versions and Folds)
 
-- This repository does **not** ship a full AlphaGenome‑internal LoRA reparameterization; instead it provides:
-  - Clean parameter inspection (to target modules).
-  - Backbone freezing utilities.
-  - A standard training loop you can adapt.
-- Detailed, model‑internal LoRA implementations can be added in your own codebase, following the pattern above.
+- **Model choice and data leakage**  
+  The `"all_folds"` distilled AlphaGenome model is convenient for practical adapter experiments, but if your train/valid/test partitions overlap AlphaGenome’s (and Borzoi’s) held‑out genomic regions, you can get **data leakage and inflated test performance**.  
+  For strict benchmarking that matches the splits used in [AlphaGenome](https://www.nature.com/articles/s41586-025-10014-0) and [Borzoi](https://www.nature.com/articles/s41588-024-02053-6):
+  - Prefer fold‑specific models (e.g. `"fold_0"`, `"fold_1"`, etc.).
+  - Align your train/valid/test intervals with the corresponding folds.
+
+- **Extensibility**  
+  The current implementation equips **heads** with LoRA adapters via `LoRALinear`. You can extend the same pattern to more complex multi‑layer heads or additional projections if needed, reusing the same utilities for parameter inspection, counting, and freezing.
+
 
