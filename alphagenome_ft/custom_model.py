@@ -87,27 +87,36 @@ def _resolve_user_metadata(
     head_name: str,
     head_config: custom_heads_module.HeadConfigLike,
 ) -> Mapping[enum.Enum, Any] | None:
-    """Return user-provided metadata, validated against num_tracks."""
+    """Return user-provided metadata, validated against num_tracks.
+
+    For custom heads ``num_tracks`` is stored directly on the config.
+    For predefined heads (``alphagenome_research`` HeadConfig) ``num_tracks``
+    is not a config attribute — it is derived from the metadata itself — so we
+    skip the size check and trust the metadata that was built from the user's
+    target list.
+    """
     metadata = custom_heads_module.get_registered_head_metadata(head_name)
     if metadata is None:
         return None
+
+    num_tracks: int | None = getattr(head_config, 'num_tracks', None)
 
     if isinstance(metadata, Mapping):
         for organism, meta in metadata.items():
             if meta is None:
                 continue
-            if len(meta) != head_config.num_tracks:
+            if num_tracks is not None and len(meta) != num_tracks:
                 raise ValueError(
                     f"Head '{head_name}' metadata has {len(meta)} tracks "
                     f"for {getattr(organism, 'name', organism)}, expected "
-                    f"{head_config.num_tracks}."
+                    f"{num_tracks}."
                 )
         return metadata
 
-    if len(metadata) != head_config.num_tracks:
+    if num_tracks is not None and len(metadata) != num_tracks:
         raise ValueError(
             f"Head '{head_name}' metadata has {len(metadata)} tracks, "
-            f"expected {head_config.num_tracks}."
+            f"expected {num_tracks}."
         )
     return {organism: metadata for organism in dna_client.Organism}
 

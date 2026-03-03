@@ -5,6 +5,15 @@ This package provides utilities for finetuning the AlphaGenome model with custom
 and parameter freezing capabilities, without modifying the original alphagenome_research codebase.
 """
 
+try:
+    from importlib.metadata import version as _version, PackageNotFoundError as _PackageNotFoundError
+    try:
+        __version__ = _version("alphagenome-ft")
+    except _PackageNotFoundError:
+        __version__ = "unknown"
+except ImportError:
+    __version__ = "unknown"
+
 from alphagenome_ft.custom_model import (
     CustomAlphaGenomeModel,
     create_model_with_heads,

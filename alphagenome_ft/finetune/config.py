@@ -40,6 +40,8 @@ except ImportError:  # pragma: no cover - handled at runtime
 import pandas as pd
 
 from alphagenome.models import dna_client
+from alphagenome.models import dna_output
+from alphagenome_research.model.metadata.metadata import AlphaGenomeOutputMetadata
 
 from alphagenome_ft import (
     get_custom_head_config,
@@ -69,7 +71,7 @@ class HeadSpec:
     kind: str | None  # Predefined head kind (e.g., "rna_seq"); None for custom.
     tracks: Sequence[TrackInfo]  # Target tracks used as supervision for this head.
     config: Any | None = None  # Runtime predefined-head config object when applicable.
-    metadata: Mapping[dna_client.Organism, pd.DataFrame] | None = None  # Optional per-organism track metadata.
+    metadata: Mapping[dna_client.Organism, AlphaGenomeOutputMetadata] | None = None  # Optional per-organism track metadata.
 
 
 def _resolve_target_path(path_value: str, base_dir: Path | None) -> str:
@@ -229,22 +231,30 @@ def _parse_targets(entries: Sequence[Mapping[str, Any]]) -> list[TrackInfo]:
 def _build_track_metadata(
     tracks: Sequence[TrackInfo],
     organism: dna_client.Organism | None,
-) -> Mapping[dna_client.Organism, pd.DataFrame] | None:
-    nonzero_means = [track.nonzero_mean for track in tracks]
-    if all(value is None for value in nonzero_means):
-        return None
-    nonzero_means = [
-        1.0 if value is None else float(value) for value in nonzero_means
-    ]
+    output_type: dna_output.OutputType,
+) -> Mapping[dna_client.Organism, AlphaGenomeOutputMetadata]:
+    """Build an AlphaGenomeOutputMetadata mapping from user-provided tracks.
+
+    The returned metadata is used to initialise predefined heads, which derive
+    their output dimensionality (num_tracks) from it.  We always return a valid
+    mapping so that the head constructor does not receive an empty dict.
+    ``nonzero_mean`` values stored on each track are kept for use by the data
+    pipeline but are not required for the metadata object itself.
+    """
     df = pd.DataFrame(
         {
             "name": [track.name for track in tracks],
-            "nonzero_mean": nonzero_means,
+            "strand": ["+"] * len(tracks),
         }
     )
+    # AlphaGenomeOutputMetadata stores per-output-type DataFrames as named
+    # fields whose names are the lower-cased OutputType enum member names
+    # (e.g. OutputType.RNA_SEQ -> field "rna_seq").
+    field_name = output_type.name.lower()
+    ag_metadata = AlphaGenomeOutputMetadata(**{field_name: df})
     if organism is not None:
-        return {organism: df}
-    return {org: df for org in dna_client.Organism}
+        return {organism: ag_metadata}
+    return {org: ag_metadata for org in dna_client.Organism}
 
 
 def prepare_head_specs(
@@ -341,7 +351,7 @@ def prepare_head_specs(
                 embedding_channels=overrides.get('embedding_channels'),
                 num_tissues=overrides.get('num_tissues'),
             )
-            metadata = _build_track_metadata(tracks, organism_enum)
+            metadata = _build_track_metadata(tracks, organism_enum, head_config.output_type)
             specs.append(
                 HeadSpec(
                     head_id=head_id,
