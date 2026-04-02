@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import math
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -36,6 +37,95 @@ def register_predefined_heads(head_specs: Sequence[HeadSpec]) -> None:
         )
 
 
+def _keypath_to_str(path_tuple: tuple) -> str:
+    """Convert a JAX parameter key-path tuple to a slash-delimited string."""
+    parts = []
+    for key in path_tuple:
+        if isinstance(key, parameter_utils.DictKey):
+            parts.append(str(key.key))
+        elif isinstance(key, parameter_utils.GetAttrKey):
+            parts.append(str(key.name))
+        elif isinstance(key, parameter_utils.SequenceKey):
+            parts.append(str(key.idx))
+        else:
+            parts.append(str(key))
+    return "/".join(parts)
+
+
+def _is_trainable_head_path(path_str: str, trainable_heads: set[str]) -> bool:
+    """Return True if a parameter path belongs to any requested trainable head."""
+    for head_name in trainable_heads:
+        if f"/head/{head_name}/" in path_str or path_str.startswith(f"head/{head_name}/"):
+            return True
+    return False
+
+
+def _label_params_for_heads(params, trainable_heads: Sequence[str]):
+    """Label model parameters as trainable head params vs frozen params."""
+    head_set = {str(name) for name in trainable_heads}
+
+    def label_fn(path, _value):
+        path_str = _keypath_to_str(path)
+        return "head" if _is_trainable_head_path(path_str, head_set) else "frozen"
+
+    return jax.tree_util.tree_map_with_path(label_fn, params)
+
+
+def create_optimizer(
+    params,
+    trainable_head_names: Sequence[str],
+    learning_rate: float,
+    weight_decay: float,
+    heads_only: bool,
+):
+    """Create optimizer for full finetuning or heads-only finetuning."""
+    if heads_only:
+        head_set = {str(name) for name in trainable_head_names}
+        head_paths = parameter_utils.get_head_parameter_paths(params)
+        matched_paths = [path for path in head_paths if _is_trainable_head_path(path, head_set)]
+        if not matched_paths:
+            sample_paths = ", ".join(head_paths[:5]) if head_paths else "<none>"
+            raise ValueError(
+                "No trainable head parameters matched --heads-only filter. "
+                f"Names tried: {sorted(head_set)}. "
+                f"Head parameter sample: {sample_paths}"
+            )
+        param_labels = _label_params_for_heads(params, trainable_head_names)
+        return optax.multi_transform(
+            {
+                "head": optax.adamw(learning_rate, weight_decay=weight_decay),
+                "frozen": optax.set_to_zero(),
+            },
+            param_labels,
+        )
+    return optax.adamw(learning_rate, weight_decay=weight_decay)
+
+
+def _replicate_tree(tree, devices):
+    """Replicate a pytree across local devices."""
+    return jax.device_put_replicated(tree, devices)
+
+
+def _unreplicate_tree(tree):
+    """Extract the first replica from a replicated pytree."""
+    return jax.tree_util.tree_map(lambda value: value[0], tree)
+
+
+def _shard_batch(batch: Mapping[str, jax.Array], num_devices: int):
+    """Reshape a batch from [global_batch, ...] to [num_devices, per_device, ...]."""
+
+    def shard_array(name: str, value):
+        if value.shape[0] % num_devices != 0:
+            raise ValueError(
+                f"Batch size  of {value.shape[0]} is not divisible by num_devices={num_devices}."
+                f"Use a global batch size divisible by the number of local devices."
+            )
+        per_device_batch = value.shape[0] // num_devices
+        return value.reshape((num_devices, per_device_batch, *value.shape[1:]))
+
+    return {name: shard_array(name, value) for name, value in batch.items()}
+
+
 def train(
     model: CustomAlphaGenomeModel,
     data_module: BigWigDataModule,
@@ -59,8 +149,9 @@ def train(
     wandb_entity: str | None = None,
     wandb_run_name: str | None = None,
     wandb_config: dict | None = None,
+    num_devices: int = 1,
 ) -> None:
-    """Run fine-tuning with JIT-compiled train/eval steps.
+    """Run fine-tuning with pmapped train/eval steps.
 
     Args:
         model: Initialized AlphaGenome model wrapper to fine-tune.
@@ -84,6 +175,7 @@ def train(
         wandb_entity: Optional W&B entity/team override.
         wandb_run_name: Optional W&B run-name override.
         wandb_config: Optional extra config keys to merge into W&B config.
+        num_devices: Number of local devices to use. Defaults to single-device.
 
     Notes:
         Total planned steps are computed before training from train-set size and
@@ -115,6 +207,17 @@ def train(
         checkpoint_dir = Path(checkpoint_dir).expanduser().resolve()
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    if num_devices < 1:
+        raise ValueError(f"num_devices must be at least 1, got {num_devices}.")
+
+    available_devices = jax.local_devices()
+    if num_devices > len(available_devices):
+        raise ValueError(
+            f"Requested num_devices={num_devices}, but only {len(available_devices)} local "
+            f"device(s) are available."
+        )
+    devices = available_devices[:num_devices]
+
     if use_wandb:
         import wandb
 
@@ -127,6 +230,7 @@ def train(
             "total_train_steps": total_train_steps,
             "heads_only": heads_only,
             "organism": organism,
+            "num_devices": num_devices,
             "best_metric": best_metric,
             "best_metric_mode": best_metric_mode,
             "early_stopping_patience": early_stopping_patience,
@@ -141,6 +245,13 @@ def train(
         )
 
     head_names = [spec.head_id for spec in head_specs]
+    if num_devices > 1 and not data_module._drop_last:
+        raise ValueError(
+            "Single-host multi-GPU training currently requires drop_last=True so every "
+            "batch can be sharded evenly across devices."
+        )
+    if heads_only:
+        model.freeze_backbone()
 
     optimizer = create_optimizer(
         model._params,
@@ -153,14 +264,11 @@ def train(
 
     organism_enum = getattr(ag_dna_model.Organism, organism)
     organism_index_value = research_dna_model.convert_to_organism_index(organism_enum)
-    strand_reindexing = jax.device_put(
-        model._metadata[organism_enum].strand_reindexing,
-        model._device_context._device,
-    )
+    strand_reindexing = model._metadata[organism_enum].strand_reindexing
 
     loss_fns = {name: model.create_loss_fn_for_head(name) for name in head_names}
 
-    @jax.jit
+    @functools.partial(jax.pmap, axis_name="data")
     def train_step(params, state, current_opt_state, batch):
         def loss_fn(current_params):
             predictions = model._predict(
@@ -169,7 +277,7 @@ def train(
                 batch["sequences"],
                 batch["organism_index"],
                 negative_strand_mask=batch["negative_strand_mask"],
-                strand_reindexing=strand_reindexing,
+                strand_reindexing=batch["strand_reindexing"],
             )
             total_loss = 0.0
             for head_name in head_names:
@@ -184,11 +292,13 @@ def train(
             return total_loss
 
         loss_value, grads = jax.value_and_grad(loss_fn)(params)
+        loss_value = jax.lax.pmean(loss_value, axis_name="data")
+        grads = jax.lax.pmean(grads, axis_name="data")
         updates, new_opt_state = optimizer.update(grads, current_opt_state, params)
         new_params = optax.apply_updates(params, updates)
         return new_params, new_opt_state, loss_value
 
-    @jax.jit
+    @functools.partial(jax.pmap, axis_name="data")
     def eval_step(params, state, batch):
         predictions = model._predict(
             params,
@@ -196,7 +306,7 @@ def train(
             batch["sequences"],
             batch["organism_index"],
             negative_strand_mask=batch["negative_strand_mask"],
-            strand_reindexing=strand_reindexing,
+            strand_reindexing=batch["strand_reindexing"],
         )
         head_losses = {}
         for head_name in head_names:
@@ -208,6 +318,10 @@ def train(
                 },
             )
             head_losses[head_name] = loss_dict["loss"]
+        head_losses = jax.tree_util.tree_map(
+            lambda loss_value: jax.lax.pmean(loss_value, axis_name="data"),
+            head_losses,
+        )
         return head_losses
 
     if verbose:
@@ -252,12 +366,16 @@ def train(
     )
 
     with model._device_context:
+        replicated_params = _replicate_tree(model._params, devices)
+        replicated_state = _replicate_tree(model._state, devices)
+        opt_state = _replicate_tree(opt_state, devices)
+        strand_reindexing_replicated = _replicate_tree(strand_reindexing, devices)
         stop_training = False
         for epoch in range(1, num_epochs + 1):
             if verbose:
-                print(f'\n{"=" * 60}')
+                print(f"\n{'=' * 60}")
                 print(f"Epoch {epoch}/{num_epochs}")
-                print(f'{"=" * 60}')
+                print(f"{'=' * 60}")
             else:
                 print(f"Epoch {epoch}/{num_epochs}")
 
@@ -265,13 +383,15 @@ def train(
             train_losses: list[float] = []
             for batch_np in data_module.iter_batches("train", seed=seed + epoch):
                 batch = prepare_batch(batch_np, organism_index_value, head_names)
-                model._params, opt_state, loss_value = train_step(
-                    model._params,
-                    model._state,
+                batch = _shard_batch(batch, num_devices)
+                batch["strand_reindexing"] = strand_reindexing_replicated
+                replicated_params, opt_state, loss_value = train_step(
+                    replicated_params,
+                    replicated_state,
                     opt_state,
                     batch,
                 )
-                loss_scalar = float(loss_value)
+                loss_scalar = float(np.asarray(loss_value)[0])
                 train_losses.append(loss_scalar)
                 epoch_step += 1
                 global_step += 1
@@ -313,12 +433,19 @@ def train(
                 losses = {head: [] for head in head_names}
                 for batch_np in data_module.iter_batches("valid"):
                     batch = prepare_batch(batch_np, organism_index_value, head_names)
-                    head_losses = eval_step(model._params, model._state, batch)
+                    batch = _shard_batch(batch, num_devices)
+                    batch["strand_reindexing"] = strand_reindexing_replicated
+                    head_losses = eval_step(replicated_params, replicated_state, batch)
                     for head_name in head_names:
-                        losses[head_name].append(float(head_losses[head_name]))
+                        losses[head_name].append(float(np.asarray(head_losses[head_name])[0]))
 
-                valid_metrics = {head: float(np.mean(values)) for head, values in losses.items() if values}
-                print("  Validation metrics:", ", ".join(f"{k}={v:.4f}" for k, v in valid_metrics.items()))
+                valid_metrics = {
+                    head: float(np.mean(values)) for head, values in losses.items() if values
+                }
+                print(
+                    "  Validation metrics:",
+                    ", ".join(f"{k}={v:.4f}" for k, v in valid_metrics.items()),
+                )
                 if use_wandb:
                     valid_log = {f"valid/{head}": v for head, v in valid_metrics.items()}
                     valid_log["valid/loss"] = float(sum(valid_metrics.values()))
@@ -333,6 +460,8 @@ def train(
                     if use_wandb:
                         wandb.log({"best/" + metric_label: metric_value, "epoch": epoch})
                     if checkpoint_dir:
+                        model._params = _unreplicate_tree(replicated_params)
+                        model._state = _unreplicate_tree(replicated_state)
                         print(
                             f"  Metric improved ({metric_label} = {metric_value:.4f}) "
                             " -- saving best checkpoint"
@@ -344,6 +473,8 @@ def train(
                 print(f"  Best metric ({metric_label}): unavailable")
 
             if checkpoint_dir:
+                model._params = _unreplicate_tree(replicated_params)
+                model._state = _unreplicate_tree(replicated_state)
                 model.save_checkpoint(checkpoint_dir / "last", save_full_model=False)
 
             if early_stopping_patience > 0 and epochs_since_improvement >= early_stopping_patience:
@@ -353,12 +484,15 @@ def train(
                 print(f"  Reached requested training steps: {global_step}/{total_train_steps}")
                 break
 
+        model._params = _unreplicate_tree(replicated_params)
+        model._state = _unreplicate_tree(replicated_state)
+
     if checkpoint_dir and not (checkpoint_dir / "last").exists():
         model.save_checkpoint(checkpoint_dir / "last", save_full_model=False)
 
-    print(f'\n{"=" * 60}')
+    print(f"\n{'=' * 60}")
     print("Training complete!")
-    print(f'{"=" * 60}')
+    print(f"{'=' * 60}")
 
     if use_wandb:
         wandb.finish()
