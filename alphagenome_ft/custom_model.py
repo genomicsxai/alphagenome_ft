@@ -258,12 +258,10 @@ class CustomAlphaGenomeModel:
                 params, state, sequences, organism_indices,
                 *, negative_strand_mask, strand_reindexing, rng=None
             ):
-                # Get raw predictions from custom forward function
-                # Haiku transforms require RNG as third argument: apply(params, state, rng, *args)
-                if rng is None:
-                    rng = jax.random.PRNGKey(0)  # Dummy RNG if not provided
-
-                    result = custom_forward_fn(params, state, rng, sequences, organism_indices)
+                # Haiku apply(params, state, rng, ...). Pass a PRNGKey for training (enables head
+                # dropout when configured). Pass None for val/test so heads that wrap dropout in
+                # try/except skip it without raising.
+                result = custom_forward_fn(params, state, rng, sequences, organism_indices)
 
                 # Custom forward function may return (predictions_dict, embeddings) tuple or just predictions
                 if isinstance(result, tuple):
@@ -1029,11 +1027,11 @@ class CustomAlphaGenomeModel:
             if hasattr(self, '_custom_forward_fn') and self._custom_forward_fn is not None:
                 # Directly call the custom forward function
                 # It may return either (predictions, embeddings) tuple or just predictions
-                rng_key = jax.random.PRNGKey(0)
+                # rng=None: deterministic forward (no head dropout) for attributions.
                 result = self._custom_forward_fn(
                     self._params,
                     self._state,
-                    rng_key,
+                    None,
                     seq,
                     organism_index,
                 )
@@ -1130,11 +1128,10 @@ class CustomAlphaGenomeModel:
         if return_predictions:
             # Use the same forward path as gradient computation
             if hasattr(self, '_custom_forward_fn') and self._custom_forward_fn is not None:
-                rng_key = jax.random.PRNGKey(0)
                 result = self._custom_forward_fn(
                     self._params,
                     self._state,
-                    rng_key,
+                    None,
                     sequence,
                     organism_index,
                 )
@@ -1299,11 +1296,10 @@ class CustomAlphaGenomeModel:
             def compute_output(seq):
                 """Compute model output for gradient computation."""
                 if hasattr(self, '_custom_forward_fn') and self._custom_forward_fn is not None:
-                    rng_key = jax.random.PRNGKey(0)
                     result = self._custom_forward_fn(
                         self._params,
                         self._state,
-                        rng_key,
+                        None,
                         seq,
                         organism_index[b:b+1],
                     )
@@ -1479,11 +1475,10 @@ class CustomAlphaGenomeModel:
         def get_head_output(seq):
             """Get head output without any reduction (for ISM computation)."""
             if hasattr(self, '_custom_forward_fn') and self._custom_forward_fn is not None:
-                rng_key = jax.random.PRNGKey(0)
                 result = self._custom_forward_fn(
                     self._params,
                     self._state,
-                    rng_key,
+                    None,
                     seq,
                     organism_index,
                 )
@@ -2301,7 +2296,7 @@ def create_model_with_heads(
     @jax.jit
     def custom_forward(params, state, rng, dna_sequence, organism_index):
         (predictions, _), _ = _forward_with_custom_heads.apply(
-            params, state, None, dna_sequence, organism_index
+            params, state, rng, dna_sequence, organism_index
         )
         return predictions
 
@@ -2516,7 +2511,7 @@ def add_heads_to_model(
     @jax.jit
     def custom_forward(params, state, rng, dna_sequence, organism_index):
         (predictions, _), _ = _forward_with_added_heads.apply(
-            params, state, None, dna_sequence, organism_index
+            params, state, rng, dna_sequence, organism_index
         )
         return predictions
 
@@ -3085,7 +3080,7 @@ def load_checkpoint(
             @jax.jit
             def custom_forward(params, state, rng, dna_sequence, organism_index):
                 (predictions, _), _ = _forward_with_custom_heads.apply(
-                    params, state, None, dna_sequence, organism_index
+                    params, state, rng, dna_sequence, organism_index
                 )
                 return predictions
 

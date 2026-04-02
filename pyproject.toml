@@ -1,6 +1,6 @@
 [project]
 name = "alphagenome-ft"
-version = "0.1.5"
+version = "0.1.6"
 description = "Finetuning utilities for AlphaGenome with custom heads and parameter freezing"
 readme = "README.md"
 requires-python = ">=3.11"
