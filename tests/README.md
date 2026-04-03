@@ -12,7 +12,9 @@ tests/
 ├── test_model_predictions.py        # Tests for model prediction consistency
 ├── test_encoder_only_mode.py        # Tests for encoder-only mode (short sequences)
 ├── test_parameter_management.py     # Tests for parameter freezing
+├── test_optimizer_masking.py      # Heads-only Optax masking (true backbone freeze)
 ├── test_checkpoint.py               # Tests for checkpoint save/load functionality
+├── kaggle_util.py                   # Detect Kaggle credentials for model download tests
 └── README.md                        # This file
 ```
 
@@ -24,6 +26,28 @@ tests/
 pip install -e ".[test]"
 # Or for development (includes all dev tools):
 pip install -e ".[dev]"
+```
+
+### Kaggle credentials (tests that download AlphaGenome)
+
+Fixtures such as `base_model` call `dna_model.create_from_kaggle`. The suite treats credentials as **available** if:
+
+1. **`KAGGLE_USERNAME` and `KAGGLE_KEY`** are exported in the environment, or  
+2. **`~/.kaggle/kaggle.json`** exists with `"username"` and `"key"` (typical Kaggle CLI setup).
+
+If neither is present, those tests are **skipped** (avoids interactive login hangs in CI).
+
+To export variables from `kaggle.json` in bash:
+
+```bash
+export KAGGLE_USERNAME="$(python3 -c "import json; print(json.load(open('$HOME/.kaggle/kaggle.json'))['username'])")"
+export KAGGLE_KEY="$(python3 -c "import json; print(json.load(open('$HOME/.kaggle/kaggle.json'))['key'])")"
+```
+
+Run a single test that does **not** need a model download:
+
+```bash
+pytest tests/test_optimizer_masking.py::test_heads_only_optimizer_fake_param_tree -q
 ```
 
 ### Run All Tests
@@ -98,7 +122,13 @@ Tests for parameter inspection and freezing:
 - Freezing and unfreezing functionality
 - Parameter value preservation
 
-### 5. Checkpoint Tests (`test_checkpoint.py`)
+### 5. Optimizer masking (`test_optimizer_masking.py`)
+
+- Heads-only `optax.multi_transform`: frozen leaves get zero updates even with non-zero gradients
+- `freeze_except_head` sets `_heads_only_finetune_default` / trainable-head hint on the model
+- User-facing pattern: [docs/heads_only_optimizer.md](../docs/heads_only_optimizer.md)
+
+### 6. Checkpoint Tests (`test_checkpoint.py`)
 
 Tests for checkpoint save and load functionality:
 - Saving heads-only checkpoints (efficient mode)

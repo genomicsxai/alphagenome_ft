@@ -255,8 +255,15 @@ class CustomAlphaGenomeModel:
             custom_heads_set = set(custom_heads_list or [])
 
             def wrapped_predict(
-                params, state, sequences, organism_indices,
-                *, negative_strand_mask, strand_reindexing, rng=None
+                params,
+                state,
+                sequences,
+                organism_indices,
+                *,
+                requested_outputs,
+                negative_strand_mask,
+                strand_reindexing,
+                rng=None,
             ):
                 # Haiku apply(params, state, rng, ...). Pass a PRNGKey for training (enables head
                 # dropout when configured). Pass None for val/test so heads that wrap dropout in
@@ -285,7 +292,9 @@ class CustomAlphaGenomeModel:
                 # (models with added heads only won't have standard predictions)
                 if standard_predictions:
                     # Process standard predictions through extract_predictions and reverse_complement
-                    extracted = extract_predictions(standard_predictions)
+                    extracted = extract_predictions(
+                        standard_predictions, requested_outputs
+                    )
                     reversed_preds = augmentation.reverse_complement(
                         extracted,
                         negative_strand_mask,
@@ -315,6 +324,10 @@ class CustomAlphaGenomeModel:
 
         # Store base model for delegation
         self._base_model = base_model
+
+        # Set by freeze_except_head; training loops may default heads_only optimizers from this.
+        self._heads_only_finetune_default = False
+        self._heads_only_trainable_head_names: tuple[str, ...] | None = None
 
     # ========================================================================
     # Parameter Freezing Methods
@@ -381,11 +394,48 @@ class CustomAlphaGenomeModel:
     def freeze_except_head(self, trainable_head: str) -> None:
         """Freeze everything except a specific head.
 
+        This updates parameter arrays with ``jax.lax.stop_gradient`` (see
+        :mod:`alphagenome_ft.parameter_utils`). That alone does **not** prevent backbone
+        updates under ``jax.grad`` / Optax; use :meth:`create_optimizer` with
+        ``heads_only=True`` (or :func:`alphagenome_ft.optimizer_utils.create_optimizer`)
+        during training so non-head weights receive zero updates.
+
+        Sets :attr:`_heads_only_finetune_default` so callers can choose a heads-only
+        optimizer by default without extra flags.
+
         Args:
             trainable_head: Name of the head to keep trainable.
         """
         self._params = parameter_utils.freeze_except_head(
             self._params, trainable_head=trainable_head
+        )
+        self._heads_only_finetune_default = True
+        self._heads_only_trainable_head_names = (str(trainable_head),)
+
+    def create_optimizer(
+        self,
+        *,
+        trainable_head_names: Sequence[str],
+        learning_rate: Any,
+        weight_decay: float | None = None,
+        heads_only: bool = False,
+        optimizer_type: str = "adamw",
+        gradient_clip_global_norm: float | None = None,
+    ):
+        """Create an Optax optimizer for :attr:`_params`.
+
+        See :func:`alphagenome_ft.optimizer_utils.create_optimizer`.
+        """
+        from alphagenome_ft import optimizer_utils
+
+        return optimizer_utils.create_optimizer(
+            self._params,
+            trainable_head_names=trainable_head_names,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            heads_only=heads_only,
+            optimizer_type=optimizer_type,
+            gradient_clip_global_norm=gradient_clip_global_norm,
         )
 
     # ========================================================================
@@ -415,6 +465,30 @@ class CustomAlphaGenomeModel:
             List of backbone parameter paths.
         """
         return parameter_utils.get_backbone_parameter_paths(self._params)
+
+    def get_trainable_parameter_paths(self) -> list[str]:
+        """Parameter paths considered trainable after :meth:`freeze_except_head`.
+
+        Uses :attr:`_heads_only_trainable_head_names` set by ``freeze_except_head``.
+        If that was not called, all paths are returned (path-level convention only;
+        use :func:`~alphagenome_ft.optimizer_utils.create_optimizer` for Optax masking).
+        """
+        all_paths = self.get_parameter_paths()
+        names = self._heads_only_trainable_head_names
+        if not names:
+            return all_paths
+
+        def _is_trainable_path(p: str) -> bool:
+            return any(
+                f"/head/{n}/" in p or p.startswith(f"head/{n}/") for n in names
+            )
+
+        return [p for p in all_paths if _is_trainable_path(p)]
+
+    def get_frozen_parameter_paths(self) -> list[str]:
+        """Paths not listed by :meth:`get_trainable_parameter_paths` after ``freeze_except_head``."""
+        trainable = set(self.get_trainable_parameter_paths())
+        return [p for p in self.get_parameter_paths() if p not in trainable]
 
     def count_parameters(self) -> int:
         """Count total number of parameters.
@@ -546,6 +620,166 @@ class CustomAlphaGenomeModel:
     # Checkpoint Save/Load Methods
     # ========================================================================
 
+    def _checkpoint_slice_trees(
+        self, save_full_model: bool, save_minimal_model: bool
+    ) -> tuple[PyTree, PyTree]:
+        """Select the same (params, state) subtrees that :meth:`save_checkpoint` writes to disk.
+
+        This is the former inline ``save_checkpoint`` extraction logic, kept in one place so
+        it cannot drift: full checkpoint; minimal (encoder + custom heads via
+        ``extract_matching`` plus explicit ``alphagenome/sequence_encoder`` and
+        ``alphagenome/head`` copies); heads-only (flat ``head/<name>/...``,
+        ``alphagenome/head``, or nested ``alphagenome`` → ``head``). Encoder-only heads with
+        different pooling (e.g. flatten vs sum) only change tensor shapes; paths still match
+        these rules.
+
+        The same PyTree structure is passed as Orbax ``restore(..., target=...)`` so arrays
+        load onto the current JAX devices instead of the device used at save time.
+        """
+        if save_full_model:
+            return self._params, self._state
+        if save_minimal_model:
+            params_to_save: dict = {}
+            state_to_save: dict = {}
+
+            def extract_matching(params_dict, condition_fn, result_dict, current_path=""):
+                if isinstance(params_dict, dict):
+                    for key, value in params_dict.items():
+                        key_str = str(key)
+                        full_path = f"{current_path}/{key_str}" if current_path else key_str
+
+                        if condition_fn(full_path, key_str):
+                            if current_path:
+                                parts = current_path.split("/")
+                                target = result_dict
+                                for part in parts:
+                                    if part and part not in target:
+                                        target[part] = {}
+                                    if part:
+                                        target = target[part]
+                                target[key] = value
+                            else:
+                                result_dict[key] = value
+                        elif isinstance(value, dict):
+                            extract_matching(value, condition_fn, result_dict, full_path)
+
+            def is_encoder_or_custom_head(path_str, key_str):
+                if (
+                    "sequence_encoder" in path_str
+                    and "transformer_tower" not in path_str
+                    and "sequence_decoder" not in path_str
+                ):
+                    return True
+                for head_name in self._custom_heads:
+                    if head_name in path_str or head_name in key_str:
+                        return True
+                return False
+
+            extract_matching(self._params, is_encoder_or_custom_head, params_to_save)
+            if self._state:
+                extract_matching(self._state, is_encoder_or_custom_head, state_to_save)
+
+            if "alphagenome" in self._params and isinstance(self._params["alphagenome"], dict):
+                if "sequence_encoder" in self._params["alphagenome"]:
+                    if "alphagenome" not in params_to_save:
+                        params_to_save["alphagenome"] = {}
+                    params_to_save["alphagenome"]["sequence_encoder"] = self._params[
+                        "alphagenome"
+                    ]["sequence_encoder"]
+
+                if "head" in self._params["alphagenome"]:
+                    for head_name in self._custom_heads:
+                        if head_name in self._params["alphagenome"]["head"]:
+                            if "alphagenome" not in params_to_save:
+                                params_to_save["alphagenome"] = {}
+                            if "head" not in params_to_save["alphagenome"]:
+                                params_to_save["alphagenome"]["head"] = {}
+                            params_to_save["alphagenome"]["head"][head_name] = self._params[
+                                "alphagenome"
+                            ]["head"][head_name]
+
+            if self._state and "alphagenome" in self._state and isinstance(
+                self._state["alphagenome"], dict
+            ):
+                if "sequence_encoder" in self._state["alphagenome"]:
+                    if "alphagenome" not in state_to_save:
+                        state_to_save["alphagenome"] = {}
+                    state_to_save["alphagenome"]["sequence_encoder"] = self._state[
+                        "alphagenome"
+                    ]["sequence_encoder"]
+
+                if "head" in self._state["alphagenome"]:
+                    for head_name in self._custom_heads:
+                        if head_name in self._state["alphagenome"]["head"]:
+                            if "alphagenome" not in state_to_save:
+                                state_to_save["alphagenome"] = {}
+                            if "head" not in state_to_save["alphagenome"]:
+                                state_to_save["alphagenome"]["head"] = {}
+                            state_to_save["alphagenome"]["head"][head_name] = self._state[
+                                "alphagenome"
+                            ]["head"][head_name]
+
+            return params_to_save, state_to_save
+
+        params_to_save = {}
+        state_to_save = {}
+
+        if isinstance(self._params, dict):
+            for key, value in self._params.items():
+                if isinstance(key, str):
+                    for head_name in self._custom_heads:
+                        if key.startswith(f"head/{head_name}/") or key == f"head/{head_name}":
+                            params_to_save[key] = value
+
+        if "alphagenome/head" in self._params:
+            for head_name in self._custom_heads:
+                if head_name in self._params["alphagenome/head"]:
+                    if "alphagenome/head" not in params_to_save:
+                        params_to_save["alphagenome/head"] = {}
+                    params_to_save["alphagenome/head"][head_name] = self._params[
+                        "alphagenome/head"
+                    ][head_name]
+
+        if "alphagenome" in self._params and "head" in self._params["alphagenome"]:
+            for head_name in self._custom_heads:
+                if head_name in self._params["alphagenome"]["head"]:
+                    if "alphagenome" not in params_to_save:
+                        params_to_save["alphagenome"] = {}
+                    if "head" not in params_to_save["alphagenome"]:
+                        params_to_save["alphagenome"]["head"] = {}
+                    params_to_save["alphagenome"]["head"][head_name] = self._params[
+                        "alphagenome"
+                    ]["head"][head_name]
+
+        if isinstance(self._state, dict):
+            for key, value in self._state.items():
+                if isinstance(key, str):
+                    for head_name in self._custom_heads:
+                        if key.startswith(f"head/{head_name}/") or key == f"head/{head_name}":
+                            state_to_save[key] = value
+
+        if "alphagenome/head" in self._state:
+            for head_name in self._custom_heads:
+                if head_name in self._state["alphagenome/head"]:
+                    if "alphagenome/head" not in state_to_save:
+                        state_to_save["alphagenome/head"] = {}
+                    state_to_save["alphagenome/head"][head_name] = self._state[
+                        "alphagenome/head"
+                    ][head_name]
+
+        if "alphagenome" in self._state and "head" in self._state["alphagenome"]:
+            for head_name in self._custom_heads:
+                if head_name in self._state["alphagenome"]["head"]:
+                    if "alphagenome" not in state_to_save:
+                        state_to_save["alphagenome"] = {}
+                    if "head" not in state_to_save["alphagenome"]:
+                        state_to_save["alphagenome"]["head"] = {}
+                    state_to_save["alphagenome"]["head"][head_name] = self._state[
+                        "alphagenome"
+                    ]["head"][head_name]
+
+        return params_to_save, state_to_save
+
     def save_checkpoint(
         self,
         checkpoint_dir: str | Path,
@@ -623,159 +857,11 @@ class CustomAlphaGenomeModel:
         with open(checkpoint_dir / 'config.json', 'w') as f:
             json.dump(metadata, f, indent=2)
 
-        # Determine what parameters to save
-        if save_full_model:
-            # Save all parameters
-            params_to_save = self._params
-            state_to_save = self._state
-        elif save_minimal_model:
-            # Save only encoder + custom head parameters (skip transformer/decoder)
-            params_to_save = {}
-            state_to_save = {}
-
-            # Helper function to recursively extract parameters matching a condition
-            def extract_matching(params_dict, condition_fn, result_dict, current_path=""):
-                """Recursively extract parameters matching a condition."""
-                if isinstance(params_dict, dict):
-                    for key, value in params_dict.items():
-                        key_str = str(key)
-                        full_path = f"{current_path}/{key_str}" if current_path else key_str
-
-                        if condition_fn(full_path, key_str):
-                            # This parameter matches - add it to result
-                            if current_path:
-                                # Need to reconstruct nested path
-                                parts = current_path.split('/')
-                                target = result_dict
-                                for part in parts:
-                                    if part and part not in target:
-                                        target[part] = {}
-                                    if part:
-                                        target = target[part]
-                                target[key] = value
-                            else:
-                                result_dict[key] = value
-                        elif isinstance(value, dict):
-                            # Recurse into nested dict
-                            new_path = full_path
-                            extract_matching(value, condition_fn, result_dict, new_path)
-
-            # Condition: keep encoder parameters (sequence_encoder) but not transformer/decoder
-            def is_encoder_or_custom_head(path_str, key_str):
-                # Check for encoder
-                if 'sequence_encoder' in path_str and 'transformer_tower' not in path_str and 'sequence_decoder' not in path_str:
-                    return True
-                # Check for custom heads
-                for head_name in self._custom_heads:
-                    if head_name in path_str or head_name in key_str:
-                        return True
-                return False
-
-            # Extract parameters
-            extract_matching(self._params, is_encoder_or_custom_head, params_to_save)
-            if self._state:
-                extract_matching(self._state, is_encoder_or_custom_head, state_to_save)
-
-            # Also handle the common nested structure explicitly
-            if 'alphagenome' in self._params and isinstance(self._params['alphagenome'], dict):
-                if 'sequence_encoder' in self._params['alphagenome']:
-                    if 'alphagenome' not in params_to_save:
-                        params_to_save['alphagenome'] = {}
-                    params_to_save['alphagenome']['sequence_encoder'] = \
-                        self._params['alphagenome']['sequence_encoder']
-
-                # Extract custom heads
-                if 'head' in self._params['alphagenome']:
-                    for head_name in self._custom_heads:
-                        if head_name in self._params['alphagenome']['head']:
-                            if 'alphagenome' not in params_to_save:
-                                params_to_save['alphagenome'] = {}
-                            if 'head' not in params_to_save['alphagenome']:
-                                params_to_save['alphagenome']['head'] = {}
-                            params_to_save['alphagenome']['head'][head_name] = \
-                                self._params['alphagenome']['head'][head_name]
-
-            # Same for state
-            if self._state and 'alphagenome' in self._state and isinstance(self._state['alphagenome'], dict):
-                if 'sequence_encoder' in self._state['alphagenome']:
-                    if 'alphagenome' not in state_to_save:
-                        state_to_save['alphagenome'] = {}
-                    state_to_save['alphagenome']['sequence_encoder'] = \
-                        self._state['alphagenome']['sequence_encoder']
-
-                if 'head' in self._state['alphagenome']:
-                    for head_name in self._custom_heads:
-                        if head_name in self._state['alphagenome']['head']:
-                            if 'alphagenome' not in state_to_save:
-                                state_to_save['alphagenome'] = {}
-                            if 'head' not in state_to_save['alphagenome']:
-                                state_to_save['alphagenome']['head'] = {}
-                            state_to_save['alphagenome']['head'][head_name] = \
-                                self._state['alphagenome']['head'][head_name]
-        else:
-            # Only save custom head parameters
-            params_to_save = {}
-            state_to_save = {}
-
-            # Extract head parameters - check all possible parameter structures
-            # Structure 1: Flat keys like 'head/mpra_head/...' (use_encoder_output=True mode)
-            # This happens when heads are created with hk.name_scope('head') outside alphagenome scope
-            if isinstance(self._params, dict):
-                for key, value in self._params.items():
-                    if isinstance(key, str):
-                        # Check if this key belongs to any of our heads
-                        for head_name in self._custom_heads:
-                            if key.startswith(f'head/{head_name}/') or key == f'head/{head_name}':
-                                params_to_save[key] = value
-
-            # Structure 2: alphagenome/head (encoder-only mode, nested)
-            if 'alphagenome/head' in self._params:
-                for head_name in self._custom_heads:
-                    if head_name in self._params['alphagenome/head']:
-                        if 'alphagenome/head' not in params_to_save:
-                            params_to_save['alphagenome/head'] = {}
-                        params_to_save['alphagenome/head'][head_name] = \
-                            self._params['alphagenome/head'][head_name]
-
-            # Structure 3: alphagenome -> head (standard mode, nested)
-            if 'alphagenome' in self._params and 'head' in self._params['alphagenome']:
-                for head_name in self._custom_heads:
-                    if head_name in self._params['alphagenome']['head']:
-                        if 'alphagenome' not in params_to_save:
-                            params_to_save['alphagenome'] = {}
-                        if 'head' not in params_to_save['alphagenome']:
-                            params_to_save['alphagenome']['head'] = {}
-                        params_to_save['alphagenome']['head'][head_name] = \
-                            self._params['alphagenome']['head'][head_name]
-
-            # Extract head state if it exists (check all structures)
-            # Structure 1: Flat keys
-            if isinstance(self._state, dict):
-                for key, value in self._state.items():
-                    if isinstance(key, str):
-                        for head_name in self._custom_heads:
-                            if key.startswith(f'head/{head_name}/') or key == f'head/{head_name}':
-                                state_to_save[key] = value
-
-            # Structure 2: alphagenome/head
-            if 'alphagenome/head' in self._state:
-                for head_name in self._custom_heads:
-                    if head_name in self._state['alphagenome/head']:
-                        if 'alphagenome/head' not in state_to_save:
-                            state_to_save['alphagenome/head'] = {}
-                        state_to_save['alphagenome/head'][head_name] = \
-                            self._state['alphagenome/head'][head_name]
-
-            # Structure 3: alphagenome -> head
-            if 'alphagenome' in self._state and 'head' in self._state['alphagenome']:
-                for head_name in self._custom_heads:
-                    if head_name in self._state['alphagenome']['head']:
-                        if 'alphagenome' not in state_to_save:
-                            state_to_save['alphagenome'] = {}
-                        if 'head' not in state_to_save['alphagenome']:
-                            state_to_save['alphagenome']['head'] = {}
-                        state_to_save['alphagenome']['head'][head_name] = \
-                            self._state['alphagenome']['head'][head_name]
+        # Subtree selection (encoder-only layouts, flat vs nested head keys): see
+        # :meth:`_checkpoint_slice_trees`.
+        params_to_save, state_to_save = self._checkpoint_slice_trees(
+            save_full_model, save_minimal_model
+        )
 
         # Save parameters using orbax
         # Remove existing checkpoint directory if it exists (to allow overwriting)
@@ -2643,14 +2729,10 @@ def load_checkpoint(
     save_minimal_model = config.get('save_minimal_model', False)
     use_encoder_output = config.get('use_encoder_output', False)
 
-    # If use_encoder_output is not in config (old checkpoint), try to infer it
-    # Encoder-only models have flat 'head/{head_name}/...' keys outside alphagenome scope
-    if not use_encoder_output:
-        # We'll check the parameter structure after loading to infer this
-        # For now, we'll set a flag to check later
-        _infer_use_encoder_output = True
-    else:
-        _infer_use_encoder_output = False
+    # Infer only for legacy checkpoints that omit ``use_encoder_output``. Current saves always
+    # write the flag explicitly; inferring when it is False would false-positive (e.g. nested
+    # head params can resemble "flat" layouts) and flip standard models to encoder-only mode.
+    _infer_use_encoder_output = 'use_encoder_output' not in config
 
     # Re-register custom heads from config
     from . import custom_heads as custom_heads_module
@@ -2717,132 +2799,40 @@ def load_checkpoint(
             # Predefined head - just verify it's registered
             print(f"  Head '{head_name}' already registered (predefined head)")
 
-    # Load checkpoint parameters
-    checkpointer = ocp.StandardCheckpointer()
-    checkpoint_path = checkpoint_dir / 'checkpoint'
-
+    # Restore checkpoint: pass a target PyTree on the *current* JAX devices so Orbax
+    # does not try to map arrays to the device used at save time (e.g. CPU vs GPU).
+    checkpoint_path = (checkpoint_dir / 'checkpoint').resolve()
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    loaded_params, loaded_state = checkpointer.restore(checkpoint_path)
+    init_for_template = init_seq_len if init_seq_len is not None else 2**14
+    template_use_encoder = bool(
+        use_encoder_output
+        or any("encoder" in str(n).lower() for n in custom_heads)
+    )
 
-
-    # Convert to absolute path (required by Orbax)
-    checkpoint_path = checkpoint_path.resolve()
-
-    # Restore checkpoint - Orbax may try to restore to the original device (e.g., GPU)
-    # We need to handle device mapping if the original device is not available
-    try:
-        restore_result = checkpointer.restore(checkpoint_path)
-        # Handle case where restore returns a tuple, list, or single value
-        if isinstance(restore_result, (tuple, list)) and len(restore_result) == 2:
-            loaded_params, loaded_state = restore_result
-        elif isinstance(restore_result, (tuple, list)) and len(restore_result) == 1:
-            # Some checkpoints might only have params
-            loaded_params = restore_result[0]
-            loaded_state = {}
-        else:
-            # Single value (just params)
-            loaded_params = restore_result
-            loaded_state = {}
-    except ValueError as e:
-        if "was not found in jax.local_devices()" in str(e):
-            # Device mismatch - checkpoint was saved on a different device
-            # Orbax stores device info and tries to restore to that device
-            # Solution: Use Orbax's restore_args to specify target device
-            print(f"  Warning: Checkpoint was saved on a different device. Restoring and moving to {device}...")
-
-            # Try using restore_args to specify target device
-            try:
-                from orbax.checkpoint import type_handlers
-                from orbax.checkpoint import args as ocp_args
-
-                # Create restore args that specify the target device
-                # This tells Orbax to restore arrays to the specified device
-                restore_args = ocp_args.CheckpointArgs(
-                    restore_type=ocp_args.RestoreType.RESTORE,
-                    # Use ArrayRestoreArgs to specify device
-                )
-
-                # Try restore with explicit device handling
-                # If restore_args doesn't work, we'll fall back to manual approach
-                restore_result = checkpointer.restore(
-                    checkpoint_path,
-                    restore_args=restore_args
-                )
-                if isinstance(restore_result, (tuple, list)) and len(restore_result) == 2:
-                    loaded_params, loaded_state = restore_result
-                elif isinstance(restore_result, (tuple, list)) and len(restore_result) == 1:
-                    loaded_params = restore_result[0]
-                    loaded_state = {}
-                else:
-                    loaded_params = restore_result
-                    loaded_state = {}
-            except (AttributeError, TypeError, ImportError):
-                # restore_args approach not available or doesn't work
-                # Fall back to: restore to any device, then move
-                available_devices = jax.local_devices()
-                restore_device = available_devices[0]
-
-                # Use a context manager to temporarily set default device
-                # This might help Orbax use the available device
-                try:
-                    # Try using context manager if available
-                    with jax.default_device(restore_device):
-                        restore_result = checkpointer.restore(checkpoint_path)
-                        if isinstance(restore_result, (tuple, list)) and len(restore_result) == 2:
-                            loaded_params, loaded_state = restore_result
-                        elif isinstance(restore_result, (tuple, list)) and len(restore_result) == 1:
-                            loaded_params = restore_result[0]
-                            loaded_state = {}
-                        else:
-                            loaded_params = restore_result
-                            loaded_state = {}
-                except (AttributeError, TypeError):
-                    # Context manager not available, try setting default device directly
-                    original_default = None
-                    try:
-                        if hasattr(jax, 'default_device'):
-                            original_default = jax.default_device()
-                            jax.default_device(restore_device)
-                        restore_result = checkpointer.restore(checkpoint_path)
-                        if isinstance(restore_result, (tuple, list)) and len(restore_result) == 2:
-                            loaded_params, loaded_state = restore_result
-                        elif isinstance(restore_result, (tuple, list)) and len(restore_result) == 1:
-                            loaded_params = restore_result[0]
-                            loaded_state = {}
-                        else:
-                            loaded_params = restore_result
-                            loaded_state = {}
-                    finally:
-                        if original_default is not None and hasattr(jax, 'default_device'):
-                            jax.default_device(original_default)
-                except ValueError as restore_error:
-                    # Still fails - Orbax is enforcing device metadata
-                    # Provide helpful error message
-                    raise ValueError(
-                        f"Could not restore checkpoint: device mismatch. "
-                        f"Checkpoint was saved on a device not available. "
-                        f"Available devices: {[str(d) for d in jax.local_devices()]}. "
-                        f"\n\nSolutions:"
-                        f"\n  1) Run on the original device (GPU if checkpoint was saved on GPU)"
-                        f"\n  2) Re-save the checkpoint on CPU: Load on original device and save with save_minimal_model=True"
-                        f"\n  3) Use the convert_to_minimal_model.py script to convert the checkpoint"
-                    ) from restore_error
-
-                # Move all arrays to target device
-                def move_to_device(x):
-                    if isinstance(x, (jnp.ndarray, jax.Array)):
-                        return jax.device_put(x, device)
-                    return x
-
-                loaded_params = jax.tree_util.tree_map(move_to_device, loaded_params)
-                if loaded_state:
-                    loaded_state = jax.tree_util.tree_map(move_to_device, loaded_state)
-
-            print(f"  ✓ Checkpoint restored and moved to {device}")
-        else:
-            raise
+    template_model = create_model_with_heads(
+        base_model_version,
+        heads=custom_heads,
+        organism_settings=organism_settings,
+        device=device,
+        checkpoint_path=base_checkpoint_path,
+        use_encoder_output=template_use_encoder,
+        init_seq_len=init_for_template,
+    )
+    restore_target = template_model._checkpoint_slice_trees(
+        save_full_model, save_minimal_model
+    )
+    checkpointer = ocp.StandardCheckpointer()
+    restore_result = checkpointer.restore(str(checkpoint_path), target=restore_target)
+    if isinstance(restore_result, (tuple, list)) and len(restore_result) == 2:
+        loaded_params, loaded_state = restore_result
+    elif isinstance(restore_result, (tuple, list)) and len(restore_result) == 1:
+        loaded_params = restore_result[0]
+        loaded_state = {}
+    else:
+        loaded_params = restore_result
+        loaded_state = {}
 
     # Infer use_encoder_output from parameter structure if not in config
     if _infer_use_encoder_output:
@@ -3292,22 +3282,10 @@ def load_checkpoint(
             print("✓ Minimal model loaded (encoder + custom heads, transformer/decoder from base model)")
 
     else:
-        # Heads-only checkpoint - need to merge with base model
+        # Heads-only checkpoint — reuse the template model built for Orbax restore
+        # (same architecture as at save time, already on the target device).
         print(f"Loading base model '{base_model_version}'...")
-
-        # Determine if we need encoder output
-        # Check if any head name suggests encoder-only mode (simple heuristic)
-        use_encoder_output = any('encoder' in name.lower() for name in custom_heads)
-
-        # Create model with requested heads
-        custom_model = create_model_with_heads(
-            base_model_version,
-            heads=custom_heads,
-            organism_settings=organism_settings,
-            device=device,
-            checkpoint_path=base_checkpoint_path,
-            use_encoder_output=use_encoder_output,
-        )
+        custom_model = template_model
 
         # Merge loaded head parameters into model
         def merge_head_params(model_params: PyTree, loaded_head_params: PyTree) -> PyTree:

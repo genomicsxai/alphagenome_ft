@@ -68,6 +68,8 @@ model = create_model_with_heads(
 model.freeze_except_head("mpra_head")
 ```
 
+**Optimizer:** For any custom loop, use `create_optimizer(..., heads_only=True)` so encoder/backbone weights are not updated. See [heads_only_optimizer.md](heads_only_optimizer.md).
+
 ### 4. Training Loop (Short Sequences)
 
 For MPRA-like data, you will typically have **short sequences and scalar or low-dimensional outputs** (e.g. log expression).
@@ -83,13 +85,20 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from alphagenome_ft import CustomHead
+from alphagenome_ft import create_optimizer
 
 # Suppose you have: sequences_onehot: (B, L, 4), targets: (B, 1)
 
 loss_fn = model.create_loss_fn_for_head("mpra_head")
 
-optimizer = optax.adamw(learning_rate=1e-3, weight_decay=1e-4)
+# Heads-only optimizer: backbone/encoder get zero Optax updates (not just stop_gradient)
+optimizer = create_optimizer(
+    model._params,
+    trainable_head_names=("mpra_head",),
+    learning_rate=1e-3,
+    weight_decay=1e-4,
+    heads_only=True,
+)
 opt_state = optimizer.init(model._params)
 
 def train_step(params, state, opt_state, batch_sequences, batch_targets):

@@ -128,6 +128,10 @@ model.plot_sequence_logo(
 )
 ```
 
+## Training note (before you get here)
+
+If you trained the model with a **custom** loop and a frozen backbone, use `alphagenome_ft.create_optimizer(..., heads_only=True)` (or `finetune.train(..., heads_only=True)`) so backbone weights do not drift. See [heads_only_optimizer.md](heads_only_optimizer.md). Attribution APIs assume you already have a trained checkpoint.
+
 ## Attribution Methods Comparison
 
 | Method | Use Case | Notes |

@@ -126,10 +126,11 @@ from alphagenome_ft import parameter_utils
 model._params = parameter_utils.freeze_except_lora(model._params)
 ```
 
-This applies `jax.lax.stop_gradient` to all parameters except those whose leaf name is `lora_a` or `lora_b`. The LoRA matrices remain trainable; the backbone (and any non‑LoRA head weights) are frozen.
+This applies `jax.lax.stop_gradient` to all parameters except those whose leaf name is `lora_a` or `lora_b`. The LoRA matrices remain trainable; the backbone (and any non‑LoRA head weights) are frozen. **Training-time** freezing of the backbone still requires **optimizer masking** for custom loops; `stop_gradient` alone is not enough (see [heads_only_optimizer.md](heads_only_optimizer.md)).
 
 - **Train with `heads_only=True`**  
-  When calling `alphagenome_ft.finetune.train.train`, pass `heads_only=True`. This ensures the optimizer does not allocate state for frozen backbone parameters, and the existing freeze is respected:
+  When calling `alphagenome_ft.finetune.train.train`, pass `heads_only=True`. The trainer uses `create_optimizer` with masking so non‑head parameters receive **zero updates** (no SGD / no weight decay on the backbone):
+
 
 ```python
 train(
@@ -153,6 +154,24 @@ train(
 ```
 
 In the ATAC demo notebook this is combined with `BigWigDataModule` and fold‑based genomic intervals, but the same pattern works for other targets and loaders.
+
+**Custom Optax loop** (replace `HEAD_NAME` with your registered head id; LoRA tensors live under that head’s path):
+
+```python
+import optax
+from alphagenome_ft import create_optimizer
+
+optimizer = create_optimizer(
+    model._params,
+    trainable_head_names=(HEAD_NAME,),
+    learning_rate=LEARNING_RATE,
+    weight_decay=WEIGHT_DECAY,
+    heads_only=True,
+)
+opt_state = optimizer.init(model._params)
+# updates, opt_state = optimizer.update(grads, opt_state, model._params)
+# model._params = optax.apply_updates(model._params, updates)
+```
 
 ### 6. LoRA and Sequence Length (up to 1 Mbp)
 

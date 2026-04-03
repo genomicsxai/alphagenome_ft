@@ -2,6 +2,8 @@
 
 This tutorial shows how to finetune **only a new prediction head** on top of a **frozen AlphaGenome backbone**, using `alphagenome-ft`.
 
+**Custom training loops:** use `create_optimizer(..., heads_only=True)` as in [heads_only_optimizer.md](heads_only_optimizer.md). The built-in `train(..., heads_only=True)` does this internally.
+
 This is the most common and compute-efficient setup:
 - **Backbone** (encoder, transformer, decoder): frozen
 - **New head**: trainable
@@ -122,11 +124,11 @@ model = create_model_with_heads(
     heads=head_ids,
 )
 
-model.freeze_backbone()
+model.freeze_backbone()  # optional: applies stop_gradient to backbone *values* only
 ```
 
 - Internally this uses the same AlphaGenome backbone, but keeps only your custom/predefined heads.
-- `freeze_backbone` is optional since `train` runs it internally.
+- **Training-time freezing** is enforced by the optimizer: `alphagenome_ft.finetune.train` uses `alphagenome_ft.optimizer_utils.create_optimizer` with `heads_only=True`, which applies `optax.multi_transform` so only `head/<head_id>/...` parameters receive updates (backbone weights stay fixed, including under weight decay). Calling `freeze_backbone()` is optional and does not replace that masking.
 - To freeze specific heads, use `model.freeze_all_heads(except_heads=head_ids)`
 
 ### 6. Run Heads-Only Training
@@ -156,8 +158,32 @@ train(
 )
 ```
 
+### Custom Optax loop (same masking as `heads_only=True`)
+
+If you train outside `finetune.train`, build the optimizer explicitly. See also [heads_only_optimizer.md](heads_only_optimizer.md).
+
+```python
+import optax
+from alphagenome_ft import create_optimizer
+
+head_ids_tuple = tuple(spec.head_id for spec in head_specs)
+
+optimizer = create_optimizer(
+    model._params,
+    trainable_head_names=head_ids_tuple,
+    learning_rate=1e-3,
+    weight_decay=1e-4,
+    heads_only=True,
+)
+opt_state = optimizer.init(model._params)
+
+# Each step after jax.grad(loss)(params):
+# updates, opt_state = optimizer.update(grads, opt_state, model._params)
+# model._params = optax.apply_updates(model._params, updates)
+```
+
 What this does:
-- Freezes all backbone parameters.
+- **Optimizer masking** freezes all non-head parameters (zero updates on backbone and on any heads you are not training).
 - Optimizes only parameters under `head/<head_id>/...`.
 - Streams windows from your BED file and BigWig tracks.
 - Saves checkpoints with **head-only** parameters by default (small files).

@@ -1,7 +1,6 @@
 """
 Pytest configuration and fixtures for alphagenome_ft tests.
 """
-import os
 
 import pytest
 import jax
@@ -20,6 +19,8 @@ from alphagenome_ft import (
     add_heads_to_model,
     create_model_with_heads,
 )
+
+from tests.kaggle_util import kaggle_credentials_available
 
 
 # ============================================================================
@@ -68,10 +69,8 @@ class MPRAHeadForTesting(CustomHead):
 
 
 def _has_kaggle_credentials() -> bool:
-    """Return True if Kaggle API credentials are configured in the environment."""
-    return bool(
-        os.environ.get("KAGGLE_USERNAME") and os.environ.get("KAGGLE_KEY")
-    )
+    """Return True if Kaggle credentials are in the environment or ``~/.kaggle/kaggle.json``."""
+    return kaggle_credentials_available()
 
 
 def require_kaggle_credentials() -> None:
@@ -80,11 +79,12 @@ def require_kaggle_credentials() -> None:
     Many tests rely on ``dna_model.create_from_kaggle``, which triggers an
     interactive kagglehub login when credentials are missing. In CI / non‑TTY
     environments this causes hangs and getpass errors, so we proactively
-    skip such tests unless the necessary environment variables are set.
+    skip such tests unless credentials exist (see ``tests/kaggle_util.py``).
     """
     if not _has_kaggle_credentials():
         pytest.skip(
-            "Kaggle credentials not configured (KAGGLE_USERNAME/KAGGLE_KEY). "
+            "Kaggle credentials not found. Set KAGGLE_USERNAME and KAGGLE_KEY, "
+            "or place username/key in ~/.kaggle/kaggle.json. "
             "Skipping tests that require downloading the AlphaGenome model."
         )
 
@@ -130,8 +130,16 @@ def organism_index():
 
 @pytest.fixture(scope="session")
 def strand_reindexing(base_model):
-    """Strand reindexing for predictions."""
-    return base_model._metadata[dna_model.Organism.HOMO_SAPIENS].strand_reindexing
+    """Strand reindexing for predictions (device-placed mapping per OutputType)."""
+    dev = base_model._device_context._device
+    sr = base_model._metadata[dna_model.Organism.HOMO_SAPIENS].strand_reindexing
+    return jax.device_put(sr, dev)
+
+
+@pytest.fixture(scope="session")
+def all_standard_requested_outputs():
+    """All :class:`~alphagenome.models.dna_output.OutputType` values for ``_predict``."""
+    return tuple(dna_output.OutputType)
 
 
 @pytest.fixture(scope="function")

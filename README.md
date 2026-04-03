@@ -27,6 +27,7 @@ A lightweight Python package for finetuning [Google DeepMind's AlphaGenome](http
   - [Add head / custom head from scratch](#add-head-to-existing-model-keep-standard-heads)
   - [API Reference](#api-reference)
   - [Saving and loading checkpoints](#saving-and-loading-checkpoints)
+  - [Heads-only optimizer (custom training loops)](docs/heads_only_optimizer.md)
   - [Attribution analysis (full detail)](#attribution-analysis)
 - **Other**
   - [Testing](#testing)
@@ -37,7 +38,7 @@ A lightweight Python package for finetuning [Google DeepMind's AlphaGenome](http
 ## Features
 
 - **Custom Prediction Heads**: Define and register your own task-specific prediction heads
-- **Parameter Freezing**: Flexible parameter management (freeze backbone, heads, or specific layers)
+- **Parameter Freezing**: Path-based freeze helpers plus **optimizer masking** (`create_optimizer`, `heads_only=True`) for real backbone freezes during training
 - **Easy Integration**: Works seamlessly with pretrained AlphaGenome models (simple wrapper classes)
 - **Parameter Inspection**: Utilities to explore and count model parameters
 - **Attribution Analysis**: Utilities to calculate attributions based on gradients or _in silico_ mutagenesis (ISM)
@@ -107,7 +108,23 @@ register_predefined_head("K562_rna_seq", rna_config)
 # 3. Create a model that uses the registered instance
 model = create_model_with_heads("all_folds", heads=["K562_rna_seq"])
 model.freeze_except_head("K562_rna_seq")
+
+# 4. Optimizer for a *custom* training loop (frozen backbone in Optax, not only stop_gradient)
+import optax
+from alphagenome_ft import create_optimizer
+optimizer = create_optimizer(
+    model._params,
+    trainable_head_names=("K562_rna_seq",),
+    learning_rate=1e-3,
+    weight_decay=1e-4,
+    heads_only=True, #NOTE: Adding this is key to avoiding base weight updates
+)
+opt_state = optimizer.init(model._params)
+# Then: updates, opt_state = optimizer.update(grads, opt_state, model._params)
+#       model._params = optax.apply_updates(model._params, updates)
 ```
+
+The built-in BigWig trainer (`alphagenome_ft.finetune.train`, `heads_only=True`) builds this optimizer for you. **Pattern reference:** [Heads-only optimizer](docs/heads_only_optimizer.md). `freeze_except_head` alone does **not** block backbone updates under `jax.grad`; `heads_only=True` in `create_optimizer` does.
 
 Note if you have a local AlphaGenome weights version you want to use instead of getting the weights from Kaggle use:
 
@@ -151,8 +168,19 @@ model = create_model_with_heads(
     heads=['my_head'],
 )
 
-# 3. Freeze backbone for finetuning
+# 3. Freeze backbone for finetuning (optional hint on the model)
 model.freeze_except_head('my_head')
+
+# 4. Custom loop: heads-only optimizer (see docs/heads_only_optimizer.md)
+from alphagenome_ft import create_optimizer
+optimizer = create_optimizer(
+    model._params,
+    trainable_head_names=('my_head',),
+    learning_rate=1e-3,
+    weight_decay=1e-4,
+    heads_only=True,
+)
+opt_state = optimizer.init(model._params)
 ```
 
 **Available Templates:**
@@ -234,8 +262,17 @@ model = add_heads_to_model(base_model, heads=['my_head'])
 # 4. Freeze backbone + standard heads, train only custom head
 model.freeze_except_head('my_head')
 
-# 5. Create loss function for training (see "Training with Custom Heads" section)
+# 5. Loss + heads-only optimizer for custom training (finetune.train sets this if heads_only=True)
 loss_fn = model.create_loss_fn_for_head('my_head')
+from alphagenome_ft import create_optimizer
+optimizer = create_optimizer(
+    model._params,
+    trainable_head_names=('my_head',),
+    learning_rate=1e-3,
+    weight_decay=1e-4,
+    heads_only=True,
+)
+opt_state = optimizer.init(model._params)
 ```
 
 **When to use each approach:**
@@ -250,7 +287,7 @@ loss_fn = model.create_loss_fn_for_head('my_head')
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/finetune_encoder_only_mpra.ipynb)
 
 **When to use:** Short sequences (&lt; ~1 kb): MPRA, promoters, enhancers. Uses encoder (CNN) only.
-**Tutorial:** [Encoder-only finetuning](docs/encoder_only_perturbation.md). Use `templates.EncoderOnlyHead` and **`use_encoder_output=True`** in `create_model_with_heads(...)`. See the application repo [AlpahGenome MPRA repo](https://github.com/genomicsxai/alphagenome_FT_MPRA) for more details.
+**Tutorial:** [Encoder-only finetuning](docs/encoder_only_perturbation.md). Use `templates.EncoderOnlyHead` and **`use_encoder_output=True`** in `create_model_with_heads(...)`. Custom loops must use [`create_optimizer(..., heads_only=True)`](docs/heads_only_optimizer.md), not a plain `optax.adamw` on the full tree. See the application repo [AlpahGenome MPRA repo](https://github.com/genomicsxai/alphagenome_FT_MPRA) for more details.
 
 ---
 
@@ -259,7 +296,7 @@ loss_fn = model.create_loss_fn_for_head('my_head')
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/finetune_rna_head_only.ipynb)
 
 **When to use:** New task (ChIP-seq, gene expression, etc.) on standard-length sequences; train only a new head, backbone frozen.
-**Tutorial:** [Frozen backbone, new head](docs/finetune_head_only.md).
+**Tutorial:** [Frozen backbone, new head](docs/finetune_head_only.md). Built-in `train(..., heads_only=True)` applies optimizer masking; custom loops: [heads_only_optimizer.md](docs/heads_only_optimizer.md).
 
 ---
 
@@ -267,14 +304,14 @@ loss_fn = model.create_loss_fn_for_head('my_head')
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/finetune_rna_lora.ipynb)
 
-**When to use:** Low-rank adapters on the backbone. **Tutorial:** [LoRA-style adapters](docs/lora_adapters.md).
+**When to use:** Low-rank adapters on the backbone. **Tutorial:** [LoRA-style adapters](docs/lora_adapters.md). For custom Optax loops, use `create_optimizer(..., heads_only=True)` with your LoRA head name so only head (including LoRA) weights update.
 
 ---
 
 ### Workflow 4: Full-model finetuning
 
 **When to use:** Adapt the backbone (e.g. after heads-only or for a different distribution).
-**Tutorial:** [Full-model finetuning (unfreezing the backbone)](docs/finetune_full_model.md). Unfreeze via `unfreeze_parameters(unfreeze_prefixes=[...])` or `freeze_backbone(freeze_prefixes=[...])`; save with `save_checkpoint(..., save_full_model=True)`.
+**Tutorial:** [Full-model finetuning (unfreezing the backbone)](docs/finetune_full_model.md). Start heads-only with `train(..., heads_only=True)` or [`create_optimizer(..., heads_only=True)`](docs/heads_only_optimizer.md); then unfreeze via `unfreeze_parameters(unfreeze_prefixes=[...])` or `freeze_backbone(freeze_prefixes=[...])`; save with `save_checkpoint(..., save_full_model=True)`.
 
 ---
 
@@ -353,7 +390,19 @@ model.freeze_backbone(freeze_prefixes=['transformer_tower'])  # Freeze only tran
 model.freeze_backbone(freeze_prefixes=['sequence_decoder'])  # Freeze only decoder
 model.freeze_backbone(freeze_prefixes=['sequence_encoder', 'transformer_tower'])  # Freeze encoder + transformer
 model.freeze_all_heads(except_heads=['my_head'])  # Freeze all heads except one
-model.freeze_except_head('my_head')        # Freeze everything except one head
+model.freeze_except_head('my_head')        # Freeze everything except one head (sets hint for heads-only optimizers)
+
+# Optimizer masking (true freeze during training — required for custom loops)
+# Full pattern: docs/heads_only_optimizer.md
+from alphagenome_ft import create_optimizer
+opt = create_optimizer(
+    model._params,
+    trainable_head_names=('my_head',),
+    learning_rate=1e-3,
+    weight_decay=1e-4,
+    heads_only=True,
+)
+opt_state = opt.init(model._params)
 
 # Inspection
 paths = model.get_parameter_paths()        # All parameter paths
@@ -425,6 +474,19 @@ model = load_checkpoint('checkpoints/my_model')
 ## Testing
 
 The package includes a comprehensive test suite using pytest.
+
+### Kaggle credentials (model download)
+
+Several tests load AlphaGenome via `create_from_kaggle`. Credentials are detected if **either**:
+
+- `KAGGLE_USERNAME` and `KAGGLE_KEY` are set in the environment, or  
+- `~/.kaggle/kaggle.json` exists and contains `"username"` and `"key"` (the default location when you use the Kaggle CLI/API).
+
+No extra export step is required if `kaggle.json` is already in place. To run only tests that do not download the model:
+
+```bash
+pytest tests/test_optimizer_masking.py::test_heads_only_optimizer_fake_param_tree -q
+```
 
 ### Run Tests
 

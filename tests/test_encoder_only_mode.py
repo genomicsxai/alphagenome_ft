@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import pytest
 import haiku as hk
 from alphagenome.models import dna_output
+from alphagenome_research.model import dna_model
 
 from alphagenome_ft import (
     CustomHead,
@@ -102,13 +103,16 @@ class TestEncoderOnlyMode:
             f"Model should have encoder parameters, got {param_count:,}"
         )
     
-    def test_short_sequence_inference(self, encoder_only_model):
+    def test_short_sequence_inference(self, encoder_only_model, all_standard_requested_outputs):
         """Verify short sequences can be processed (this would fail without encoder-only mode)."""
         # Create a SHORT sequence (300 bp) that would fail in transformer
         short_seq = jnp.zeros((1, 300, 4), dtype=jnp.float32)
         short_seq = short_seq.at[:, :, 0].set(1.0)  # All A's
         
         organism_index = jnp.array([0])
+        dev = encoder_only_model._device_context._device
+        meta = encoder_only_model._metadata[dna_model.Organism.HOMO_SAPIENS]
+        strand_reindexing = jax.device_put(meta.strand_reindexing, dev)
         
         # This should work with encoder-only mode
         with encoder_only_model._device_context:
@@ -117,11 +121,9 @@ class TestEncoderOnlyMode:
                 encoder_only_model._state,
                 short_seq,
                 organism_index,
+                requested_outputs=all_standard_requested_outputs,
                 negative_strand_mask=jnp.array([False]),
-                strand_reindexing=jax.device_put(
-                    encoder_only_model._metadata[encoder_only_model._organism_enum.HOMO_SAPIENS].strand_reindexing,
-                    encoder_only_model._device_context._device
-                ),
+                strand_reindexing=strand_reindexing,
             )
         
         # Check prediction exists
@@ -138,11 +140,16 @@ class TestEncoderOnlyMode:
             f"Expected ~2-3 bins for 300bp sequence, got {pred_array.shape[1]}"
         )
     
-    def test_encoder_embeddings_only(self, encoder_only_model, test_sequence, organism_index):
+    def test_encoder_embeddings_only(
+        self, encoder_only_model, test_sequence, organism_index, all_standard_requested_outputs
+    ):
         """Verify only encoder_output is populated, not transformer/decoder embeddings."""
         # Run prediction and capture embeddings
         # Note: We can't directly access embeddings from _predict, so we test indirectly
         # by verifying the head works (which requires encoder_output)
+        dev = encoder_only_model._device_context._device
+        meta = encoder_only_model._metadata[dna_model.Organism.HOMO_SAPIENS]
+        strand_reindexing = jax.device_put(meta.strand_reindexing, dev)
         
         with encoder_only_model._device_context:
             predictions = encoder_only_model._predict(
@@ -150,11 +157,9 @@ class TestEncoderOnlyMode:
                 encoder_only_model._state,
                 test_sequence,
                 organism_index,
+                requested_outputs=all_standard_requested_outputs,
                 negative_strand_mask=jnp.array([False]),
-                strand_reindexing=jax.device_put(
-                    encoder_only_model._metadata[encoder_only_model._organism_enum.HOMO_SAPIENS].strand_reindexing,
-                    encoder_only_model._device_context._device
-                ),
+                strand_reindexing=strand_reindexing,
             )
         
         # If encoder_output wasn't available, the head would have raised an error

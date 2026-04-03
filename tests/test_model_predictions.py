@@ -25,6 +25,7 @@ class TestPredictionConsistency:
         organism_index,
         test_interval,
         strand_reindexing,
+        all_standard_requested_outputs,
     ):
         """Verify wrapped model produces identical predictions for standard heads."""
         
@@ -35,11 +36,9 @@ class TestPredictionConsistency:
                 base_model._state,
                 test_sequence,
                 organism_index,
+                requested_outputs=all_standard_requested_outputs,
                 negative_strand_mask=jnp.array([test_interval.negative_strand]),
-                strand_reindexing=jax.device_put(
-                    strand_reindexing,
-                    base_model._device_context._device
-                ),
+                strand_reindexing=strand_reindexing,
             )
         
         # Get predictions from wrapped model
@@ -49,11 +48,9 @@ class TestPredictionConsistency:
                 wrapped_model_with_head._state,
                 test_sequence,
                 organism_index,
+                requested_outputs=all_standard_requested_outputs,
                 negative_strand_mask=jnp.array([test_interval.negative_strand]),
-                strand_reindexing=jax.device_put(
-                    strand_reindexing,
-                    wrapped_model_with_head._device_context._device
-                ),
+                strand_reindexing=strand_reindexing,
             )
         
         # Verify all standard output types match
@@ -126,6 +123,7 @@ class TestPredictionConsistency:
         organism_index,
         test_interval,
         strand_reindexing,
+        all_standard_requested_outputs,
     ):
         """Verify custom head produces output."""
         
@@ -135,11 +133,9 @@ class TestPredictionConsistency:
                 wrapped_model_with_head._state,
                 test_sequence,
                 organism_index,
+                requested_outputs=all_standard_requested_outputs,
                 negative_strand_mask=jnp.array([test_interval.negative_strand]),
-                strand_reindexing=jax.device_put(
-                    strand_reindexing,
-                    wrapped_model_with_head._device_context._device
-                ),
+                strand_reindexing=strand_reindexing,
             )
         
         # Check custom head output exists

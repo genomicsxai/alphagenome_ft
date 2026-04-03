@@ -34,7 +34,7 @@ In JAX/Haiku, parameters are organized in a PyTree (nested dictionary structure)
 
 Core Functions:
 1. `_keypath_to_str(path_tuple)` - Converts JAX keypath tuples to readable strings.
-2. `freeze_parameters(params, freeze_paths, freeze_prefixes)` - Freeze specific parameters by applying `jax.lax.stop_gradient`.
+2. `freeze_parameters(params, freeze_paths, freeze_prefixes)` - Freeze specific parameters by applying `jax.lax.stop_gradient` **at call time only**; it does not block later `jax.grad` / Optax updates. For true freezing during training, use `alphagenome_ft.optimizer_utils.create_optimizer` with `heads_only=True`.
 3. `unfreeze_parameters(params, unfreeze_paths, unfreeze_prefixes)` - Remove stop_gradient from parameters (make them trainable again).
 4. `freeze_backbone(params, freeze_prefixes)` - Freeze backbone components modularly (encoder, transformer, decoder).
 5. `freeze_all_heads(params, except_heads)` - Freeze all heads except specified ones.
@@ -79,7 +79,11 @@ def freeze_parameters(
     freeze_paths: Sequence[str] | None = None,
     freeze_prefixes: Sequence[str] | None = None,
 ) -> PyTree:
-    """Freeze specific parameters by applying stop_gradient.
+    """Freeze specific parameters by applying stop_gradient at call time.
+
+    This does **not** prevent Optax from updating the same arrays in a later training
+    step; use :func:`alphagenome_ft.optimizer_utils.create_optimizer` with masking when
+    you need a frozen backbone during optimization.
     
     Args:
         params: Parameter tree to freeze.

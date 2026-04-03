@@ -69,6 +69,25 @@ model._params = parameter_utils.freeze_backbone(model._params)
 # Train with heads_only=True first (see Section 6).
 ```
 
+For a **custom** training loop during this heads-only phase, use the same masking as the built-in trainer:
+
+```python
+import optax
+from alphagenome_ft import create_optimizer
+
+head_ids_tuple = tuple(spec.head_id for spec in head_specs)
+optimizer = create_optimizer(
+    model._params,
+    trainable_head_names=head_ids_tuple,
+    learning_rate=1e-3,
+    weight_decay=1e-4,
+    heads_only=True,
+)
+opt_state = optimizer.init(model._params)
+```
+
+See [heads_only_optimizer.md](heads_only_optimizer.md).
+
 Later, you can **unfreeze** more components:
 
 ```python
@@ -103,7 +122,7 @@ model._params = parameter_utils.freeze_backbone(
 
 ### 5. Optimizer Setup for Full Finetuning
 
-When you want to update backbone parameters, call `train` with `heads_only=False`. This uses a single AdamW optimizer over all parameters:
+When you want to update **all** parameters (including backbone), call `train` with `heads_only=False`. That uses a single AdamW optimizer over the full tree—**do not** use `heads_only=True` in this phase. For a **custom** full-model loop, use a standard optimizer (e.g. `optax.adamw`) on `model._params` without `create_optimizer(..., heads_only=True)`.
 
 ```python
 from alphagenome_ft.finetune import train

@@ -12,10 +12,10 @@ import optax
 from alphagenome.models import dna_model as ag_dna_model
 from alphagenome_research.model import dna_model as research_dna_model
 
-from alphagenome_ft import parameter_utils
 from alphagenome_ft.custom_model import CustomAlphaGenomeModel
 from alphagenome_ft.finetune.config import HeadSpec
 from alphagenome_ft.finetune.data import BigWigDataModule, prepare_batch
+from alphagenome_ft.optimizer_utils import create_optimizer
 
 
 def register_predefined_heads(head_specs: Sequence[HeadSpec]) -> None:
@@ -34,70 +34,6 @@ def register_predefined_heads(head_specs: Sequence[HeadSpec]) -> None:
             spec.config,
             metadata=spec.metadata,
         )
-
-
-def _keypath_to_str(path_tuple: tuple) -> str:
-    """Convert a JAX parameter key-path tuple to a slash-delimited string."""
-    parts = []
-    for key in path_tuple:
-        if isinstance(key, parameter_utils.DictKey):
-            parts.append(str(key.key))
-        elif isinstance(key, parameter_utils.GetAttrKey):
-            parts.append(str(key.name))
-        elif isinstance(key, parameter_utils.SequenceKey):
-            parts.append(str(key.idx))
-        else:
-            parts.append(str(key))
-    return "/".join(parts)
-
-
-def _is_trainable_head_path(path_str: str, trainable_heads: set[str]) -> bool:
-    """Return True if a parameter path belongs to any requested trainable head."""
-    for head_name in trainable_heads:
-        if f"/head/{head_name}/" in path_str or path_str.startswith(f"head/{head_name}/"):
-            return True
-    return False
-
-
-def _label_params_for_heads(params, trainable_heads: Sequence[str]):
-    """Label model parameters as trainable head params vs frozen params."""
-    head_set = {str(name) for name in trainable_heads}
-
-    def label_fn(path, _value):
-        path_str = _keypath_to_str(path)
-        return "head" if _is_trainable_head_path(path_str, head_set) else "frozen"
-
-    return jax.tree_util.tree_map_with_path(label_fn, params)
-
-
-def create_optimizer(
-    params,
-    trainable_head_names: Sequence[str],
-    learning_rate: float,
-    weight_decay: float,
-    heads_only: bool,
-):
-    """Create optimizer for full finetuning or heads-only finetuning."""
-    if heads_only:
-        head_set = {str(name) for name in trainable_head_names}
-        head_paths = parameter_utils.get_head_parameter_paths(params)
-        matched_paths = [path for path in head_paths if _is_trainable_head_path(path, head_set)]
-        if not matched_paths:
-            sample_paths = ", ".join(head_paths[:5]) if head_paths else "<none>"
-            raise ValueError(
-                "No trainable head parameters matched --heads-only filter. "
-                f"Names tried: {sorted(head_set)}. "
-                f"Head parameter sample: {sample_paths}"
-            )
-        param_labels = _label_params_for_heads(params, trainable_head_names)
-        return optax.multi_transform(
-            {
-                "head": optax.adamw(learning_rate, weight_decay=weight_decay),
-                "frozen": optax.set_to_zero(),
-            },
-            param_labels,
-        )
-    return optax.adamw(learning_rate, weight_decay=weight_decay)
 
 
 def train(
@@ -205,15 +141,13 @@ def train(
         )
 
     head_names = [spec.head_id for spec in head_specs]
-    if heads_only:
-        model.freeze_backbone()
 
     optimizer = create_optimizer(
         model._params,
-        head_names,
-        learning_rate,
-        weight_decay,
-        heads_only,
+        trainable_head_names=head_names,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        heads_only=heads_only,
     )
     opt_state = optimizer.init(model._params)
 
