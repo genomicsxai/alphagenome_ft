@@ -182,6 +182,16 @@ def train(
         batch settings as ``steps_per_epoch * num_epochs`` (or capped by
         ``max_train_steps`` when provided). Progress is reported with a global
         counter in ``current/total`` format.
+
+        Multi-GPU training on a single node is supported by passing a non-zero ``num_devices``
+        with a global ``batch_size`` divisible by ``num_devices``. For multi-GPU training,
+        the code requires ``drop_last=True`` to ensure all batches are evenly divisible
+        across devices.
+
+        The multi-GPU implementation is a distributed data-parallel (DDP) style approach
+        using JAX's ``pmap``. Model parameters and optimizer state are replicated across
+        devices, and each device processes a shard of each batch. Gradients and metrics
+        are averaged across devices with ``lax.pmean`` to keep them in sync.
     """
     train_intervals = list(data_module._intervals.get("train", ()))
     num_train_examples = len(train_intervals)
