@@ -25,6 +25,8 @@ classifiers = [
 dependencies = [
     "aiohttp>=3.0.0",
     "dm-haiku>=0.0.10",
+    # orbax-checkpoint imports flax internally (tree utils); not always pulled as a transitive dep.
+    "flax>=0.8.0",
     "jaxtyping>=0.2.0",
     "optax>=0.2.7",
     "orbax-checkpoint>=0.4.0",

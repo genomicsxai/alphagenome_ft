@@ -36,6 +36,11 @@ jobs:
         run: |
           pip freeze
           python -c "import optax; print('optax OK')"
+
+      - name: Verify AlphaGenome stack imports
+        run: |
+          python -c "import orbax.checkpoint as ocp; import flax; print('orbax+flax OK')"
+          python -c "from alphagenome_research.model import dna_model; print('dna_model OK')"
       
       - name: Run unit tests
         run: |
