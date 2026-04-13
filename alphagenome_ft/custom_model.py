@@ -2729,6 +2729,14 @@ def load_checkpoint(
     save_minimal_model = config.get('save_minimal_model', False)
     use_encoder_output = config.get('use_encoder_output', False)
 
+    # ``save_minimal_model`` checkpoints match the encoder-only Haiku transform (encoder + heads,
+    # no transformer). The restore template in ``create_model_with_heads`` must use the same
+    # path; ``config.json`` may still say ``use_encoder_output: false`` because ``save_checkpoint``
+    # keys off ``_custom_forward_fn``, which is only set in the no-custom-forward branch of
+    # ``CustomAlphaGenomeModel.__init__``.
+    if save_minimal_model and not save_full_model:
+        use_encoder_output = True
+
     # Infer only for legacy checkpoints that omit ``use_encoder_output``. Current saves always
     # write the flag explicitly; inferring when it is False would false-positive (e.g. nested
     # head params can resemble "flat" layouts) and flip standard models to encoder-only mode.
