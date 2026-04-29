@@ -287,7 +287,7 @@ opt_state = optimizer.init(model._params)
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/finetune_encoder_only_mpra.ipynb)
 
 **When to use:** Short sequences (&lt; ~1 kb): MPRA, promoters, enhancers. Uses encoder (CNN) only.
-**Tutorial:** [Encoder-only finetuning](docs/encoder_only_perturbation.md). Use `templates.EncoderOnlyHead` and **`use_encoder_output=True`** in `create_model_with_heads(...)`. Custom loops must use [`create_optimizer(..., heads_only=True)`](docs/heads_only_optimizer.md), not a plain `optax.adamw` on the full tree. See the application repo [AlpahGenome MPRA repo](https://github.com/genomicsxai/alphagenome_FT_MPRA) for more details.
+**Tutorial:** [Encoder-only finetuning](docs/encoder_only_perturbation.md). Use `templates.EncoderOnlyHead` and **`use_encoder_output=True`** in `create_model_with_heads(...)`. Custom loops must use [`create_optimizer(..., heads_only=True)`](docs/heads_only_optimizer.md), not a plain `optax.adamw` on the full tree. See the application repo [AlpahGenome MPRA repo](https://github.com/Al-Murphy/alphagenome_FT_MPRA) for more details.
 
 ---
 
