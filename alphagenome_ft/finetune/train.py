@@ -8,11 +8,14 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 import jax
+import jax.numpy as jnp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 import optax
 from alphagenome.models import dna_model as ag_dna_model
 from alphagenome_research.model import dna_model as research_dna_model
 
+from alphagenome_ft import parameter_utils
 from alphagenome_ft.custom_model import CustomAlphaGenomeModel
 from alphagenome_ft.finetune.config import HeadSpec
 from alphagenome_ft.finetune.data import BigWigDataModule, prepare_batch
@@ -102,22 +105,32 @@ def create_optimizer(
 
 
 def _replicate_tree(tree, devices):
-    """Replicate a pytree across local devices."""
-    return jax.device_put_replicated(tree, devices)
+    """Replicate a pytree across local devices for pmap."""
+    mesh = Mesh(np.array(devices), ("data",))
+    sharding = NamedSharding(mesh, P("data"))
+    return jax.tree_util.tree_map(
+        lambda value: jax.device_put(jnp.stack([value] * len(devices)), sharding),
+        tree,
+    )
 
 
 def _unreplicate_tree(tree):
-    """Extract the first replica from a replicated pytree."""
-    return jax.tree_util.tree_map(lambda value: value[0], tree)
+    """Extract the first local replica from a replicated pytree."""
+    return jax.tree_util.tree_map(
+        lambda value: np.asarray(value.addressable_shards[0].data).squeeze(0)
+        if hasattr(value, "addressable_shards")
+        else value[0],
+        tree,
+    )
 
 
 def _shard_batch(batch: Mapping[str, jax.Array], num_devices: int):
     """Reshape a batch from [global_batch, ...] to [num_devices, per_device, ...]."""
 
-    def shard_array(name: str, value):
+    def shard_array(value: jax.Array) -> jax.Array:
         if value.shape[0] % num_devices != 0:
             raise ValueError(
-                f"Batch size  of {value.shape[0]} is not divisible by num_devices={num_devices}."
+                f"Batch size of {value.shape[0]} is not divisible by num_devices={num_devices}."
                 f"Use a global batch size divisible by the number of local devices."
             )
         per_device_batch = value.shape[0] // num_devices
