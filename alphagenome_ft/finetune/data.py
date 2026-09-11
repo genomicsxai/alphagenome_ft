@@ -694,7 +694,7 @@ class BigWigDataModule:
             return
 
         order = np.arange(len(windows))
-        if self._shuffle:
+        if self._shuffle and split == "train":
             rng = np.random.default_rng(seed)
             rng.shuffle(order)
 
@@ -762,6 +762,76 @@ class BigWigDataModule:
         limit = min(target_len, arr.shape[0])
         padded[:limit] = arr[:limit]
         return padded
+
+
+def compute_track_nonzero_means(
+    bigwig_paths: Sequence[Path],
+    intervals: Sequence[genome.Interval],
+    *,
+    max_samples: int | None = 1000,
+    strand_pair_groups: Sequence[tuple[int, int]] | None = None,
+) -> np.ndarray:
+    """Estimate per-track nonzero means using the PyTorch fine-tuning rule.
+
+    Intervals are sampled deterministically and only finite, nonzero BigWig
+    values contribute. Strand-paired tracks can share their averaged scale.
+    """
+    if not bigwig_paths:
+        raise ValueError("At least one BigWig path is required.")
+    if not intervals:
+        raise ValueError("At least one training interval is required.")
+    if max_samples is not None and max_samples <= 0:
+        raise ValueError("max_samples must be positive when provided.")
+
+    sampled = list(intervals)
+    if max_samples is not None and len(sampled) > max_samples:
+        step = max(1, len(sampled) // max_samples)
+        sampled = sampled[::step][:max_samples]
+
+    sums = np.zeros(len(bigwig_paths), dtype=np.float64)
+    counts = np.zeros(len(bigwig_paths), dtype=np.int64)
+    handles = [pyBigWig.open(str(Path(path))) for path in bigwig_paths]
+    try:
+        for interval in sampled:
+            for index, handle in enumerate(handles):
+                values = handle.values(
+                    interval.chromosome,
+                    interval.start,
+                    interval.end,
+                    numpy=True,
+                )
+                if values is None:
+                    continue
+                array = np.nan_to_num(np.asarray(values, dtype=np.float32))
+                nonzero = array[array != 0]
+                # Match the PyTorch window reduction before float64 accumulation.
+                sums[index] += nonzero.sum()
+                counts[index] += nonzero.size
+    finally:
+        for handle in handles:
+            handle.close()
+
+    means = np.divide(
+        sums,
+        counts,
+        out=np.ones_like(sums),
+        where=counts > 0,
+    )
+    if strand_pair_groups is not None:
+        seen: set[int] = set()
+        for plus_index, minus_index in strand_pair_groups:
+            pair = (int(plus_index), int(minus_index))
+            if pair[0] == pair[1]:
+                raise ValueError(f"Strand pair must contain distinct tracks: {pair}.")
+            if any(index < 0 or index >= len(means) for index in pair):
+                raise ValueError(f"Strand-pair index out of range: {pair}.")
+            if any(index in seen for index in pair):
+                raise ValueError(f"Track appears in more than one strand pair: {pair}.")
+            seen.update(pair)
+            paired_mean = 0.5 * (means[pair[0]] + means[pair[1]])
+            means[pair[0]] = paired_mean
+            means[pair[1]] = paired_mean
+    return means.astype(np.float32)
 
 
 def build_fasta_index(fasta_path: Path) -> dict[str, int]:
