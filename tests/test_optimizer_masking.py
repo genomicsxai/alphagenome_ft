@@ -48,6 +48,38 @@ def test_heads_only_optimizer_fake_param_tree():
     jax.tree_util.tree_map(assert_head_moved, params, new_params, labels)
 
 
+def test_heads_plus_lora_optimizer_freezes_pretrained_backbone_weights():
+    params = {
+        "alphagenome": {
+            "transformer_tower": {
+                "q_layer": {
+                    "w": jnp.ones((2, 3)),
+                    "lora_a": jnp.ones((2, 1)),
+                    "lora_b": jnp.ones((1, 3)),
+                }
+            },
+            "head": {"my_task": {"w": jnp.ones((3, 1))}},
+        }
+    }
+    optimizer = create_optimizer(
+        params,
+        trainable_head_names=("my_task",),
+        learning_rate=1e-2,
+        weight_decay=None,
+        heads_only=True,
+        train_lora=True,
+    )
+    state = optimizer.init(params)
+    grads = jax.tree_util.tree_map(jnp.ones_like, params)
+    updates, _ = optimizer.update(grads, state, params)
+
+    q_updates = updates["alphagenome"]["transformer_tower"]["q_layer"]
+    assert jnp.allclose(q_updates["w"], 0)
+    assert not jnp.allclose(q_updates["lora_a"], 0)
+    assert not jnp.allclose(q_updates["lora_b"], 0)
+    assert not jnp.allclose(updates["alphagenome"]["head"]["my_task"]["w"], 0)
+
+
 @pytest.mark.skipif(
     not kaggle_credentials_available(),
     reason="Kaggle credentials required for model fixture (~/.kaggle/kaggle.json or env)",
