@@ -29,7 +29,7 @@ from alphagenome_ft.finetune.combined_data import (
     load_interval_list,
 )
 from alphagenome_ft.finetune.workarounds import (
-    init_splice_site_from_pretrained,
+    apply_pretrained_head_samples,
     reinit_junction_rope_embeddings,
 )
 
@@ -39,12 +39,19 @@ def main(args=None) -> None:
         args = parse_args()
 
     # Heavy imports deferred past argparse so --help works without a full JAX install.
+    from alphagenome.models import dna_model as ag_dna_model
+    from alphagenome_research.model import dna_model as research_dna_model
+
     from alphagenome_ft import create_model_with_heads, load_checkpoint
     from alphagenome_ft import lora as lora_lib
     from alphagenome_ft.finetune import config as ft_config
     from alphagenome_ft.finetune.data import BigWigDataModule
     from alphagenome_ft.finetune.splice_data import SpliceDataModule
     from alphagenome_ft.finetune.train import register_predefined_heads, train as run_train
+
+    organism_index = research_dna_model.convert_to_organism_index(
+        getattr(ag_dna_model.Organism, args.organism)
+    )
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -187,11 +194,7 @@ def main(args=None) -> None:
                 model, head_ids["splice_sites_junction"], std=0.0, seed=args.seed,
             )
 
-        print("Initializing splice_site head from the pretrained model's own "
-              "standard splice-site classification head (matches "
-              "alphagenome-pytorch's --pretrained-head-samples splice_site:0; "
-              "see workarounds.init_splice_site_from_pretrained docstring).")
-        init_splice_site_from_pretrained(model, head_ids["splice_sites_classification"])
+        apply_pretrained_head_samples(model, args.pretrained_head_samples, organism_index)
 
     if args.usage_num_segments > 1:
         model.set_usage_num_segments(
@@ -272,6 +275,11 @@ def main(args=None) -> None:
         save_every_steps=args.save_every_steps,
         gradient_clip_global_norm=args.max_grad_norm if args.max_grad_norm > 0 else None,
         verbose=True,
+        log_every=args.log_every,
+        use_wandb=args.wandb,
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        wandb_run_name=args.run_name,
     )
 
     # Distinct from checkpoint_dir/{last,best} (which --resume auto reads/

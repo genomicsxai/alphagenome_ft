@@ -191,4 +191,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                               "Also restores optimizer (Adam) state from an "
                               "opt_state sidecar there, if present. Mirrors "
                               "alphagenome-pytorch's --resume auto.")
+    parser.add_argument("--log-every", type=int, default=50,
+                         help="Log per-head training loss (to training_log.csv "
+                              "and W&B) every this many optimizer steps. Matches "
+                              "alphagenome-pytorch's --log-every default.")
+    parser.add_argument("--wandb", action="store_true",
+                         help="Enable Weights & Biases logging, mirroring "
+                              "alphagenome-pytorch's --wandb.")
+    parser.add_argument("--wandb-project", default="alphagenome-ft")
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--pretrained-head-samples", type=str, default="splice_site:0",
+                         help="Per-head control over pretrained-vs-random weight init, "
+                              "mirroring alphagenome-pytorch's --pretrained-head-samples. "
+                              "Format: 'modality[@resolution]:idx,...' where modality is "
+                              "one of rna_seq/splice_site/splice_usage/splice_junctions, "
+                              "and idx is either a single integer (broadcast that "
+                              "pretrained track to every output track of the head) or a "
+                              "'|'-separated list of integers/NA with one entry per output "
+                              "track (validated against the head's actual track count). "
+                              "Use 'NA' to keep random initialization for a modality or a "
+                              "specific output track. '@resolution' is only meaningful for "
+                              "rna_seq (this repo's custom head is built with resolutions=[1] "
+                              "by default; requesting an unbuilt resolution errors). "
+                              "Modalities not listed keep random initialization. The "
+                              "organism is taken from --organism. For splice_site the index "
+                              "is ignored (its 5-class output has no per-track structure); "
+                              "for splice_junctions the index selects pretrained RoPE "
+                              "tissues specifically (its main linear projects trunk "
+                              "embeddings into a shared representation, not a per-tissue "
+                              "one, so that part is always copied whole, organism-only). "
+                              "Default 'splice_site:0' reproduces this repo's prior "
+                              "hardcoded behavior.")
     return parser.parse_args(argv)

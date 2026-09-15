@@ -22,6 +22,7 @@ from alphagenome_research.model import dna_model as research_dna_model
 from alphagenome_ft.custom_model import CustomAlphaGenomeModel
 from alphagenome_ft.finetune.config import HeadSpec
 from alphagenome_ft.finetune.data import BigWigDataModule, prepare_batch
+from alphagenome_ft.finetune.logging_utils import TrainingLogger
 from alphagenome_ft.finetune.splice_data import SpliceDataModule
 from alphagenome_ft.optimizer_utils import create_optimizer, label_params_for_trainable_heads
 
@@ -161,6 +162,7 @@ def train(
     resume_from: Path | None = None,
     save_every_steps: int | None = None,
     gradient_clip_global_norm: float | None = None,
+    log_every: int = 50,
 ) -> None:
     """Run fine-tuning with pmapped train/eval steps.
 
@@ -240,6 +242,9 @@ def train(
             ``alphagenome_ft.optimizer_utils.create_optimizer`` — see that
             function's docstring). Matches alphagenome-pytorch's
             ``--max-grad-norm``. ``None`` (default) disables clipping.
+        log_every: Log per-head training loss (to ``checkpoint_dir``'s
+            ``training_log.csv``, and to W&B if enabled) every this many
+            optimizer steps. Matches alphagenome-pytorch's ``--log-every``.
 
     Notes:
         Total planned steps are computed before training from train-set size and
@@ -307,31 +312,30 @@ def train(
         )
     devices = available_devices[:num_devices]
 
-    if use_wandb:
-        import wandb
-
-        wb_config = {
-            "learning_rate": learning_rate,
-            "weight_decay": weight_decay,
-            "num_epochs": num_epochs,
-            "batch_size": data_module._batch_size,
-            "steps_per_epoch": steps_per_epoch,
-            "total_train_steps": total_train_steps,
-            "heads_only": heads_only,
-            "organism": organism,
-            "num_devices": num_devices,
-            "best_metric": best_metric,
-            "best_metric_mode": best_metric_mode,
-            "early_stopping_patience": early_stopping_patience,
-            "seed": seed,
-            **(wandb_config or {}),
-        }
-        wandb.init(
-            project=wandb_project or "alphagenome-ft",
-            entity=wandb_entity,
-            name=wandb_run_name,
-            config=wb_config,
-        )
+    wb_config = {
+        "learning_rate": learning_rate,
+        "weight_decay": weight_decay,
+        "num_epochs": num_epochs,
+        "batch_size": data_module._batch_size,
+        "steps_per_epoch": steps_per_epoch,
+        "total_train_steps": total_train_steps,
+        "heads_only": heads_only,
+        "organism": organism,
+        "num_devices": num_devices,
+        "best_metric": best_metric,
+        "best_metric_mode": best_metric_mode,
+        "early_stopping_patience": early_stopping_patience,
+        "seed": seed,
+        **(wandb_config or {}),
+    }
+    logger = TrainingLogger(
+        log_dir=checkpoint_dir,
+        use_wandb=use_wandb,
+        wandb_project=wandb_project or "alphagenome-ft",
+        wandb_entity=wandb_entity,
+        run_name=wandb_run_name,
+        config=wb_config,
+    )
 
     head_names = [spec.head_id for spec in head_specs]
     if num_devices > 1 and not data_module._drop_last:
@@ -431,18 +435,25 @@ def train(
                 strand_reindexing=batch["strand_reindexing"],
                 **_predict_extra_kwargs(batch),
             )
-            total_loss = 0.0
+            head_losses = {}
             for head_name in head_names:
                 head_loss_dict = loss_fns[head_name](
                     predictions[head_name], _head_batch(batch, head_name)
                 )
-                total_loss = total_loss + head_loss_dict["loss"]
-            return total_loss
+                head_losses[head_name] = head_loss_dict["loss"]
+            total_loss = sum(head_losses.values())
+            return total_loss, head_losses
 
-        loss_value, grads = jax.value_and_grad(loss_fn)(params)
+        (loss_value, head_losses), grads = jax.value_and_grad(
+            loss_fn, has_aux=True
+        )(params)
         loss_value = jax.lax.pmean(loss_value, axis_name="data")
         grads = jax.lax.pmean(grads, axis_name="data")
-        return loss_value, grads
+        head_losses = jax.tree_util.tree_map(
+            lambda loss_value: jax.lax.pmean(loss_value, axis_name="data"),
+            head_losses,
+        )
+        return loss_value, grads, head_losses
 
     @functools.partial(jax.pmap, axis_name="data")
     def apply_grads(params, current_opt_state, grads):
@@ -611,8 +622,10 @@ def train(
             # time as redoing the training itself.
             skip_batches = epoch_step * gradient_accumulation_steps if epoch == start_epoch else 0
             train_losses: list[float] = []
+            train_head_losses: dict[str, list[float]] = {head: [] for head in head_names}
             accum_grads = None
             accum_loss_sum = 0.0
+            accum_head_loss_sum = {head: 0.0 for head in head_names}
             accum_count = 0
             for batch_np in _prefetch(data_module.iter_batches(
                 "train", seed=seed + epoch, skip_batches=skip_batches,
@@ -620,7 +633,7 @@ def train(
                 batch = prepare_batch(batch_np, organism_index_value, head_names)
                 batch = _shard_batch(batch, num_devices)
                 batch["strand_reindexing"] = strand_reindexing_replicated
-                micro_loss_value, micro_grads = grad_step(
+                micro_loss_value, micro_grads, micro_head_losses = grad_step(
                     replicated_params, replicated_state, batch,
                 )
                 accum_grads = (
@@ -629,6 +642,10 @@ def train(
                     else jax.tree_util.tree_map(jnp.add, accum_grads, micro_grads)
                 )
                 accum_loss_sum += float(np.asarray(micro_loss_value)[0])
+                for head_name in head_names:
+                    accum_head_loss_sum[head_name] += float(
+                        np.asarray(micro_head_losses[head_name])[0]
+                    )
                 accum_count += 1
 
                 if accum_count < gradient_accumulation_steps:
@@ -643,11 +660,17 @@ def train(
                     replicated_params, opt_state, averaged_grads,
                 )
                 loss_scalar = accum_loss_sum / accum_count
+                head_loss_scalars = {
+                    head: accum_head_loss_sum[head] / accum_count for head in head_names
+                }
                 accum_grads = None
                 accum_loss_sum = 0.0
+                accum_head_loss_sum = {head: 0.0 for head in head_names}
                 accum_count = 0
 
                 train_losses.append(loss_scalar)
+                for head_name in head_names:
+                    train_head_losses[head_name].append(head_loss_scalars[head_name])
                 epoch_step += 1
                 global_step += 1
 
@@ -659,12 +682,16 @@ def train(
                         flush=True,
                     )
 
-                if use_wandb:
-                    wandb.log(
+                if global_step % log_every == 0:
+                    logger.log_step(
                         {
-                            "train/step_loss": loss_scalar,
-                            "epoch": epoch,
                             "step": global_step,
+                            "epoch": epoch,
+                            "loss": loss_scalar,
+                            **{
+                                f"{head}_loss": v
+                                for head, v in head_loss_scalars.items()
+                            },
                         }
                     )
 
@@ -682,12 +709,15 @@ def train(
                     break
 
             train_loss_avg = float(np.mean(train_losses)) if train_losses else None
+            train_head_loss_avgs = {
+                head: float(np.mean(values))
+                for head, values in train_head_losses.items()
+                if values
+            }
             if verbose:
                 print()
             if train_loss_avg is not None:
                 print(f"  Train loss: {train_loss_avg:.4f}")
-                if use_wandb:
-                    wandb.log({"train/epoch_loss": train_loss_avg, "epoch": epoch})
 
             valid_metrics: Mapping[str, float] | None = None
             if "valid" in data_module._intervals and len(data_module._intervals["valid"]) > 0:
@@ -714,19 +744,37 @@ def train(
                     "  Validation metrics:",
                     ", ".join(f"{k}={v:.4f}" for k, v in valid_metrics.items()),
                 )
-                if use_wandb:
-                    valid_log = {f"valid/{head}": v for head, v in valid_metrics.items()}
-                    valid_log["valid/loss"] = float(sum(valid_metrics.values()))
-                    valid_log["epoch"] = epoch
-                    wandb.log(valid_log)
+
+            if train_loss_avg is not None:
+                logger.log_epoch(
+                    epoch,
+                    {
+                        "train_loss": train_loss_avg,
+                        **{
+                            f"train_{head}_loss": v
+                            for head, v in train_head_loss_avgs.items()
+                        },
+                        **(
+                            {
+                                "val_loss": float(sum(valid_metrics.values())),
+                                **{
+                                    f"val_{head}_loss": v
+                                    for head, v in valid_metrics.items()
+                                },
+                            }
+                            if valid_metrics is not None
+                            else {}
+                        ),
+                    },
+                )
 
             metric_label, metric_value = resolve_metric(best_metric, train_loss_avg, valid_metrics)
             if metric_value is not None and math.isfinite(metric_value):
                 if is_improved(metric_value, best_value):
                     best_value = metric_value
                     epochs_since_improvement = 0
-                    if use_wandb:
-                        wandb.log({"best/" + metric_label: metric_value, "epoch": epoch})
+                    if logger.wandb is not None:
+                        logger.wandb.log({"best/" + metric_label: metric_value, "epoch": epoch})
                     if checkpoint_dir:
                         model._params = _unreplicate_tree(replicated_params)
                         model._state = _unreplicate_tree(replicated_state)
@@ -770,8 +818,7 @@ def train(
     print("Training complete!")
     print(f"{'=' * 60}")
 
-    if use_wandb:
-        wandb.finish()
+    logger.finish()
 
 
 __all__ = [
