@@ -151,3 +151,38 @@ def create_optimizer(
             inner,
         )
     return inner
+
+
+def build_lr_schedule(
+    base_lr: float, warmup_steps: int, total_steps: int, schedule: str,
+) -> float | Any:
+    """Build a learning-rate value/schedule for :func:`create_optimizer`.
+
+    Mirrors alphagenome-pytorch's ``create_lr_scheduler`` (a ``LambdaLR`` multiplicative
+    factor) formula exactly, rather than reaching for ``optax.warmup_cosine_decay_schedule``
+    (whose endpoint semantics aren't guaranteed to match PyTorch's bit-for-bit): linear
+    warmup from 0 to ``base_lr`` over ``warmup_steps``, then either held constant or cosine
+    decayed to 0 by ``total_steps``.
+
+    Returns the plain ``base_lr`` float unchanged when ``warmup_steps == 0`` and
+    ``schedule == "constant"`` (today's default), so existing callers that never pass these
+    flags see no behavior change and no schedule-tracing overhead.
+    """
+    if warmup_steps == 0 and schedule == "constant":
+        return base_lr
+    if schedule not in ("constant", "cosine"):
+        raise ValueError(f"schedule must be 'constant' or 'cosine', got {schedule!r}.")
+
+    def lr_fn(step):
+        warmup_factor = jax.numpy.minimum(step / max(warmup_steps, 1), 1.0)
+        if schedule == "constant":
+            decay_factor = 1.0
+        else:
+            progress = jax.numpy.clip(
+                (step - warmup_steps) / max(total_steps - warmup_steps, 1), 0.0, 1.0,
+            )
+            decay_factor = 0.5 * (1.0 + jax.numpy.cos(jax.numpy.pi * progress))
+        factor = jax.numpy.where(step < warmup_steps, warmup_factor, decay_factor)
+        return base_lr * factor
+
+    return lr_fn

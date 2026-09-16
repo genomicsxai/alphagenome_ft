@@ -24,7 +24,11 @@ from alphagenome_ft.finetune.config import HeadSpec
 from alphagenome_ft.finetune.data import BigWigDataModule, prepare_batch
 from alphagenome_ft.finetune.logging_utils import TrainingLogger
 from alphagenome_ft.finetune.splice_data import SpliceDataModule
-from alphagenome_ft.optimizer_utils import create_optimizer, label_params_for_trainable_heads
+from alphagenome_ft.optimizer_utils import (
+    build_lr_schedule,
+    create_optimizer,
+    label_params_for_trainable_heads,
+)
 
 
 def _prefetch(iterator: Iterator, buffer_size: int = 2) -> Iterator:
@@ -98,6 +102,30 @@ def register_predefined_heads(head_specs: Sequence[HeadSpec]) -> None:
 ## what actually runs, and threaded gradient_clip_global_norm through train().
 
 
+def _splice_head_track_names(spec: HeadSpec) -> list[str]:
+    """Per-track sample-derived name labels for a splice_usage/splice_junctions
+    ``HeadSpec``, used only for ``--metrics-per-sample`` CSV column naming.
+
+    Deliberately duplicates (rather than imports/reuses) the exact naming
+    logic from ``finetune.config._build_splice_metadata``, since that
+    function only returns an ``AlphaGenomeOutputMetadata`` mapping (no
+    ``HeadSpec.tracks`` -- splice ``HeadSpec``s always have ``tracks=()``,
+    see ``config.prepare_head_specs``), not something this module could
+    otherwise reuse directly. Must stay in sync with that function's ordering
+    if it ever changes.
+    """
+    ss = spec.splice_source
+    if ss is None:
+        raise ValueError(f"HeadSpec {spec.head_id!r} has no splice_source.")
+    if spec.kind == "splice_sites_usage":
+        samples = ss.ssu if ss.ssu is not None else ss.star_junctions
+        sample_names = [Path(p).stem for p in samples]
+        return [n for name in sample_names for n in (f"{name}_pos", f"{name}_neg")]
+    if spec.kind == "splice_sites_junction":
+        return [Path(p).stem for p in ss.star_junctions]
+    raise ValueError(f"No per-track names for head kind {spec.kind!r}.")
+
+
 def _replicate_tree(tree, devices):
     """Replicate a pytree across local devices for pmap."""
     mesh = Mesh(np.array(devices), ("data",))
@@ -163,6 +191,11 @@ def train(
     save_every_steps: int | None = None,
     gradient_clip_global_norm: float | None = None,
     log_every: int = 50,
+    modality_weights: dict[str, float] | None = None,
+    warmup_steps: int = 0,
+    lr_schedule: str = "constant",
+    compute_pearson: bool = True,
+    metrics_per_sample: bool = False,
 ) -> None:
     """Run fine-tuning with pmapped train/eval steps.
 
@@ -245,6 +278,26 @@ def train(
         log_every: Log per-head training loss (to ``checkpoint_dir``'s
             ``training_log.csv``, and to W&B if enabled) every this many
             optimizer steps. Matches alphagenome-pytorch's ``--log-every``.
+        modality_weights: Optional per-head loss weights (``{head_id: weight}``,
+            default 1.0 for heads not listed). Applied to the total loss
+            optimized against; per-head CSV/W&B logging stays unweighted.
+            Matches alphagenome-pytorch's ``--modality-weights``.
+        warmup_steps: Linear LR warmup over this many optimizer steps before
+            ``lr_schedule`` takes over. Matches alphagenome-pytorch's
+            ``--warmup-steps``. 0 (default) disables warmup.
+        lr_schedule: ``"constant"`` (default) or ``"cosine"`` (decays to 0 by
+            the end of training). Matches alphagenome-pytorch's
+            ``--lr-schedule``. See ``optimizer_utils.build_lr_schedule``.
+        compute_pearson: If True (default), compute per-head validation
+            Pearson correlation for rna_seq/splice_usage/splice_junctions
+            (not splice_site, which is classification), pooled exactly
+            across the whole validation set via streaming sufficient
+            statistics. Matches alphagenome-pytorch's ``--no-val-pearson``
+            (inverted: this flag defaults True like PyTorch's).
+        metrics_per_sample: If True, additionally log per-track (= per
+            biological sample, for splice_usage/splice_junctions) Pearson
+            correlation. No effect if ``compute_pearson`` is False. Matches
+            alphagenome-pytorch's ``--metrics-per-sample``. Default False.
 
     Notes:
         Total planned steps are computed before training from train-set size and
@@ -338,6 +391,7 @@ def train(
     )
 
     head_names = [spec.head_id for spec in head_specs]
+    head_specs_by_id = {spec.head_id: spec for spec in head_specs}
     if num_devices > 1 and not data_module._drop_last:
         raise ValueError(
             "Single-host multi-GPU training currently requires drop_last=True so every "
@@ -348,16 +402,18 @@ def train(
     if heads_only:
         model.freeze_backbone()
 
+    lr_or_schedule = build_lr_schedule(learning_rate, warmup_steps, total_train_steps, lr_schedule)
     optimizer = create_optimizer(
         model._params,
         trainable_head_names=head_names,
-        learning_rate=learning_rate,
+        learning_rate=lr_or_schedule,
         weight_decay=weight_decay,
         heads_only=heads_only,
         lora_enabled=lora_enabled,
         gradient_clip_global_norm=gradient_clip_global_norm,
     )
     opt_state = optimizer.init(model._params)
+    modality_weights = modality_weights or {}
 
     organism_enum = getattr(ag_dna_model.Organism, organism)
     organism_index_value = research_dna_model.convert_to_organism_index(organism_enum)
@@ -441,7 +497,12 @@ def train(
                     predictions[head_name], _head_batch(batch, head_name)
                 )
                 head_losses[head_name] = head_loss_dict["loss"]
-            total_loss = sum(head_losses.values())
+            # head_losses (returned as aux for per-head CSV/W&B logging) stays
+            # unweighted; only the optimized total applies modality_weights,
+            # matching alphagenome-pytorch's loss_components vs. loss split.
+            total_loss = sum(
+                modality_weights.get(h, 1.0) * head_losses[h] for h in head_names
+            )
             return total_loss, head_losses
 
         (loss_value, head_losses), grads = jax.value_and_grad(
@@ -461,6 +522,54 @@ def train(
         updates, new_opt_state = optimizer.update(grads, current_opt_state, params)
         new_params = optax.apply_updates(params, updates)
         return new_params, new_opt_state
+
+    # Heads with a per-position/per-track prediction directly comparable to a
+    # raw target (unlike splice_site, whose classification output has no
+    # correlation-shaped counterpart) -- matches alphagenome-pytorch's Pearson
+    # scope. splice_usage/splice_junctions additionally get a per-track
+    # ("per-sample", since their tracks are 1:1 with a source sample/file --
+    # see _splice_head_track_names) breakdown under --metrics-per-sample;
+    # rna_seq has no such 1:1 track-to-sample mapping, matching PyTorch's own
+    # scoping of --metrics-per-sample.
+    _PEARSON_HEADS = ("rna_seq", "splice_usage", "splice_junctions")
+    _PER_SAMPLE_PEARSON_HEADS = ("splice_usage", "splice_junctions")
+
+    def _pearson_partial_stats(pred, target, mask=None, *, per_track: bool):
+        """Streaming sufficient statistics (n, sum_x, sum_y, sum_xy, sum_x2,
+        sum_y2) for a pooled Pearson r, optionally kept separate per track
+        (last axis) instead of reduced to a scalar. Exact once finalized
+        across batches (see _finalize_pearson in the validation loop below)
+        -- not an average of per-batch correlations.
+        """
+        pred = pred.astype(jnp.float32)
+        target = target.astype(jnp.float32)
+        weight = jnp.ones_like(pred) if mask is None else mask.astype(jnp.float32)
+        reduce_axes = tuple(range(pred.ndim - 1)) if per_track else tuple(range(pred.ndim))
+        return {
+            "n": jnp.sum(weight, axis=reduce_axes),
+            "sum_x": jnp.sum(pred * weight, axis=reduce_axes),
+            "sum_y": jnp.sum(target * weight, axis=reduce_axes),
+            "sum_xy": jnp.sum(pred * target * weight, axis=reduce_axes),
+            "sum_x2": jnp.sum(pred * pred * weight, axis=reduce_axes),
+            "sum_y2": jnp.sum(target * target * weight, axis=reduce_axes),
+        }
+
+    def _head_pearson_inputs(head_name, predictions, target):
+        """(prediction_array, mask_or_None) directly comparable to ``target``
+        for the given head. splice_junctions' pairwise donor x acceptor
+        predictions include real padding (invalid position pairs / padding
+        tissues) that must be excluded via its mask, unlike rna_seq/
+        splice_usage, whose custom heads here are built with exactly the
+        right number of tracks (no padding).
+        """
+        head_pred = predictions[head_name]
+        if head_name == "rna_seq":
+            return head_pred["predictions_1bp"], None
+        if head_name == "splice_usage":
+            return head_pred["predictions"], None
+        if head_name == "splice_junctions":
+            return head_pred["predictions"], head_pred["splice_junction_mask"]
+        raise ValueError(f"No Pearson prediction mapping for head {head_name!r}.")
 
     @functools.partial(jax.pmap, axis_name="data")
     def eval_step(params, state, batch):
@@ -483,13 +592,36 @@ def train(
             lambda loss_value: jax.lax.pmean(loss_value, axis_name="data"),
             head_losses,
         )
-        return head_losses
+
+        pearson_stats: dict = {}
+        if compute_pearson:
+            for head_name in _PEARSON_HEADS:
+                if head_name not in head_names:
+                    continue
+                target = _head_batch(batch, head_name)["targets"]
+                pred_array, mask = _head_pearson_inputs(head_name, predictions, target)
+                stats = {"agg": _pearson_partial_stats(pred_array, target, mask, per_track=False)}
+                if metrics_per_sample and head_name in _PER_SAMPLE_PEARSON_HEADS:
+                    stats["per_track"] = _pearson_partial_stats(
+                        pred_array, target, mask, per_track=True
+                    )
+                pearson_stats[head_name] = stats
+            pearson_stats = jax.tree_util.tree_map(
+                lambda x: jax.lax.pmean(x, axis_name="data"), pearson_stats,
+            )
+        return head_losses, pearson_stats
 
     if verbose:
         print("JIT-compiling step functions (first call will be slow)...")
 
     def aggregate_valid_loss(metrics: Mapping[str, float]) -> float | None:
-        return float(sum(metrics.values())) if metrics else None
+        # Weighted the same way as the training loss (grad_step's loss_fn
+        # above), so the metric driving best-checkpoint/early-stopping stays
+        # consistent with what's actually being optimized; per-head
+        # val_<head>_loss CSV columns stay unweighted.
+        if not metrics:
+            return None
+        return float(sum(modality_weights.get(k, 1.0) * v for k, v in metrics.items()))
 
     def resolve_metric(
         metric_name: str,
@@ -720,8 +852,16 @@ def train(
                 print(f"  Train loss: {train_loss_avg:.4f}")
 
             valid_metrics: Mapping[str, float] | None = None
+            pearson_metrics: dict[str, float] = {}
             if "valid" in data_module._intervals and len(data_module._intervals["valid"]) > 0:
                 losses = {head: [] for head in head_names}
+                # Raw per-batch stats accumulated as SUMS (not per-batch
+                # means), keyed [head_name][kind]["n"/"sum_x"/...] -- summing
+                # (rather than averaging) sufficient statistics across
+                # batches is what makes the final Pearson r an exact pooled
+                # correlation over the whole validation set, not an average
+                # of per-batch correlations.
+                pearson_totals: dict[str, dict[str, dict[str, float]]] = {}
                 # Explicit seed, not the default (None): CombinedDataModule
                 # passes this same seed to both its underlying modules, so an
                 # explicit shared value is what keeps their independent
@@ -733,9 +873,24 @@ def train(
                     batch = prepare_batch(batch_np, organism_index_value, head_names)
                     batch = _shard_batch(batch, num_devices)
                     batch["strand_reindexing"] = strand_reindexing_replicated
-                    head_losses = eval_step(replicated_params, replicated_state, batch)
+                    head_losses, batch_pearson_stats = eval_step(
+                        replicated_params, replicated_state, batch,
+                    )
                     for head_name in head_names:
                         losses[head_name].append(float(np.asarray(head_losses[head_name])[0]))
+                    for head_name, stats_by_kind in batch_pearson_stats.items():
+                        host_stats = {
+                            kind: {k: np.asarray(v)[0] for k, v in stats.items()}
+                            for kind, stats in stats_by_kind.items()
+                        }
+                        if head_name not in pearson_totals:
+                            pearson_totals[head_name] = host_stats
+                        else:
+                            for kind, stats in host_stats.items():
+                                for k, v in stats.items():
+                                    pearson_totals[head_name][kind][k] = (
+                                        pearson_totals[head_name][kind][k] + v
+                                    )
 
                 valid_metrics = {
                     head: float(np.mean(values)) for head, values in losses.items() if values
@@ -744,6 +899,32 @@ def train(
                     "  Validation metrics:",
                     ", ".join(f"{k}={v:.4f}" for k, v in valid_metrics.items()),
                 )
+
+                def _finalize_pearson_r(stats: Mapping[str, np.ndarray]) -> np.ndarray:
+                    n, sx, sy = stats["n"], stats["sum_x"], stats["sum_y"]
+                    sxy, sx2, sy2 = stats["sum_xy"], stats["sum_x2"], stats["sum_y2"]
+                    numerator = n * sxy - sx * sy
+                    denom_sq = np.clip(n * sx2 - sx**2, 0, None) * np.clip(n * sy2 - sy**2, 0, None)
+                    denom = np.sqrt(denom_sq)
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        return np.where(denom > 0, numerator / np.where(denom > 0, denom, 1.0), np.nan)
+
+                aggregate_pearson: dict[str, float] = {}
+                for head_name, stats_by_kind in pearson_totals.items():
+                    agg_r = float(_finalize_pearson_r(stats_by_kind["agg"]))
+                    aggregate_pearson[f"pearson_r_{head_name}"] = agg_r
+                    pearson_metrics[f"pearson_r_{head_name}"] = agg_r
+                    if "per_track" in stats_by_kind:
+                        track_names = _splice_head_track_names(head_specs_by_id[head_name])
+                        per_track_r = np.atleast_1d(_finalize_pearson_r(stats_by_kind["per_track"]))
+                        for name, r in zip(track_names, per_track_r):
+                            pearson_metrics[f"pearson_r_{head_name}_{name}"] = float(r)
+
+                if aggregate_pearson:
+                    print(
+                        "  Validation Pearson r:",
+                        ", ".join(f"{k}={v:.4f}" for k, v in aggregate_pearson.items()),
+                    )
 
             if train_loss_avg is not None:
                 logger.log_epoch(
@@ -756,11 +937,12 @@ def train(
                         },
                         **(
                             {
-                                "val_loss": float(sum(valid_metrics.values())),
+                                "val_loss": aggregate_valid_loss(valid_metrics),
                                 **{
                                     f"val_{head}_loss": v
                                     for head, v in valid_metrics.items()
                                 },
+                                **{f"val_{k}": v for k, v in pearson_metrics.items()},
                             }
                             if valid_metrics is not None
                             else {}

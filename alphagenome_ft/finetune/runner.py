@@ -22,7 +22,7 @@ import random
 
 import numpy as np
 
-from alphagenome_ft.finetune.args import parse_args
+from alphagenome_ft.finetune.args import parse_args, parse_modality_weights
 from alphagenome_ft.finetune.combined_data import (
     CombinedDataModule,
     compute_track_means,
@@ -280,6 +280,11 @@ def main(args=None) -> None:
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
         wandb_run_name=args.run_name,
+        modality_weights=parse_modality_weights(args.modality_weights),
+        warmup_steps=args.warmup_steps,
+        lr_schedule=args.lr_schedule,
+        compute_pearson=not args.no_val_pearson,
+        metrics_per_sample=args.metrics_per_sample,
     )
 
     # Distinct from checkpoint_dir/{last,best} (which --resume auto reads/

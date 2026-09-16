@@ -222,4 +222,62 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                               "one, so that part is always copied whole, organism-only). "
                               "Default 'splice_site:0' reproduces this repo's prior "
                               "hardcoded behavior.")
+    parser.add_argument("--modality-weights", type=str, default=None,
+                         help="Optional per-head loss weights, mirroring "
+                              "alphagenome-pytorch's --modality-weights. Format: "
+                              "'modality:weight,...' where modality is one of "
+                              "rna_seq/splice_site/splice_usage/splice_junctions. Each "
+                              "head's loss is scaled by its weight before being summed "
+                              "into the total optimized loss; per-head CSV/W&B logging "
+                              "stays unweighted. Modalities not listed default to 1.0.")
+    parser.add_argument("--warmup-steps", type=int, default=0,
+                         help="Linear LR warmup over this many optimizer steps before "
+                              "--lr-schedule takes over, mirroring alphagenome-pytorch's "
+                              "--warmup-steps. Default 0 (no warmup) matches this repo's "
+                              "prior constant-LR-only behavior.")
+    parser.add_argument("--lr-schedule", choices=["constant", "cosine"], default="constant",
+                         help="LR schedule after warmup, mirroring alphagenome-pytorch's "
+                              "--lr-schedule. 'constant' (default, matches prior behavior) "
+                              "or 'cosine' (decays to 0 by the end of training).")
+    parser.add_argument("--no-val-pearson", action="store_true",
+                         help="Disable per-head validation Pearson correlation "
+                              "(rna_seq/splice_usage/splice_junctions; not splice_site, "
+                              "which is classification), mirroring alphagenome-pytorch's "
+                              "--no-val-pearson. On by default, matching PyTorch's default.")
+    parser.add_argument("--metrics-per-sample", action="store_true",
+                         help="Also log per-sample (per-track) Pearson correlation for "
+                              "splice_usage/splice_junctions specifically, mirroring "
+                              "alphagenome-pytorch's --metrics-per-sample. Off by default. "
+                              "No effect if --no-val-pearson is also set.")
     return parser.parse_args(argv)
+
+
+def parse_modality_weights(raw: str | None) -> dict[str, float]:
+    """Parse a ``--modality-weights`` string into ``{modality: weight}``.
+
+    Pure string parsing with no head-param coupling (unlike
+    ``workarounds.parse_pretrained_head_samples``), so it lives here rather than in
+    ``workarounds.py``. Modalities not present in the result should be treated by the
+    caller as weight ``1.0``.
+    """
+    if not raw:
+        return {}
+    valid_modalities = {"rna_seq", "splice_site", "splice_usage", "splice_junctions"}
+    result: dict[str, float] = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(
+                f"Malformed --modality-weights entry {item!r}: expected 'modality:weight'."
+            )
+        modality, weight_str = item.rsplit(":", 1)
+        modality = modality.strip()
+        if modality not in valid_modalities:
+            raise ValueError(
+                f"Unrecognized --modality-weights modality '{modality}'; "
+                f"expected one of {sorted(valid_modalities)}."
+            )
+        result[modality] = float(weight_str.strip())
+    return result
