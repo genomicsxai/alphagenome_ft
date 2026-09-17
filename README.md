@@ -46,7 +46,7 @@ A lightweight Python package for finetuning [Google DeepMind's AlphaGenome](http
 
 ## Installation
 
-This package depends on the AlphaGenome stack (`alphagenome` and `alphagenome_research`), which are not on PyPI and must be installed from GitHub. Use the following order.
+This package depends on the AlphaGenome stack (`alphagenome` and `alphagenome_research`). `alphagenome` (≥ 0.7.0) is on PyPI and is installed automatically; `alphagenome_research` is not on PyPI and must be installed from GitHub. Use the following order.
 
 ### Step 1: Install alphagenome-ft
 
@@ -62,22 +62,25 @@ cd alphagenome_ft
 pip install -e .
 ```
 
-This installs `alphagenome-ft` and its PyPI dependencies (JAX, Haiku, optax, etc.). It does **not** install the AlphaGenome model code.
+This installs `alphagenome-ft` and its PyPI dependencies (JAX, Haiku, optax, `alphagenome`, etc.). It does **not** install the AlphaGenome Research model code.
 
-### Step 2: Install AlphaGenome and AlphaGenome Research
+### Step 2: Install AlphaGenome Research
 
-`alphagenome_ft` wraps [AlphaGenome](https://github.com/google-deepmind/alphagenome/) and [AlphaGenome Research](https://github.com/google-deepmind/alphagenome_research/). Install both from GitHub:
+`alphagenome_ft` wraps [AlphaGenome](https://github.com/google-deepmind/alphagenome/) and [AlphaGenome Research](https://github.com/google-deepmind/alphagenome_research/). Install the research package from GitHub:
 
 ```bash
-pip install git+https://github.com/google-deepmind/alphagenome.git
 pip install git+https://github.com/google-deepmind/alphagenome_research.git
 ```
+
+To track the latest base package from GitHub instead of the PyPI release, also run
+`pip install git+https://github.com/google-deepmind/alphagenome.git`.
 
 ### Requirements
 
 - Python ≥ 3.11
+- `alphagenome` ≥ 0.7.0 (on PyPI, installed automatically). Older releases still work when paired with an `alphagenome_research` build from before June 2026, which ships its own FASTA extractor.
 - All other runtime dependencies (JAX, Haiku, optax, orbax-checkpoint, etc.) are installed automatically with `alphagenome-ft`. See `pyproject.toml` for versions.
-- AlphaGenome and AlphaGenome Research must be installed separately as above; they are not on PyPI.
+- AlphaGenome Research must be installed separately from GitHub as above; it is not on PyPI.
 
 ## Quick Start
 There are two options to add new heads to AlphaGenome.
