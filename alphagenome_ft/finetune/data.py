@@ -13,8 +13,14 @@ import numpy as np
 import pandas as pd
 import pyBigWig
 from alphagenome.data import genome
-from alphagenome_research.io import fasta as fasta_lib
 from alphagenome_research.model import one_hot_encoder
+
+try:
+    # alphagenome >= 0.7.0 ships the FASTA extractor in the base package.
+    from alphagenome.io import fasta as fasta_lib
+except ImportError:  # pragma: no cover - older alphagenome + older alphagenome_research
+    # alphagenome_research builds from before June 2026 still carry their own copy.
+    from alphagenome_research.io import fasta as fasta_lib
 
 
 from alphagenome_ft.finetune.config import HeadSpec
