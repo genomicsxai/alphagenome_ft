@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import pyBigWig
 from alphagenome.data import genome
-from alphagenome_research.io import fasta as fasta_lib
+from alphagenome.io import fasta as fasta_lib
 from alphagenome_research.model import one_hot_encoder
 
 
