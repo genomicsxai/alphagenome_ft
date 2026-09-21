@@ -60,6 +60,7 @@ from alphagenome_ft.lora import (
     count_lora_parameters,
 )
 from alphagenome_ft.parameter_utils import freeze_except_lora
+from alphagenome_ft.compat import call_with_is_training
 from alphagenome_ft.optimizer_utils import (
     create_optimizer,
     label_params_for_trainable_heads,
@@ -116,4 +117,6 @@ __all__ = [
     'create_optimizer',
     'label_params_for_trainable_heads',
     'parameter_path_to_str',
+    # alphagenome_research API compatibility (is_training keyword added June 2026)
+    'call_with_is_training',
 ]
