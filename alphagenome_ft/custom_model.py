@@ -80,6 +80,7 @@ from alphagenome_research.model.metadata import metadata as metadata_lib
 
 from alphagenome_ft import parameter_utils
 from alphagenome_ft import custom_heads as custom_heads_module
+from alphagenome_ft.custom_forward import _call_reverse_compat
 
 
 def _resolve_user_metadata(
@@ -2256,7 +2257,7 @@ def create_model_with_heads(
                         num_organisms = len(metadata)
 
                         # Step 1: Run encoder ONLY
-                        trunk, intermediates = model_lib.SequenceEncoder()(dna_sequence)
+                        trunk, intermediates = _call_reverse_compat(model_lib.SequenceEncoder(), dna_sequence, is_training=False)
                         encoder_output = trunk  # Save encoder output
 
                         # Create extended embeddings with ONLY encoder output
@@ -3006,7 +3007,7 @@ def load_checkpoint(
                         with hk.mixed_precision.push_policy(model_lib.SequenceEncoder, policy):
                             with hk.name_scope('alphagenome'):
                                 # Run encoder ONLY (no transformer/decoder).
-                                trunk, intermediates = model_lib.SequenceEncoder()(dna_sequence)
+                                trunk, intermediates = _call_reverse_compat(model_lib.SequenceEncoder(), dna_sequence, is_training=False)
                                 encoder_output = trunk  # Shape: (batch, num_positions, encoder_feature_size)
 
                                 # Pad or truncate encoder_output to match expected size (for flatten pooling)

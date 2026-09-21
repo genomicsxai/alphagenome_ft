@@ -1,12 +1,22 @@
 """
 Custom forward pass that exposes encoder output before transformer.
 """
+import inspect
 import haiku as hk
 from alphagenome_research.model import model as model_lib
 from alphagenome_research.model import embeddings as embeddings_module
 from alphagenome_ft.embeddings_extended import ExtendedEmbeddings
 from jaxtyping import Array, Float, Int
 
+def _call_reverse_compat(module, *args, is_training=False, **kwargs):
+    """Call a module with is_training compatibility with AlphaGenome
+    
+    This allows the forward pass to work with AlphaGenome versions
+    pre- and post-0.7.0.
+    """
+    if "is_training" in inspect.signature(module.__call__).parameters:
+        kwargs["is_training"] = is_training
+    return module(*args, **kwargs)
 
 def forward_with_encoder_output(
     alphagenome: model_lib.AlphaGenome,
@@ -61,7 +71,7 @@ def forward_with_encoder_output(
     num_organisms = alphagenome._num_organisms
     
     # Step 1: Run encoder - exactly as AlphaGenome does
-    trunk, intermediates = model_lib.SequenceEncoder()(dna_sequence)
+    trunk, intermediates = _call_reverse_compat(model_lib.SequenceEncoder(), dna_sequence, is_training=False)
     
     # Save encoder output (before organism embedding and transformer)
     encoder_output = trunk
@@ -73,17 +83,17 @@ def forward_with_encoder_output(
     trunk += organism_embedding_trunk[:, None, :]
     
     # Step 2: Run transformer
-    trunk, pair_activations = model_lib.TransformerTower()(trunk)
+    trunk, pair_activations = _call_reverse_compat(model_lib.TransformerTower(), trunk, is_training=False)
     
     # Step 3: Run decoder
-    x = model_lib.SequenceDecoder()(trunk, intermediates)
+    x = _call_reverse_compat(model_lib.SequenceDecoder(), trunk, intermediates, is_training=False)
     
     # Step 4: Create output embeddings (same as AlphaGenome)
-    embeddings_128bp = embeddings_module.OutputEmbedder(num_organisms)(
-        trunk, organism_index
+    embeddings_128bp = _call_reverse_compat(
+        embeddings_module.OutputEmbedder(num_organisms), trunk, organism_index, is_training=False
     )
-    embeddings_1bp = embeddings_module.OutputEmbedder(num_organisms)(
-        x, organism_index, embeddings_128bp
+    embeddings_1bp = _call_reverse_compat(
+        embeddings_module.OutputEmbedder(num_organisms), x, organism_index, embeddings_128bp, is_training=False
     )
     
     # Step 5: Return extended embeddings with encoder output
