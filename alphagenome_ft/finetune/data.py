@@ -106,22 +106,31 @@ _CHROMSIZES = {
     },
 }
 
-# Model folds are not the numbered partitions in sequences_human.bed.gz.
-# Keep aligned with alphagenome-pytorch/scripts/convert_borzoi_folds.py.
-# Each model holds out one validation partition and one test partition.
-_MODEL_HELD_OUT_FOLDS = {
-    "0": ("fold0", "fold1"),
-    "1": ("fold3", "fold4"),
-    "2": ("fold2", "fold5"),
-    "3": ("fold6", "fold7"),
-}
+# Model folds (AlphaGenome fold_0..fold_3) are not the numbered partitions
+# (fold0..fold7) in sequences_human.bed.gz. Each model holds out one validation
+# partition and one test partition, matching alphagenome.data.fold_intervals
+# and alphagenome-pytorch/scripts/convert_borzoi_folds.py.
 FOLD_MAPPING = {
-    model_fold: {
-        "train": [f"fold{i}" for i in range(8) if f"fold{i}" not in (valid, test)],
-        "valid": [valid],
-        "test": [test],
-    }
-    for model_fold, (valid, test) in _MODEL_HELD_OUT_FOLDS.items()
+    "0": {
+        "train": ["fold2", "fold3", "fold4", "fold5", "fold6", "fold7"],
+        "valid": ["fold0"],
+        "test": ["fold1"],
+    },
+    "1": {
+        "train": ["fold0", "fold1", "fold2", "fold5", "fold6", "fold7"],
+        "valid": ["fold3"],
+        "test": ["fold4"],
+    },
+    "2": {
+        "train": ["fold0", "fold1", "fold3", "fold4", "fold6", "fold7"],
+        "valid": ["fold2"],
+        "test": ["fold5"],
+    },
+    "3": {
+        "train": ["fold0", "fold1", "fold2", "fold3", "fold4", "fold5"],
+        "valid": ["fold6"],
+        "test": ["fold7"],
+    },
 }
 
 
