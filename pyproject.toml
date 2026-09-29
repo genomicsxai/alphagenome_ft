@@ -33,6 +33,7 @@ dependencies = [
     "optax>=0.2.7",
     "orbax-checkpoint>=0.4.0",
     "pandas>=2.0.0",
+    "pybigwig>=0.3.0",
     "requests>=2.0.0",
 ]
 

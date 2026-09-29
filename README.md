@@ -548,3 +548,31 @@ If you use the `pypi` environment, create it in the repo under Settings → Envi
 MIT License - see [LICENSE](LICENSE) file for details.
 
 This project extends [AlphaGenome](https://github.com/google-deepmind/alphagenome_research/), which has its own license terms.
+
+
+### Fold and target metadata alignment
+
+Model fold IDs are distinct from the eight partitions in the Borzoi sequence BED.
+`get_fold_split` and `prepare_intervals_from_fold` use these assignments, matching
+`alphagenome-pytorch/scripts/convert_borzoi_folds.py`:
+
+| Model | Validation partition | Test partition | Training partitions |
+| --- | --- | --- | --- |
+| fold_0 | fold0 | fold1 | fold2, fold3, fold4, fold5, fold6, fold7 |
+| fold_1 | fold3 | fold4 | fold0, fold1, fold2, fold5, fold6, fold7 |
+| fold_2 | fold2 | fold5 | fold0, fold1, fold3, fold4, fold6, fold7 |
+| fold_3 | fold6 | fold7 | fold0, fold1, fold2, fold3, fold4, fold5 |
+
+Numeric IDs (`0`–`3`) and model names (`fold_0`–`fold_3`, case insensitive)
+are accepted. Keep the pretrained model version aligned with the selected split.
+Explicit BED files bypass automatic partition assignment; their directory name
+alone does not establish provenance.
+Previous runs using the old automatic mapping are not corrected retroactively.
+
+Targets may specify `strand: "+"`, `strand: "-"`, or `strand: "."` explicitly.
+When omitted, `_forward`/`.forward`/`_plus`/`.plus` or a trailing `+` infer `+`,
+the matching reverse/minus suffixes or a trailing `-` infer `-`, and other labels
+are unstranded (`.`). Explicit strand values override label inference. Stranded
+targets must have equal numbers of positive and negative channels, listed in
+corresponding sample order, because AlphaGenome pairs the k-th `+` track with the
+k-th `-` track for reverse-complement reindexing.

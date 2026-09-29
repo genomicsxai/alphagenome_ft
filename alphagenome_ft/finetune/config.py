@@ -60,6 +60,11 @@ class TrackInfo:
     name: str
     path: Path
     nonzero_mean: float | None = None
+    strand: str | None = None  # Explicit +, -, or .; None infers from the label.
+
+    def __post_init__(self) -> None:
+        if self.strand not in (None, "+", "-", "."):
+            raise ValueError(f"Invalid strand {self.strand!r} for track {self.name!r}.")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -224,7 +229,7 @@ def _parse_targets(entries: Sequence[Mapping[str, Any]]) -> list[TrackInfo]:
             nonzero_mean = float(nonzero_mean)
         if not path.exists():
             raise FileNotFoundError(f'Target file not found: {path}')
-        tracks.append(TrackInfo(name=name, path=path, nonzero_mean=nonzero_mean))
+        tracks.append(TrackInfo(name=name, path=path, nonzero_mean=nonzero_mean, strand=item.get("strand")))
     return tracks
 
 
@@ -240,13 +245,27 @@ def _build_track_metadata(
     mapping so that the head constructor does not receive an empty dict.
     ``nonzero_mean`` values stored on each track are kept for use by the data
     pipeline but are not required for the metadata object itself.
+    Strand comes from ``TrackInfo.strand`` when given, otherwise from common
+    forward/reverse label suffixes (including Borzoi-style trailing ``+``/``-``).
     """
-    df = pd.DataFrame(
-        {
-            "name": [track.name for track in tracks],
-            "strand": ["+"] * len(tracks),
-        }
-    )
+    def infer_strand(name: str) -> str:
+        lowered = name.lower()
+        if lowered.endswith(("_forward", ".forward", "_plus", ".plus", "+")):
+            return "+"
+        if lowered.endswith(("_reverse", ".reverse", "_minus", ".minus", "-")):
+            return "-"
+        return "."
+
+    columns: dict[str, list[Any]] = {
+        "name": [track.name for track in tracks],
+        "strand": [track.strand if track.strand is not None else infer_strand(track.name) for track in tracks],
+    }
+    if columns["strand"].count("+") != columns["strand"].count("-"):
+        raise ValueError(
+            "Stranded targets require equal numbers of + and - tracks for reverse-complement "
+            "reindexing. Supply paired tracks in matching order, or strand='.' for unstranded targets."
+        )
+    df = pd.DataFrame(columns)
     # AlphaGenomeOutputMetadata stores per-output-type DataFrames as named
     # fields whose names are the lower-cased OutputType enum member names
     # (e.g. OutputType.RNA_SEQ -> field "rna_seq").
