@@ -106,33 +106,45 @@ _CHROMSIZES = {
     },
 }
 
+# Model folds (AlphaGenome fold_0..fold_3) are not the numbered partitions
+# (fold0..fold7) in sequences_human.bed.gz. Each model holds out one validation
+# partition and one test partition, matching alphagenome.data.fold_intervals
+# and alphagenome-pytorch/scripts/convert_borzoi_folds.py.
 FOLD_MAPPING = {
     "0": {
         "train": ["fold2", "fold3", "fold4", "fold5", "fold6", "fold7"],
-        "valid": ["fold1"],
-        "test": ["fold0"],
-    },
-    "1": {
-        "train": ["fold0", "fold3", "fold4", "fold5", "fold6", "fold7"],
-        "valid": ["fold2"],
+        "valid": ["fold0"],
         "test": ["fold1"],
     },
-    "2": {
-        "train": ["fold0", "fold1", "fold4", "fold5", "fold6", "fold7"],
+    "1": {
+        "train": ["fold0", "fold1", "fold2", "fold5", "fold6", "fold7"],
         "valid": ["fold3"],
-        "test": ["fold2"],
+        "test": ["fold4"],
+    },
+    "2": {
+        "train": ["fold0", "fold1", "fold3", "fold4", "fold6", "fold7"],
+        "valid": ["fold2"],
+        "test": ["fold5"],
     },
     "3": {
-        "train": ["fold0", "fold1", "fold2", "fold5", "fold6", "fold7"],
-        "valid": ["fold4"],
-        "test": ["fold3"],
+        "train": ["fold0", "fold1", "fold2", "fold3", "fold4", "fold5"],
+        "valid": ["fold6"],
+        "test": ["fold7"],
     },
 }
 
 
+def normalize_model_fold(fold: str | int) -> str:
+    """Accept numeric model IDs and AlphaGenome's fold_0/FOLD_0 names."""
+    key = str(fold).strip().lower().removeprefix("fold_")
+    if key not in FOLD_MAPPING:
+        raise ValueError(f"Invalid model fold {fold!r}; expected 0–3 or fold_0–fold_3.")
+    return key
+
+
 def build_split_lookup(fold_key: str) -> dict[str, str]:
     split_lookup: dict[str, str] = {}
-    mapping = FOLD_MAPPING[fold_key]
+    mapping = FOLD_MAPPING[normalize_model_fold(fold_key)]
     for split_name, fold_list in mapping.items():
         for fold_label in fold_list:
             split_lookup[fold_label] = split_name
@@ -217,7 +229,7 @@ def get_fold_split(
     """Create train/valid/test windows for a Borzoi-style fold split.
 
     Args:
-        fold: Fold identifier (``0``-``3``) used with ``FOLD_MAPPING``.
+        fold: Model fold (``0``–``3`` or ``fold_0``–``fold_3``), not a BED partition.
         window_size: Final window length centered on each source interval.
         organism: Organism key or alias (for example ``HOMO_SAPIENS`` or ``hg38``).
         bed_path: Optional BED/BED.GZ path containing ``chrom start end fold``.
@@ -233,10 +245,7 @@ def get_fold_split(
     """
     organism = _normalize_organism(organism)
 
-    fold_key = str(fold)
-    if fold_key not in FOLD_MAPPING:
-        valid = ", ".join(sorted(FOLD_MAPPING))
-        raise ValueError(f"Invalid fold '{fold}'. Valid folds: {valid}")
+    fold_key = normalize_model_fold(fold)
 
     if bed_path is None:
         if organism not in _DEFAULT_INTERVALS:

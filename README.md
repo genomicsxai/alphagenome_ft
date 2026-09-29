@@ -4,6 +4,16 @@ A lightweight Python package for finetuning [Google DeepMind's AlphaGenome](http
 
 **Project leads - [Alan Murphy](https://al-murphy.github.io/), [Masayuki (Moon) Nagai](https://masayukinagai.github.io/), [Alejandro Buendia](https://abuendia.github.io/)**
 
+> [!WARNING]
+> 🐛 **Bug fix: fold splits (fixed in 0.1.12).** In versions up to and including
+> 0.1.11, `get_fold_split` and `prepare_intervals_from_fold` held out the wrong
+> Borzoi partitions. As a result, splits did not match the pretrained AlphaGenome
+> fold checkpoints. Starting in 0.1.12, the mapping matches AlphaGenome and Borzoi
+> for all four folds. Runs that used the
+> automatic fold splits should be retrained and re-evaluated. Runs that passed their
+> own train/valid/test BED files are unaffected. See
+> [Fold and target metadata alignment](#fold-and-target-metadata-alignment) for more.
+
 ## Use cases
 
 - If you want to apply AlphaGenome to your MPRA (or other perturbation) data of interest, see [Encoder-only / short sequences (MPRA)](#workflow-1-encoder-only--short-sequences-mpra). [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/finetune_encoder_only_mpra.ipynb)
@@ -548,3 +558,28 @@ If you use the `pypi` environment, create it in the repo under Settings → Envi
 MIT License - see [LICENSE](LICENSE) file for details.
 
 This project extends [AlphaGenome](https://github.com/google-deepmind/alphagenome_research/), which has its own license terms.
+
+
+### Fold and target metadata alignment
+
+Model fold IDs are distinct from the eight partitions in the Borzoi sequence BED.
+`get_fold_split` and `prepare_intervals_from_fold` use these assignments, matching
+`alphagenome-pytorch/scripts/convert_borzoi_folds.py`:
+
+| Model | Validation partition | Test partition | Training partitions |
+| --- | --- | --- | --- |
+| fold_0 | fold0 | fold1 | fold2, fold3, fold4, fold5, fold6, fold7 |
+| fold_1 | fold3 | fold4 | fold0, fold1, fold2, fold5, fold6, fold7 |
+| fold_2 | fold2 | fold5 | fold0, fold1, fold3, fold4, fold6, fold7 |
+| fold_3 | fold6 | fold7 | fold0, fold1, fold2, fold3, fold4, fold5 |
+
+Numeric IDs (`0`–`3`) and model names (`fold_0`–`fold_3`, case insensitive)
+are accepted. Keep the pretrained model version aligned with the selected split.
+
+Targets may specify `strand: "+"`, `strand: "-"`, or `strand: "."` explicitly.
+When omitted, `_forward`/`.forward`/`_plus`/`.plus` or a trailing `+` infer `+`,
+the matching reverse/minus suffixes or a trailing `-` infer `-`, and other labels
+are unstranded (`.`). Explicit strand values override label inference. Stranded
+targets must have equal numbers of positive and negative channels, listed in
+corresponding sample order, because AlphaGenome pairs the k-th `+` track with the
+k-th `-` track for reverse-complement reindexing.
