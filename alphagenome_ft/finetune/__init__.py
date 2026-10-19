@@ -17,6 +17,7 @@ from alphagenome_ft.finetune.data import (
     prepare_intervals_from_split,
     build_fasta_index,
     prepare_batch,
+    compute_track_nonzero_means,
 )
 from alphagenome_ft.finetune.train import (
     register_predefined_heads,
@@ -41,6 +42,7 @@ __all__ = [
     'prepare_intervals_from_split',
     'build_fasta_index',
     'prepare_batch',
+    'compute_track_nonzero_means',
     # train
     'register_predefined_heads',
     'create_optimizer',

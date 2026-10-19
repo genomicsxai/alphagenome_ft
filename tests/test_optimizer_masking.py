@@ -48,6 +48,88 @@ def test_heads_only_optimizer_fake_param_tree():
     jax.tree_util.tree_map(assert_head_moved, params, new_params, labels)
 
 
+def test_heads_plus_lora_optimizer_freezes_pretrained_backbone_weights():
+    params = {
+        "alphagenome": {
+            "transformer_tower": {
+                "q_layer": {
+                    "w": jnp.ones((2, 3)),
+                    "lora_a": jnp.ones((2, 1)),
+                    "lora_b": jnp.ones((1, 3)),
+                }
+            },
+            "head": {"my_task": {"w": jnp.ones((3, 1))}},
+        }
+    }
+    optimizer = create_optimizer(
+        params,
+        trainable_head_names=("my_task",),
+        learning_rate=1e-2,
+        weight_decay=None,
+        heads_only=True,
+        train_lora=True,
+    )
+    state = optimizer.init(params)
+    grads = jax.tree_util.tree_map(jnp.ones_like, params)
+    updates, _ = optimizer.update(grads, state, params)
+
+    q_updates = updates["alphagenome"]["transformer_tower"]["q_layer"]
+    assert jnp.allclose(q_updates["w"], 0)
+    assert not jnp.allclose(q_updates["lora_a"], 0)
+    assert not jnp.allclose(q_updates["lora_b"], 0)
+    assert not jnp.allclose(updates["alphagenome"]["head"]["my_task"]["w"], 0)
+
+
+def test_heads_only_with_train_lora_still_updates_lora_after_freeze_backbone():
+    """train(heads_only=True, train_lora=True) calls freeze_backbone() first.
+
+    freeze_backbone applies stop_gradient eagerly, which does not persist into
+    the later jax.grad over params, so LoRA leaves (B starts at zero) must still
+    receive gradients and updates while pretrained weights stay fixed.
+    """
+    from alphagenome_ft import parameter_utils
+    from alphagenome_ft.finetune.train import (
+        _label_params_for_heads,
+        stop_frozen_parameter_gradients,
+    )
+
+    params = {
+        "alphagenome/transformer_tower/mha_block/q_layer": {
+            "w": jnp.full((2, 3), 0.5),
+            "lora_a": jnp.full((2, 1), 0.3),
+            "lora_b": jnp.zeros((1, 3)),
+        },
+        "alphagenome/head/my_task": {"w": jnp.ones((3, 1))},
+    }
+    params = parameter_utils.freeze_backbone(params)
+    labels = _label_params_for_heads(params, ["my_task"], include_lora=True)
+    x = jnp.array([[1.0, -2.0]])
+
+    def loss_fn(p):
+        p = stop_frozen_parameter_gradients(p, labels)
+        q = p["alphagenome/transformer_tower/mha_block/q_layer"]
+        hidden = x @ q["w"] + (x @ q["lora_a"]) @ q["lora_b"]
+        return jnp.sum(jnp.square(hidden @ p["alphagenome/head/my_task"]["w"] - 1.0))
+
+    grads = jax.grad(loss_fn)(params)
+    q_grads = grads["alphagenome/transformer_tower/mha_block/q_layer"]
+    assert jnp.allclose(q_grads["w"], 0)
+    assert not jnp.allclose(q_grads["lora_b"], 0)
+
+    optimizer = create_optimizer(
+        params,
+        trainable_head_names=("my_task",),
+        learning_rate=1e-2,
+        weight_decay=None,
+        heads_only=True,
+        train_lora=True,
+    )
+    updates, _ = optimizer.update(grads, optimizer.init(params), params)
+    q_updates = updates["alphagenome/transformer_tower/mha_block/q_layer"]
+    assert jnp.allclose(q_updates["w"], 0)
+    assert not jnp.allclose(q_updates["lora_b"], 0)
+
+
 @pytest.mark.skipif(
     not kaggle_credentials_available(),
     reason="Kaggle credentials required for model fixture (~/.kaggle/kaggle.json or env)",

@@ -19,7 +19,6 @@ from alphagenome_ft import parameter_utils
 from alphagenome_ft.custom_model import CustomAlphaGenomeModel
 from alphagenome_ft.finetune.config import HeadSpec
 from alphagenome_ft.finetune.data import BigWigDataModule, prepare_batch
-from alphagenome_ft.optimizer_utils import create_optimizer
 
 
 def register_predefined_heads(head_specs: Sequence[HeadSpec]) -> None:
@@ -63,15 +62,32 @@ def _is_trainable_head_path(path_str: str, trainable_heads: set[str]) -> bool:
     return False
 
 
-def _label_params_for_heads(params, trainable_heads: Sequence[str]):
-    """Label model parameters as trainable head params vs frozen params."""
+def _label_params_for_heads(
+    params,
+    trainable_heads: Sequence[str],
+    *,
+    include_lora: bool = False,
+):
+    """Label model parameters as trainable head/LoRA params vs frozen params."""
     head_set = {str(name) for name in trainable_heads}
 
     def label_fn(path, _value):
         path_str = _keypath_to_str(path)
-        return "head" if _is_trainable_head_path(path_str, head_set) else "frozen"
+        is_lora = path_str.rsplit("/", 1)[-1] in {"lora_a", "lora_b"}
+        trainable = _is_trainable_head_path(path_str, head_set) or (
+            include_lora and is_lora
+        )
+        return "head" if trainable else "frozen"
 
     return jax.tree_util.tree_map_with_path(label_fn, params)
+
+
+def stop_frozen_parameter_gradients(params, labels):
+    """Freeze weight derivatives while retaining derivatives through activations."""
+    return jax.tree_util.tree_map(
+        lambda parameter, label: parameter if label == "head" else jax.lax.stop_gradient(parameter),
+        params, labels,
+    )
 
 
 def create_optimizer(
@@ -80,8 +96,35 @@ def create_optimizer(
     learning_rate: float,
     weight_decay: float,
     heads_only: bool,
+    train_lora: bool = False,
+    max_grad_norm: float | None = None,
 ):
-    """Create optimizer for full finetuning or heads-only finetuning."""
+    """Create optimizer for full finetuning or heads-only finetuning.
+
+    Args:
+        params: Parameter PyTree used to build the trainable/frozen labels.
+        trainable_head_names: Head ids to keep trainable when ``heads_only``.
+        learning_rate: Scalar LR or Optax schedule for AdamW.
+        weight_decay: AdamW decoupled weight decay.
+        heads_only: If True, mask updates outside heads (and LoRA) to zero.
+        train_lora: Also train ``lora_a``/``lora_b`` leaves.
+        max_grad_norm: If set (and > 0), clip gradients by global norm. This
+            matches the PyTorch pipeline's ``--max-grad-norm`` default of 1.0.
+
+    Note:
+        When ``heads_only`` is True the clip is installed *inside* the ``head``
+        branch of the ``multi_transform`` rather than in front of it. Backbone
+        gradients supplied by other callers may be nonzero. The trainer now
+        stops frozen parameter gradients inside the differentiated function.
+        Clipping inside the branch always computes the norm over the
+        trainable leaves only, which is what
+        ``torch.nn.utils.clip_grad_norm_(trainable_params, ...)`` does.
+    """
+    def _with_clipping(tx: optax.GradientTransformation) -> optax.GradientTransformation:
+        if max_grad_norm is None or max_grad_norm <= 0:
+            return tx
+        return optax.chain(optax.clip_by_global_norm(max_grad_norm), tx)
+
     if heads_only:
         head_set = {str(name) for name in trainable_head_names}
         head_paths = parameter_utils.get_head_parameter_paths(params)
@@ -93,15 +136,28 @@ def create_optimizer(
                 f"Names tried: {sorted(head_set)}. "
                 f"Head parameter sample: {sample_paths}"
             )
-        param_labels = _label_params_for_heads(params, trainable_head_names)
+        param_labels = _label_params_for_heads(
+            params,
+            trainable_head_names,
+            include_lora=train_lora,
+        )
+        if train_lora:
+            all_paths = parameter_utils.get_parameter_paths(params)
+            if not any(
+                path.rsplit("/", 1)[-1] in {"lora_a", "lora_b"}
+                for path in all_paths
+            ):
+                raise ValueError("train_lora=True but no lora_a/lora_b parameters were found.")
         return optax.multi_transform(
             {
-                "head": optax.adamw(learning_rate, weight_decay=weight_decay),
+                "head": _with_clipping(
+                    optax.adamw(learning_rate, weight_decay=weight_decay)
+                ),
                 "frozen": optax.set_to_zero(),
             },
             param_labels,
         )
-    return optax.adamw(learning_rate, weight_decay=weight_decay)
+    return _with_clipping(optax.adamw(learning_rate, weight_decay=weight_decay))
 
 
 def _replicate_tree(tree, devices):
@@ -136,7 +192,7 @@ def _shard_batch(batch: Mapping[str, jax.Array], num_devices: int):
         per_device_batch = value.shape[0] // num_devices
         return value.reshape((num_devices, per_device_batch, *value.shape[1:]))
 
-    return {name: shard_array(name, value) for name, value in batch.items()}
+    return {name: shard_array(value) for name, value in batch.items()}
 
 
 def train(
@@ -149,6 +205,7 @@ def train(
     num_epochs: int,
     seed: int = 42,
     max_train_steps: int | None = None,
+    max_grad_norm: float | None = 1.0,
     heads_only: bool = False,
     checkpoint_dir: Path | None = None,
     organism: str = "HOMO_SAPIENS",
@@ -156,6 +213,7 @@ def train(
     best_metric_mode: str = "min",
     early_stopping_patience: int = 0,
     early_stopping_min_delta: float = 0.0,
+    early_stopping_min_epochs: int = 0,
     verbose: bool = False,
     use_wandb: bool = False,
     wandb_project: str | None = None,
@@ -163,6 +221,7 @@ def train(
     wandb_run_name: str | None = None,
     wandb_config: dict | None = None,
     num_devices: int = 1,
+    train_lora: bool = False,
 ) -> None:
     """Run fine-tuning with pmapped train/eval steps.
 
@@ -175,6 +234,10 @@ def train(
         num_epochs: Maximum number of epochs to run.
         seed: Base RNG seed used for per-epoch training shuffles.
         max_train_steps: Optional global cap on optimizer updates across all epochs.
+        max_grad_norm: Clip gradients to this global norm before the AdamW
+            update. Defaults to 1.0 to match the PyTorch pipeline's
+            ``--max-grad-norm`` default. Pass ``None`` (or 0) to disable
+            clipping, which reproduces the pre-parity JAX behaviour.
         heads_only: If True, freeze backbone and optimize selected heads only.
         checkpoint_dir: Optional output directory for ``best``/``last`` checkpoints.
         organism: Organism enum name used for model organism indexing.
@@ -182,6 +245,7 @@ def train(
         best_metric_mode: Improvement direction for ``best_metric`` (``min`` or ``max``).
         early_stopping_patience: Stop after this many non-improving epochs (0 disables).
         early_stopping_min_delta: Minimum metric change required to count as improvement.
+        early_stopping_min_epochs: Do not stop before this many epochs have completed.
         verbose: If True, print per-step progress and extra diagnostics.
         use_wandb: If True, log metrics to Weights & Biases.
         wandb_project: Optional W&B project name override.
@@ -189,6 +253,7 @@ def train(
         wandb_run_name: Optional W&B run-name override.
         wandb_config: Optional extra config keys to merge into W&B config.
         num_devices: Number of local devices to use. Defaults to single-device.
+        train_lora: Train LoRA adapter leaves in addition to the selected heads.
 
     Notes:
         Total planned steps are computed before training from train-set size and
@@ -247,6 +312,7 @@ def train(
         wb_config = {
             "learning_rate": learning_rate,
             "weight_decay": weight_decay,
+            "max_grad_norm": max_grad_norm,
             "num_epochs": num_epochs,
             "batch_size": data_module._batch_size,
             "steps_per_epoch": steps_per_epoch,
@@ -254,9 +320,11 @@ def train(
             "heads_only": heads_only,
             "organism": organism,
             "num_devices": num_devices,
+            "train_lora": train_lora,
             "best_metric": best_metric,
             "best_metric_mode": best_metric_mode,
             "early_stopping_patience": early_stopping_patience,
+            "early_stopping_min_epochs": early_stopping_min_epochs,
             "seed": seed,
             **(wandb_config or {}),
         }
@@ -282,6 +350,8 @@ def train(
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         heads_only=heads_only,
+        train_lora=train_lora,
+        max_grad_norm=max_grad_norm,
     )
     opt_state = optimizer.init(model._params)
 
@@ -290,10 +360,16 @@ def train(
     strand_reindexing = model._metadata[organism_enum].strand_reindexing
 
     loss_fns = {name: model.create_loss_fn_for_head(name) for name in head_names}
+    trainable_labels = (
+        _label_params_for_heads(model._params, head_names, include_lora=train_lora)
+        if heads_only else None
+    )
 
     @functools.partial(jax.pmap, axis_name="data")
     def train_step(params, state, current_opt_state, batch):
         def loss_fn(current_params):
+            if trainable_labels is not None:
+                current_params = stop_frozen_parameter_gradients(current_params, trainable_labels)
             predictions = model._predict(
                 current_params,
                 state,
@@ -301,6 +377,7 @@ def train(
                 batch["organism_index"],
                 negative_strand_mask=batch["negative_strand_mask"],
                 strand_reindexing=batch["strand_reindexing"],
+                requested_outputs=frozenset(),
             )
             total_loss = 0.0
             for head_name in head_names:
@@ -330,6 +407,7 @@ def train(
             batch["organism_index"],
             negative_strand_mask=batch["negative_strand_mask"],
             strand_reindexing=batch["strand_reindexing"],
+            requested_outputs=frozenset(),
         )
         head_losses = {}
         for head_name in head_names:
@@ -500,7 +578,11 @@ def train(
                 model._state = _unreplicate_tree(replicated_state)
                 model.save_checkpoint(checkpoint_dir / "last", save_full_model=False)
 
-            if early_stopping_patience > 0 and epochs_since_improvement >= early_stopping_patience:
+            if (
+                early_stopping_patience > 0
+                and epoch >= early_stopping_min_epochs
+                and epochs_since_improvement >= early_stopping_patience
+            ):
                 print(f"\n  Early stopping: no improvement for {epochs_since_improvement} epoch(s)")
                 break
             if stop_training:

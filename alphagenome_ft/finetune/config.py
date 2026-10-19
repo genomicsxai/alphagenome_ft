@@ -243,8 +243,8 @@ def _build_track_metadata(
     The returned metadata is used to initialise predefined heads, which derive
     their output dimensionality (num_tracks) from it.  We always return a valid
     mapping so that the head constructor does not receive an empty dict.
-    ``nonzero_mean`` values stored on each track are kept for use by the data
-    pipeline but are not required for the metadata object itself.
+    Optional ``nonzero_mean`` values are embedded in the track metadata so the
+    upstream GenomeTracksHead applies the same scaling as the PyTorch port.
     Strand comes from ``TrackInfo.strand`` when given, otherwise from common
     forward/reverse label suffixes (including Borzoi-style trailing ``+``/``-``).
     """
@@ -265,6 +265,11 @@ def _build_track_metadata(
             "Stranded targets require equal numbers of + and - tracks for reverse-complement "
             "reindexing. Supply paired tracks in matching order, or strand='.' for unstranded targets."
         )
+    if any(track.nonzero_mean is not None for track in tracks):
+        columns["nonzero_mean"] = [
+            1.0 if track.nonzero_mean is None else float(track.nonzero_mean)
+            for track in tracks
+        ]
     df = pd.DataFrame(columns)
     # AlphaGenomeOutputMetadata stores per-output-type DataFrames as named
     # fields whose names are the lower-cased OutputType enum member names
