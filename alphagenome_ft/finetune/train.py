@@ -90,6 +90,28 @@ def stop_frozen_parameter_gradients(params, labels):
     )
 
 
+def _resolve_lora_training_mode(
+    model: CustomAlphaGenomeModel,
+    *,
+    heads_only: bool | None,
+    train_lora: bool | None,
+) -> tuple[bool, bool]:
+    """Infer safe trainer defaults and reject accidental full-backbone LoRA runs."""
+    has_backbone_lora = getattr(model, "_backbone_lora_config", None) is not None
+    resolved_train_lora = has_backbone_lora if train_lora is None else train_lora
+    if heads_only is None:
+        resolved_heads_only = has_backbone_lora or resolved_train_lora
+    else:
+        resolved_heads_only = heads_only
+    if resolved_train_lora and not resolved_heads_only:
+        raise ValueError(
+            "train_lora=True requires heads_only=True; otherwise the pretrained "
+            "backbone would also be updated. Pass heads_only=True, or set "
+            "train_lora=False for full-model finetuning."
+        )
+    return bool(resolved_heads_only), bool(resolved_train_lora)
+
+
 def create_optimizer(
     params,
     trainable_head_names: Sequence[str],
@@ -206,7 +228,7 @@ def train(
     seed: int = 42,
     max_train_steps: int | None = None,
     max_grad_norm: float | None = 1.0,
-    heads_only: bool = False,
+    heads_only: bool | None = None,
     checkpoint_dir: Path | None = None,
     organism: str = "HOMO_SAPIENS",
     best_metric: str = "valid_loss",
@@ -221,7 +243,7 @@ def train(
     wandb_run_name: str | None = None,
     wandb_config: dict | None = None,
     num_devices: int = 1,
-    train_lora: bool = False,
+    train_lora: bool | None = None,
 ) -> None:
     """Run fine-tuning with pmapped train/eval steps.
 
@@ -238,7 +260,9 @@ def train(
             update. Defaults to 1.0 to match the PyTorch pipeline's
             ``--max-grad-norm`` default. Pass ``None`` (or 0) to disable
             clipping, which reproduces the pre-parity JAX behaviour.
-        heads_only: If True, freeze backbone and optimize selected heads only.
+        heads_only: If True, freeze the backbone and optimize selected heads
+            only. ``None`` (the default) enables this automatically for a model
+            created with ``backbone_lora_config`` or when ``train_lora=True``.
         checkpoint_dir: Optional output directory for ``best``/``last`` checkpoints.
         organism: Organism enum name used for model organism indexing.
         best_metric: Metric name used for best-checkpoint and early-stopping tracking.
@@ -254,6 +278,10 @@ def train(
         wandb_config: Optional extra config keys to merge into W&B config.
         num_devices: Number of local devices to use. Defaults to single-device.
         train_lora: Train LoRA adapter leaves in addition to the selected heads.
+            ``None`` (the default) enables this automatically when the model was
+            created with ``backbone_lora_config``. ``train_lora=True`` with
+            ``heads_only=False`` is rejected to prevent accidental full-backbone
+            updates.
 
     Notes:
         Total planned steps are computed before training from train-set size and
@@ -305,6 +333,12 @@ def train(
             f"device(s) are available."
         )
     devices = available_devices[:num_devices]
+
+    heads_only, train_lora = _resolve_lora_training_mode(
+        model,
+        heads_only=heads_only,
+        train_lora=train_lora,
+    )
 
     if use_wandb:
         import wandb

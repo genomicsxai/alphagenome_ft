@@ -115,7 +115,9 @@ def create_optimizer(
             for AdamW beyond its default).
         heads_only: If True, apply ``optax.multi_transform`` head vs frozen masking.
         optimizer_type: ``\"adamw\"`` or ``\"adam\"``.
-        gradient_clip_global_norm: If set, prepend ``optax.clip_by_global_norm``.
+        gradient_clip_global_norm: If set, clip the global norm of trainable
+            leaves. Frozen gradients are excluded, matching
+            ``torch.nn.utils.clip_grad_norm_(trainable_params, ...)``.
         train_lora: Include all ``lora_a``/``lora_b`` leaves in the trainable mask.
 
     Returns:
@@ -126,6 +128,16 @@ def create_optimizer(
         optimizer_type=optimizer_type,
         weight_decay=weight_decay,
     )
+
+    def with_clipping(
+        tx: optax.GradientTransformation,
+    ) -> optax.GradientTransformation:
+        if gradient_clip_global_norm is None or gradient_clip_global_norm <= 0:
+            return tx
+        return optax.chain(
+            optax.clip_by_global_norm(gradient_clip_global_norm),
+            tx,
+        )
 
     if heads_only:
         assert_trainable_head_params_exist(params, trainable_head_names)
@@ -140,13 +152,9 @@ def create_optimizer(
         ):
             raise ValueError("train_lora=True but no lora_a/lora_b parameters were found.")
         inner = optax.multi_transform(
-            {"head": inner, "frozen": optax.set_to_zero()},
+            {"head": with_clipping(inner), "frozen": optax.set_to_zero()},
             labels,
         )
+        return inner
 
-    if gradient_clip_global_norm is not None:
-        return optax.chain(
-            optax.clip_by_global_norm(gradient_clip_global_norm),
-            inner,
-        )
-    return inner
+    return with_clipping(inner)

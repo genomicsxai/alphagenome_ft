@@ -75,6 +75,51 @@ def test_nonzero_means_reject_infinite_values(monkeypatch):
         data_module.compute_track_nonzero_means([Path("bad.bw")], intervals)
 
 
+def test_prepare_head_specs_can_compute_missing_nonzero_means(
+    monkeypatch, tmp_path
+):
+    paths = [tmp_path / "sample_forward.bw", tmp_path / "sample_reverse.bw"]
+    for path in paths:
+        path.touch()
+    observed = {}
+
+    def fake_means(bigwig_paths, intervals, *, max_samples, strand_pair_groups):
+        observed["paths"] = bigwig_paths
+        observed["intervals"] = intervals
+        observed["max_samples"] = max_samples
+        observed["pairs"] = strand_pair_groups
+        return np.array([2.5, 2.5], dtype=np.float32)
+
+    monkeypatch.setattr(data_module, "compute_track_nonzero_means", fake_means)
+    intervals = [SimpleNamespace(chromosome="chr1", start=0, end=4)]
+    specs = config_module.prepare_head_specs(
+        {
+            "heads": [
+                {
+                    "id": "computed_rna",
+                    "source": "predefined",
+                    "kind": "rna_seq",
+                    "targets": [
+                        {"path": str(paths[0]), "label": "sample_forward"},
+                        {"path": str(paths[1]), "label": "sample_reverse"},
+                    ],
+                }
+            ]
+        },
+        organism="HOMO_SAPIENS",
+        nonzero_mean_intervals=intervals,
+        nonzero_mean_max_samples=17,
+    )
+
+    assert [track.nonzero_mean for track in specs[0].tracks] == [2.5, 2.5]
+    assert observed == {
+        "paths": paths,
+        "intervals": intervals,
+        "max_samples": 17,
+        "pairs": [(0, 1)],
+    }
+
+
 def test_validation_keeps_bed_order_with_partial_batch(monkeypatch):
     """The final singleton affects a mean-of-batch-means validation loss."""
     module = object.__new__(data_module.BigWigDataModule)

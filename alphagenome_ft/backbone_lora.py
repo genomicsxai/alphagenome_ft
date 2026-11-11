@@ -57,12 +57,25 @@ class BackboneLoRAConfig:
         return tuple(dict.fromkeys(_TARGET_ALIASES[target] for target in self.targets))
 
 
-def _call_with_optional_training(module, *args, is_training: bool):
+def _call_with_optional_training(
+    module,
+    *args,
+    is_training: bool,
+    **optional_kwargs,
+):
     """Call old and new alphagenome_research module signatures."""
     try:
-        return module(*args, is_training=is_training)
+        return module(*args, is_training=is_training, **optional_kwargs)
     except TypeError as exc:
-        if "is_training" not in str(exc):
+        message = str(exc)
+        unsupported_optional = any(name in message for name in optional_kwargs)
+        if unsupported_optional:
+            return _call_with_optional_training(
+                module,
+                *args,
+                is_training=is_training,
+            )
+        if "is_training" not in message:
             raise
         return module(*args)
 
@@ -276,7 +289,10 @@ class BackboneLoRAAlphaGenome(hk.Module):
     def __call__(self, dna_sequence, organism_index, *, is_training: bool = False):
         num_organisms = self._num_organisms
         trunk, intermediates = _call_with_optional_training(
-            model_lib.SequenceEncoder(), dna_sequence, is_training=is_training
+            model_lib.SequenceEncoder(),
+            dna_sequence,
+            is_training=is_training,
+            remat=self._config.gradient_checkpointing,
         )
         if num_organisms >= 1:
             if hasattr(embeddings_module, "create_default_embedding"):
@@ -290,21 +306,42 @@ class BackboneLoRAAlphaGenome(hk.Module):
         trunk, pair_activations = BackboneLoRATransformerTower(self._config)(
             trunk, is_training=is_training
         )
-        decoded = _call_with_optional_training(
-            (BackboneLoRASequenceDecoder() if self._config.gradient_checkpointing
-             else model_lib.SequenceDecoder()),
-            trunk,
-            intermediates,
-            is_training=is_training,
-        )
+        decoder = model_lib.SequenceDecoder()
+        try:
+            decoded = decoder(
+                trunk,
+                intermediates,
+                is_training=is_training,
+                remat=self._config.gradient_checkpointing,
+            )
+        except TypeError as exc:
+            if "remat" not in str(exc):
+                raise
+            decoded = _call_with_optional_training(
+                (BackboneLoRASequenceDecoder()
+                 if self._config.gradient_checkpointing else decoder),
+                trunk,
+                intermediates,
+                is_training=is_training,
+            )
         embeddings_128bp = _call_output_embedder(
             embeddings_module.OutputEmbedder(num_organisms),
             trunk,
             organism_index,
             is_training=is_training,
         )
+        output_embedder_1bp = embeddings_module.OutputEmbedder(num_organisms)
+        if (
+            self._config.gradient_checkpointing
+            and hasattr(layers, "maybe_hk_remat")
+        ):
+            output_embedder_1bp = layers.maybe_hk_remat(
+                output_embedder_1bp,
+                True,
+                static_argnames=("is_training",),
+            )
         embeddings_1bp = _call_output_embedder(
-            embeddings_module.OutputEmbedder(num_organisms),
+            output_embedder_1bp,
             decoded,
             organism_index,
             is_training=is_training,

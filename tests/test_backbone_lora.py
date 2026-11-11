@@ -34,6 +34,16 @@ def test_backbone_lora_config_maps_pytorch_projection_names():
         BackboneLoRAConfig(targets=("k_proj",))
 
 
+def test_optional_remat_keyword_is_backward_compatible():
+    class LegacyModule:
+        def __call__(self, value, *, is_training):
+            return value + int(is_training)
+
+    assert _call_with_optional_training(
+        LegacyModule(), 2, is_training=True, remat=True
+    ) == 3
+
+
 def test_lora_mha_starts_as_exact_pretrained_noop():
     x = jnp.ones((1, 4, 32), dtype=jnp.bfloat16)
     bias = jnp.zeros((1, 8, 4, 4), dtype=jnp.float32)
@@ -147,7 +157,9 @@ def test_full_lora_trunk_matches_native_alphagenome_at_init(gradient_checkpointi
 
     def native_forward(dna, organism):
         with hk.mixed_precision.push_policy(model_lib.AlphaGenome, policy):
-            return model_lib.AlphaGenome({})(dna, organism)[1]
+            return model_lib.AlphaGenome(
+                {}, remat=gradient_checkpointing
+            )(dna, organism)[1]
 
     def lora_forward(dna, organism):
         with hk.mixed_precision.push_policy(BackboneLoRAAlphaGenome, policy):

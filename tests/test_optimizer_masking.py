@@ -80,6 +80,41 @@ def test_heads_plus_lora_optimizer_freezes_pretrained_backbone_weights():
     assert not jnp.allclose(updates["alphagenome"]["head"]["my_task"]["w"], 0)
 
 
+def test_heads_only_clipping_excludes_frozen_gradients(monkeypatch):
+    """Match PyTorch clipping over trainable parameters, not the whole tree."""
+    from alphagenome_ft import optimizer_utils
+
+    params = {
+        "alphagenome": {
+            "backbone": {"w": jnp.array([0.0])},
+            "head": {"my_task": {"w": jnp.array([0.0])}},
+        }
+    }
+    grads = {
+        "alphagenome": {
+            "backbone": {"w": jnp.array([400.0])},
+            "head": {"my_task": {"w": jnp.array([3.0])}},
+        }
+    }
+    monkeypatch.setattr(
+        optimizer_utils,
+        "_build_adam_or_adamw",
+        lambda *_args, **_kwargs: optax.identity(),
+    )
+    optimizer = create_optimizer(
+        params,
+        trainable_head_names=("my_task",),
+        learning_rate=1.0,
+        heads_only=True,
+        gradient_clip_global_norm=1.0,
+    )
+
+    updates, _ = optimizer.update(grads, optimizer.init(params), params)
+
+    assert jnp.allclose(updates["alphagenome"]["backbone"]["w"], 0)
+    assert jnp.allclose(updates["alphagenome"]["head"]["my_task"]["w"], 1.0)
+
+
 def test_heads_only_with_train_lora_still_updates_lora_after_freeze_backbone():
     """train(heads_only=True, train_lora=True) calls freeze_backbone() first.
 
