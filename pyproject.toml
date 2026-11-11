@@ -25,7 +25,8 @@ classifiers = [
 dependencies = [
     "aiohttp>=3.0.0",
     # alphagenome_research (June 2026+) moved io/fasta into the base package and requires >=0.7.0.
-    "alphagenome>=0.7.0",
+    # AlphaGenome 2.x removed the models.dna_output API used throughout this package.
+    "alphagenome>=0.7.0,<2",
     "dm-haiku>=0.0.10",
     # orbax-checkpoint imports flax internally (tree utils); not always pulled as a transitive dep.
     "flax>=0.8.0",
