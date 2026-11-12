@@ -1,206 +1,164 @@
-## Tutorial: LoRA Adapters in `alphagenome-ft`
+# LoRA adapters
 
-This tutorial explains how to use the **built‑in LoRA (Low‑Rank Adaptation) utilities** in `alphagenome-ft` to perform parameter‑efficient finetuning of AlphaGenome, and how this is instantiated in the ATAC demo notebook `notebooks/finetune_atac_lora.ipynb`.
+`alphagenome-ft` supports LoRA inside AlphaGenome's transformer backbone. The
+implementation mirrors the default LoRA mode in `alphagenome-pytorch`:
 
-The package now provides:
-- **LoRA building blocks** in `alphagenome_ft.lora` (`LoRAConfig`, `LoRALinear`, parameter‑count helpers).
-- **Parameter inspection and freezing utilities** in `alphagenome_ft.parameter_utils`.
-- A standard training loop (`alphagenome_ft.finetune.train.train`) that works with LoRA‑equipped heads.
+- adapters are added to the query and value projections in all nine attention
+  blocks (`q_proj`/`v_proj` in PyTorch, `q_layer`/`v_layer` in JAX);
+- rank defaults to 8 and alpha defaults to 16, for a scale of `alpha / rank`;
+- A uses the same bounds as PyTorch `nn.Linear`'s Kaiming-uniform default and B
+  is initialized to zero, so the adapted trunk is an exact pretrained no-op at
+  initialization;
+- the pretrained trunk is frozen while the selected heads and adapter matrices
+  are trained; and
+- gradient clipping defaults to a global norm of 1.0 over trainable parameters.
 
-### 1. When to Use LoRA vs Heads‑Only Finetuning
+At rank 8 with both default targets, the backbone has 308,736 trainable LoRA
+scalars.
 
-**Heads‑only finetuning**:
-- Adds a new task‑specific head on top of frozen AlphaGenome embeddings.
-- Trains only the head parameters; the backbone remains frozen.
-- Works well when a shallow mapping from embeddings to targets is sufficient.
+See the [changelog](../CHANGELOG.md) for changes to gradient-clipping defaults
+and `nonzero_mean` scaling, including older-checkpoint compatibility.
 
-**LoRA finetuning**:
-- Still keeps the AlphaGenome backbone **frozen**, but adds small trainable low‑rank matrices inside your head’s linear projections.
-- Increases expressivity with **very few additional parameters**, often improving over heads‑only training while retaining low memory and compute cost.
+## Create a backbone-LoRA model
 
-Use **LoRA** when:
-- Full‑model finetuning is too expensive.
-- Heads‑only finetuning has saturated and you need a richer adapter without unfreezing the backbone.
-
-### 2. Built‑In LoRA Utilities (`alphagenome_ft.lora`)
-
-`alphagenome_ft.lora` provides:
-
-- **`LoRAConfig`**  
-  - `rank`: low‑rank dimension (e.g. 4, 8, 16).  
-  - `alpha`: scaling factor; effective scale is \( \alpha / \text{rank} \). Setting `alpha == rank` yields scale 1.
-
-- **`LoRALinear`**  
-  - A Haiku module that augments a linear projection with a LoRA adapter.  
-  - Parameters:
-    - Base weight `w` (typically kept frozen).
-    - Low‑rank matrices `lora_a`, `lora_b` (trainable).  
-  - Optional bias term `b` controlled by `with_bias`.  
-  - Designed so that the parameters are named `w`, `lora_a`, `lora_b`, matching AlphaGenome’s linear‑layer conventions and integrating cleanly with checkpoints.
-
-- **`get_lora_parameter_paths(params)`**  
-  - Returns all parameter paths in a Haiku parameter tree whose leaf name is `lora_a` or `lora_b`.  
-  - Useful for verifying that LoRA adapters are present where you expect them.
-
-- **`count_lora_parameters(params)`**  
-  - Counts the total number of scalar parameters across all `lora_a` and `lora_b` arrays.  
-  - Lets you quantify how lightweight your adapters are compared to the full model.
-
-The underlying forward computation in `LoRALinear` is:
-
-\[
-  y = x W \;+\; (x A) B \cdot \frac{\alpha}{r},
-\]
-
-where:
-- \( W \) is the frozen base weight (`w`),
-- \( A \) is `lora_a` (shape \((\text{in\_dim}, r)\)),
-- \( B \) is `lora_b` (shape \((r, \text{out\_dim})\)),
-- \( r \) is the LoRA rank.
-
-In the reference implementation:
-- `lora_a` is initialised from a small normal distribution.
-- `lora_b` is initialised to zeros so the adapter starts as a **no‑op**, matching the frozen‑backbone baseline at step 0.
-
-### 3. Example: ATAC/RNA Head with LoRA
-
-The notebook `notebooks/finetune_atac_lora.ipynb` shows a concrete **LoRA head** that adapts AlphaGenome to ATAC tracks, but the same pattern applies to RNA or other genome‑track targets.
-
-Key ideas:
-- Use **1 bp embeddings** from the AlphaGenome decoder: `embeddings.get_sequence_embeddings(resolution=1)` giving shape `(B, S, 1536)`.
-- Apply a single `LoRALinear` to project from 1536 features to `NUM_TRACKS` outputs.
-- Wrap this in a `CustomHead` whose `predict` method uses `LoRALinear` and whose `loss` compares predictions to per‑base targets.
-- Register the head via `register_custom_head` and build `head_specs` with `source: "custom"`.
-
-Conceptually, the `predict` method of such a head looks like:
+Register or prepare the heads normally, then pass `BackboneLoRAConfig` when the
+model is created:
 
 ```python
-from alphagenome_ft import lora
+from alphagenome_ft import BackboneLoRAConfig, create_model_with_heads
 
-class LoRAHead(CustomHead):
-    def predict(self, embeddings, organism_index, **kwargs):
-        x   = embeddings.get_sequence_embeddings(resolution=1)          # (B, S, 1536)
-        cfg = lora.LoRAConfig(rank=LORA_RANK, alpha=LORA_ALPHA)
-        x   = lora.LoRALinear(self._num_tracks, cfg)(x)                 # (B, S, num_tracks)
-        return {"predictions": jax.nn.softplus(x)}
+lora_config = BackboneLoRAConfig(
+    rank=8,
+    alpha=16,
+    targets=("q_proj", "v_proj"),
+    gradient_checkpointing=True,  # recommended for long sequences
+)
+
+model = create_model_with_heads(
+    "all_folds",
+    heads=[HEAD_NAME],
+    backbone_lora_config=lora_config,
+    head_init_scheme="pytorch",  # match newly initialized PyTorch track heads
+    init_seq_len=SEQUENCE_LENGTH,
+)
 ```
 
-The notebook then:
-- Defines `TARGETS_CONFIG` for BigWig tracks and converts it to `head_specs`.
-- Creates a model with `create_model_with_heads(MODEL_VERSION, heads=[HEAD_NAME])`.
+`head_init_scheme="pytorch"` matches the initialization distribution of new
+predefined track heads. The default, `"jax"`, preserves native Haiku head
+initialization. This setting does not change the LoRA A/B initialization above.
 
-### 4. Inspecting and Counting LoRA Parameters
+The PyTorch names `q_proj` and `v_proj` are accepted deliberately. Their JAX
+parameter paths remain the native `q_layer` and `v_layer` paths, which lets the
+pretrained `w` leaves load unchanged while adding `lora_a` and `lora_b`.
+Encoder-only mode and `detach_backbone=True` are incompatible with backbone
+LoRA because both bypass or stop gradients before the transformer.
 
-Before training, you can verify where LoRA lives and how large it is:
+## Train adapters and heads
 
-- **Backbone paths**:  
-  `parameter_utils.get_backbone_parameter_paths(model._params)`  
-  lists all arrays belonging to the frozen AlphaGenome backbone.
-
-- **LoRA paths**:  
-  `lora.get_lora_parameter_paths(model._params)`  
-  returns all leaf paths ending in `lora_a` or `lora_b`.
-
-- **Parameter counts**:  
-  Combine `parameter_utils.count_parameters(model._params)` with  
-  `lora.count_lora_parameters(model._params)` to compute the **LoRA parameter fraction**:
+The built-in trainer recognizes `model._backbone_lora_config`. When
+`heads_only` and `train_lora` are left as `None`, it enables both automatically:
 
 ```python
-total_params = parameter_utils.count_parameters(model._params)
-lora_params  = lora.count_lora_parameters(model._params)
-print(f"LoRA fraction: {lora_params / total_params:.4%}")
+from alphagenome_ft.finetune import train
+
+train(
+    model,
+    data_module,
+    head_specs,
+    learning_rate=1e-4,
+    weight_decay=0.0,
+    num_epochs=10,
+    checkpoint_dir=CHECKPOINT_DIR,
+)
 ```
 
-This gives a quick sanity check that your adapters remain small relative to the backbone.
+This trains only the requested heads plus all `lora_a`/`lora_b` leaves. The
+base query/value weights and the rest of the trunk get zero gradients and zero
+optimizer updates. Passing `train_lora=True, heads_only=False` is rejected,
+because it would silently turn the run into full-model finetuning.
 
-### 5. Freezing the Backbone and Training Only LoRA
-
-Once the LoRA head is attached, the notebook freezes the backbone while keeping the LoRA adapters trainable:
-
-- **Freeze everything except LoRA**  
-  Use `parameter_utils.freeze_except_lora`:
-
-```python
-from alphagenome_ft import parameter_utils
-
-model._params = parameter_utils.freeze_except_lora(model._params)
-```
-
-This applies `jax.lax.stop_gradient` to all parameters except those whose leaf name is `lora_a` or `lora_b`. The LoRA matrices remain trainable; the backbone (and any non‑LoRA head weights) are frozen. **Training-time** freezing of the backbone still requires **optimizer masking** for custom loops; `stop_gradient` alone is not enough (see [heads_only_optimizer.md](heads_only_optimizer.md)).
-
-- **Train with `heads_only=True`**  
-  When calling `alphagenome_ft.finetune.train.train`, pass `heads_only=True`. The trainer uses `create_optimizer` with masking so non‑head parameters receive **zero updates** (no SGD / no weight decay on the backbone):
-
+For an explicit call, use:
 
 ```python
 train(
     model,
     data_module,
     head_specs,
-    learning_rate=LEARNING_RATE,
-    weight_decay=WEIGHT_DECAY,
-    num_epochs=NUM_EPOCHS,
-    seed=SEED,
-    max_train_steps=MAX_TRAIN_STEPS,
+    learning_rate=1e-4,
+    weight_decay=0.0,
+    num_epochs=10,
     heads_only=True,
-    checkpoint_dir=CHECKPOINT_DIR,
-    organism=ORGANISM,
-    best_metric=BEST_METRIC,
-    best_metric_mode=BEST_METRIC_MODE,
-    early_stopping_patience=EARLY_STOPPING_PATIENCE,
-    early_stopping_min_delta=EARLY_STOPPING_MIN_DELTA,
-    verbose=VERBOSE,
+    train_lora=True,
+    max_grad_norm=1.0,
 )
 ```
 
-In the ATAC demo notebook this is combined with `BigWigDataModule` and fold‑based genomic intervals, but the same pattern works for other targets and loaders.
+`max_grad_norm=1.0` matches the PyTorch pipeline. Set it to `None` or `0` to
+recover the older JAX behavior without clipping.
 
-**Custom Optax loop** (replace `HEAD_NAME` with your registered head id; LoRA tensors live under that head’s path):
+Matching these settings does not imply bitwise equality between training runs.
+Framework RNGs and mixed-precision kernels differ. PyTorch gradient clipping
+also divides by `norm + 1e-6`, while Optax clips using the norm without that
+additive term.
+
+### Custom Optax loops
+
+Use the package optimizer rather than applying AdamW to the full parameter
+tree:
 
 ```python
-import optax
 from alphagenome_ft import create_optimizer
 
 optimizer = create_optimizer(
     model._params,
     trainable_head_names=(HEAD_NAME,),
-    learning_rate=LEARNING_RATE,
-    weight_decay=WEIGHT_DECAY,
+    learning_rate=1e-4,
+    weight_decay=0.0,
     heads_only=True,
+    train_lora=True,
+    gradient_clip_global_norm=1.0,
 )
 opt_state = optimizer.init(model._params)
-# updates, opt_state = optimizer.update(grads, opt_state, model._params)
-# model._params = optax.apply_updates(model._params, updates)
 ```
 
-### 6. LoRA and Sequence Length (up to 1 Mbp)
+Clipping is computed only over trainable head and LoRA leaves, matching
+`torch.nn.utils.clip_grad_norm_(trainable_params, ...)`. `freeze_backbone()` or
+`jax.lax.stop_gradient` on an already-created parameter tree is not, by itself,
+a persistent optimizer mask.
 
-LoRA operates on **weights**, not directly on sequence length, so you can reuse any of the sequence window sizes described elsewhere:
+## Inspect adapter parameters
 
-- 32k, 64k, 128k, and up to ~1 Mbp windows.
-- Control sequence length via `window_size` in the finetuning data utilities (e.g. `prepare_intervals_from_fold`) or your own loaders.
+```python
+from alphagenome_ft import count_lora_parameters, get_lora_parameter_paths
 
-Your choice of **where** to place LoRA (which heads or layers) is independent of the chosen window size.
+paths = get_lora_parameter_paths(model._params)
+count = count_lora_parameters(model._params)
+print(count, paths[:4])
+```
 
-### 7. Recommended Workflow
+For the default nine-block Q/V configuration, `count` is 308,736.
 
-1. **Start with heads‑only finetuning** on your task using the standard `GENOME_TRACKS` heads.
-2. If performance plateaus:
-   - Introduce a LoRA head (as in `finetune_atac_lora.ipynb`) for your task.
-   - Use `LoRAConfig` to keep the adapter small (e.g. rank 4–16).
-3. Monitor:
-   - Validation metrics (compare heads‑only vs LoRA).
-   - LoRA parameter fraction (via `count_lora_parameters`) to ensure parameter efficiency.
+## Checkpoints
 
-### 8. Notes and Caveats (Model Versions and Folds)
+The default delta checkpoint (`save_full_model=False`) stores custom heads and
+LoRA leaves, but not pretrained base weights. Reload it with the same base
+checkpoint or model version:
 
-- **Model choice and data leakage**  
-  The `"all_folds"` distilled AlphaGenome model is convenient for practical adapter experiments, but if your train/valid/test partitions overlap AlphaGenome’s (and Borzoi’s) held‑out genomic regions, you can get **data leakage and inflated test performance**.  
-  For strict benchmarking that matches the splits used in [AlphaGenome](https://www.nature.com/articles/s41586-025-10014-0) and [Borzoi](https://www.nature.com/articles/s41588-024-02053-6):
-  - Prefer fold‑specific models (e.g. `"fold_0"`, `"fold_1"`, etc.).
-  - Align your train/valid/test intervals with the corresponding folds.
+```python
+model.save_checkpoint(CHECKPOINT_DIR, save_full_model=False)
+```
 
-- **Extensibility**  
-  The current implementation equips **heads** with LoRA adapters via `LoRALinear`. You can extend the same pattern to more complex multi‑layer heads or additional projections if needed, reusing the same utilities for parameter inspection, counting, and freezing.
+Full-model LoRA checkpoints are also supported and restore the LoRA-aware
+forward function. Minimal encoder-only checkpoints are intentionally rejected
+for backbone LoRA because they omit the transformer where the adapters live.
 
+## Legacy head-level LoRA
 
+`LoRAConfig` and `LoRALinear` remain available for custom heads that contain
+their own low-rank projections. That is distinct from the PyTorch-aligned
+backbone mode above. A head-level adapter can be useful for experimentation,
+but it does not adapt AlphaGenome's attention projections.
+
+For leakage-sensitive evaluation, use a fold-specific base model and match the
+training, validation, and test intervals to that fold. The `all_folds` model is
+convenient for applications but is not appropriate for held-out fold claims.

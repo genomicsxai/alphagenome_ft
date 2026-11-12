@@ -243,28 +243,30 @@ def _build_track_metadata(
     The returned metadata is used to initialise predefined heads, which derive
     their output dimensionality (num_tracks) from it.  We always return a valid
     mapping so that the head constructor does not receive an empty dict.
-    ``nonzero_mean`` values stored on each track are kept for use by the data
-    pipeline but are not required for the metadata object itself.
+    Optional ``nonzero_mean`` values are embedded in the track metadata so the
+    upstream GenomeTracksHead applies the same scaling as the PyTorch port.
     Strand comes from ``TrackInfo.strand`` when given, otherwise from common
     forward/reverse label suffixes (including Borzoi-style trailing ``+``/``-``).
     """
-    def infer_strand(name: str) -> str:
-        lowered = name.lower()
-        if lowered.endswith(("_forward", ".forward", "_plus", ".plus", "+")):
-            return "+"
-        if lowered.endswith(("_reverse", ".reverse", "_minus", ".minus", "-")):
-            return "-"
-        return "."
-
     columns: dict[str, list[Any]] = {
         "name": [track.name for track in tracks],
-        "strand": [track.strand if track.strand is not None else infer_strand(track.name) for track in tracks],
+        "strand": [
+            track.strand
+            if track.strand is not None
+            else _infer_track_strand(track.name)
+            for track in tracks
+        ],
     }
     if columns["strand"].count("+") != columns["strand"].count("-"):
         raise ValueError(
             "Stranded targets require equal numbers of + and - tracks for reverse-complement "
             "reindexing. Supply paired tracks in matching order, or strand='.' for unstranded targets."
         )
+    if any(track.nonzero_mean is not None for track in tracks):
+        columns["nonzero_mean"] = [
+            1.0 if track.nonzero_mean is None else float(track.nonzero_mean)
+            for track in tracks
+        ]
     df = pd.DataFrame(columns)
     # AlphaGenomeOutputMetadata stores per-output-type DataFrames as named
     # fields whose names are the lower-cased OutputType enum member names
@@ -276,11 +278,68 @@ def _build_track_metadata(
     return {org: ag_metadata for org in dna_client.Organism}
 
 
+def _infer_track_strand(name: str) -> str:
+    """Infer a track strand from supported forward/reverse label suffixes."""
+    lowered = name.lower()
+    if lowered.endswith(("_forward", ".forward", "_plus", ".plus", "+")):
+        return "+"
+    if lowered.endswith(("_reverse", ".reverse", "_minus", ".minus", "-")):
+        return "-"
+    return "."
+
+
+def _compute_missing_track_means(
+    tracks: Sequence[TrackInfo],
+    intervals: Sequence[Any] | None,
+    *,
+    max_samples: int | None,
+) -> list[TrackInfo]:
+    """Populate an entirely unspecified mean set from training intervals."""
+    if intervals is None or any(track.nonzero_mean is not None for track in tracks):
+        return list(tracks)
+
+    from alphagenome_ft.finetune.data import compute_track_nonzero_means
+
+    strands = [
+        track.strand
+        if track.strand is not None
+        else _infer_track_strand(track.name)
+        for track in tracks
+    ]
+    plus_indices = [index for index, strand in enumerate(strands) if strand == "+"]
+    minus_indices = [index for index, strand in enumerate(strands) if strand == "-"]
+    if len(plus_indices) != len(minus_indices):
+        raise ValueError(
+            "Stranded targets require equal numbers of + and - tracks before "
+            "nonzero means can be estimated."
+        )
+    means = compute_track_nonzero_means(
+        [track.path for track in tracks],
+        intervals,
+        max_samples=max_samples,
+        strand_pair_groups=list(zip(plus_indices, minus_indices)),
+    )
+    return [
+        dataclasses.replace(track, nonzero_mean=float(means[index]))
+        for index, track in enumerate(tracks)
+    ]
+
+
 def prepare_head_specs(
     config: Mapping[str, Any],
     *,
     organism: str | None = None,
+    nonzero_mean_intervals: Sequence[Any] | None = None,
+    nonzero_mean_max_samples: int | None = 1000,
 ) -> list[HeadSpec]:
+    """Build head specs and optionally estimate missing predefined-head scales.
+
+    When ``nonzero_mean_intervals`` is provided and none of a predefined head's
+    targets declares ``nonzero_mean``, scales are computed from those training
+    intervals using the same nonzero-value reduction as ``alphagenome-pytorch``.
+    If any target declares a value, the existing explicit/default-1.0 behavior
+    is retained for that head.
+    """
     heads_cfg = config.get('heads')
     if not heads_cfg:
         raise ValueError('Config must define a non-empty "heads" list.')
@@ -333,6 +392,11 @@ def prepare_head_specs(
                 )
             )
         elif source == 'predefined':
+            tracks = _compute_missing_track_means(
+                tracks,
+                nonzero_mean_intervals,
+                max_samples=nonzero_mean_max_samples,
+            )
             kind_name = entry.get('kind')
             if not kind_name:
                 raise ValueError(

@@ -317,7 +317,7 @@ opt_state = optimizer.init(model._params)
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/finetune_rna_lora.ipynb)
 
-**When to use:** Low-rank adapters on the backbone. **Tutorial:** [LoRA-style adapters](docs/lora_adapters.md). For custom Optax loops, use `create_optimizer(..., heads_only=True)` with your LoRA head name so only head (including LoRA) weights update.
+**When to use:** Low-rank adapters on the transformer query/value projections, matching the default `alphagenome-pytorch` LoRA targets. **Tutorial:** [LoRA adapters](docs/lora_adapters.md). Create the model with `backbone_lora_config=BackboneLoRAConfig(...)`; the built-in trainer then defaults to training only the selected heads and LoRA leaves. Custom Optax loops should use `create_optimizer(..., heads_only=True, train_lora=True)`.
 
 ---
 
