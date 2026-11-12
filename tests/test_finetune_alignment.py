@@ -58,13 +58,14 @@ def test_nonzero_means_and_strand_pair_averaging(monkeypatch):
     np.testing.assert_allclose(means, [2.5, 2.5])
 
 
-def test_nonzero_means_reject_infinite_values(monkeypatch):
+@pytest.mark.parametrize("infinite_value", [np.inf, -np.inf])
+def test_nonzero_means_reject_infinite_values(monkeypatch, infinite_value):
     class FakeBigWig:
         def __init__(self, path):
             self.path = path
 
         def values(self, *_args, **_kwargs):
-            return np.array([0.0, 2.0, np.inf, 4.0], dtype=np.float32)
+            return np.array([0.0, 2.0, infinite_value, 4.0], dtype=np.float32)
 
         def close(self):
             pass

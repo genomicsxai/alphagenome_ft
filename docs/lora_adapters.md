@@ -16,6 +16,9 @@ implementation mirrors the default LoRA mode in `alphagenome-pytorch`:
 At rank 8 with both default targets, the backbone has 308,736 trainable LoRA
 scalars.
 
+See the [changelog](../CHANGELOG.md) for changes to gradient-clipping defaults
+and `nonzero_mean` scaling, including older-checkpoint compatibility.
+
 ## Create a backbone-LoRA model
 
 Register or prepare the heads normally, then pass `BackboneLoRAConfig` when the
@@ -35,9 +38,14 @@ model = create_model_with_heads(
     "all_folds",
     heads=[HEAD_NAME],
     backbone_lora_config=lora_config,
+    head_init_scheme="pytorch",  # match newly initialized PyTorch track heads
     init_seq_len=SEQUENCE_LENGTH,
 )
 ```
+
+`head_init_scheme="pytorch"` matches the initialization distribution of new
+predefined track heads. The default, `"jax"`, preserves native Haiku head
+initialization. This setting does not change the LoRA A/B initialization above.
 
 The PyTorch names `q_proj` and `v_proj` are accepted deliberately. Their JAX
 parameter paths remain the native `q_layer` and `v_layer` paths, which lets the
@@ -87,6 +95,11 @@ train(
 
 `max_grad_norm=1.0` matches the PyTorch pipeline. Set it to `None` or `0` to
 recover the older JAX behavior without clipping.
+
+Matching these settings does not imply bitwise equality between training runs.
+Framework RNGs and mixed-precision kernels differ. PyTorch gradient clipping
+also divides by `norm + 1e-6`, while Optax clips using the norm without that
+additive term.
 
 ### Custom Optax loops
 

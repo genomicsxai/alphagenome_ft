@@ -784,9 +784,10 @@ def compute_track_nonzero_means(
 
     Intervals are sampled deterministically and only nonzero BigWig values
     contribute; NaN counts as zero, as in PyTorch. An infinite value raises
-    rather than saturating to the float32 maximum, which would silently set the
-    track scale to ~1e38 in both frameworks. Strand-paired tracks can share
-    their averaged scale.
+    rather than saturating to the float32 maximum as the PyTorch helper does.
+    Parity with that helper applies to finite inputs. Strand-paired tracks can
+    share their averaged scale. Invalid BigWig queries propagate pyBigWig's
+    exception.
     """
     if not bigwig_paths:
         raise ValueError("At least one BigWig path is required.")
@@ -812,8 +813,6 @@ def compute_track_nonzero_means(
                     interval.end,
                     numpy=True,
                 )
-                if values is None:
-                    continue
                 array = np.asarray(values, dtype=np.float32)
                 if np.isinf(array).any():
                     raise ValueError(
