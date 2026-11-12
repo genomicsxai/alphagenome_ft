@@ -16,8 +16,22 @@ implementation mirrors the default LoRA mode in `alphagenome-pytorch`:
 At rank 8 with both default targets, the backbone has 308,736 trainable LoRA
 scalars.
 
-See the [changelog](../CHANGELOG.md) for changes to gradient-clipping defaults
-and `nonzero_mean` scaling, including older-checkpoint compatibility.
+## Compatibility notes
+
+`train()` now enables gradient clipping at `max_grad_norm=1.0`; set it to `None`
+or `0` to recover the previous behavior. Both optimizer factories exclude
+frozen gradients from the clipping norm.
+
+YAML `nonzero_mean` values now reach predefined track heads and affect target
+scaling, loss, and prediction unscaling; previously they were ignored. To load
+older checkpoints trained through that YAML path with their original unit
+scale, register the heads with those formerly ignored means omitted or set to
+`1.0`. Retaining the old non-unit values changes prediction unscaling.
+
+`prepare_head_specs(..., nonzero_mean_intervals=training_intervals)` can
+estimate scales when a head has no explicit means. Use training intervals
+only. NaNs count as zero and infinities raise; the PyTorch helper currently
+saturates infinities, so parity applies to finite data.
 
 ## Create a backbone-LoRA model
 
