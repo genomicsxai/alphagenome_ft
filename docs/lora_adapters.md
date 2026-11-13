@@ -16,9 +16,6 @@ implementation mirrors the default LoRA mode in `alphagenome-pytorch`:
 At rank 8 with both default targets, the backbone has 308,736 trainable LoRA
 scalars.
 
-See the [changelog](../CHANGELOG.md) for changes to gradient-clipping defaults
-and `nonzero_mean` scaling, including older-checkpoint compatibility.
-
 ## Create a backbone-LoRA model
 
 Register or prepare the heads normally, then pass `BackboneLoRAConfig` when the

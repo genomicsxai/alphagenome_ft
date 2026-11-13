@@ -9,6 +9,7 @@ pretrained ``w`` leaves merge at their original paths while the new
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import math
 from collections.abc import Sequence
 
@@ -78,6 +79,18 @@ def _call_with_optional_training(
         if "is_training" not in message:
             raise
         return module(*args)
+
+
+def _accepts_keyword(fn, name: str) -> bool:
+    """Return whether ``fn`` (following ``__wrapped__``) accepts keyword ``name``."""
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 def _call_output_embedder(
@@ -306,20 +319,23 @@ class BackboneLoRAAlphaGenome(hk.Module):
         trunk, pair_activations = BackboneLoRATransformerTower(self._config)(
             trunk, is_training=is_training
         )
-        decoder = model_lib.SequenceDecoder()
-        try:
-            decoded = decoder(
+        # Check the signature instead of try/except: constructing a second
+        # decoder would rename it to sequence_decoder_1, losing pretrained weights.
+        if _accepts_keyword(model_lib.SequenceDecoder.__call__, "remat"):
+            decoded = model_lib.SequenceDecoder()(
                 trunk,
                 intermediates,
                 is_training=is_training,
                 remat=self._config.gradient_checkpointing,
             )
-        except TypeError as exc:
-            if "remat" not in str(exc):
-                raise
+        else:
+            decoder = (
+                BackboneLoRASequenceDecoder()
+                if self._config.gradient_checkpointing
+                else model_lib.SequenceDecoder()
+            )
             decoded = _call_with_optional_training(
-                (BackboneLoRASequenceDecoder()
-                 if self._config.gradient_checkpointing else decoder),
+                decoder,
                 trunk,
                 intermediates,
                 is_training=is_training,
