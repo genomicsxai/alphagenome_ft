@@ -289,9 +289,9 @@ def main(args=None) -> None:
 
     # Distinct from checkpoint_dir/{last,best} (which --resume auto reads/
     # writes across invocations): callers that declare a Snakemake-style
-    # output should point at this marker, never at last/ itself — see
-    # CLAUDE.md's Snakemake gotcha about resumable checkpoints as rule
-    # outputs.
+    # output should point at this marker, never at last/ itself: declaring
+    # the resumable directory as a rule output lets a rerun-incomplete wipe
+    # real training progress.
     (checkpoint_dir / "training_complete.marker").touch()
     print(f"Done! Checkpoints written under {checkpoint_dir}")
 
