@@ -43,7 +43,6 @@ def main(args=None) -> None:
     from alphagenome_research.model import dna_model as research_dna_model
 
     from alphagenome_ft import create_model_with_heads, load_checkpoint
-    from alphagenome_ft import lora as lora_lib
     from alphagenome_ft.finetune import config as ft_config
     from alphagenome_ft.finetune.data import BigWigDataModule
     from alphagenome_ft.finetune.splice_data import SpliceDataModule
@@ -58,19 +57,20 @@ def main(args=None) -> None:
 
     lora_enabled = args.mode == "lora"
     detach_backbone = not lora_enabled
-    install_backbone_patches = None
+    backbone_lora_config = None
     if lora_enabled:
-        lora_cfg = lora_lib.BackboneLoRAConfig.from_pytorch_style_targets(
-            args.lora_targets.split(","), rank=args.lora_rank, alpha=args.lora_alpha,
-        )
-        print(f"Mode: lora — will install backbone LoRA adapters "
-              f"(rank={lora_cfg.rank}, alpha={lora_cfg.alpha}, targets={lora_cfg.targets}) "
-              f"right after the base pretrained checkpoint restores (not before: an "
-              f"active patch makes that restore's own orbax target tree mismatch the "
-              f"saved checkpoint's structure, since it doesn't have LoRA params).")
+        from alphagenome_ft.backbone_lora import BackboneLoRAConfig
 
-        def install_backbone_patches() -> None:
-            lora_lib.install_mha_backbone_lora(lora_cfg)
+        backbone_lora_config = BackboneLoRAConfig(
+            rank=args.lora_rank,
+            alpha=args.lora_alpha,
+            targets=tuple(t.strip() for t in args.lora_targets.split(",") if t.strip()),
+        )
+        print(f"Mode: lora - transformer LoRA adapters "
+              f"(rank={backbone_lora_config.rank}, alpha={backbone_lora_config.alpha}, "
+              f"targets={backbone_lora_config.targets}) are built into the trunk by "
+              f"create_model_with_heads(backbone_lora_config=...); pretrained weights "
+              f"keep their paths and only lora_a/lora_b are new.")
 
     head_ids = {
         "splice_sites_classification": "splice_site",
@@ -150,7 +150,7 @@ def main(args=None) -> None:
             init_seq_len=args.sequence_length,
             detach_backbone=detach_backbone,
             gradient_checkpointing=args.gradient_checkpointing,
-            install_backbone_patches=install_backbone_patches,
+            backbone_lora_config=backbone_lora_config,
             dtype=args.dtype,
         )
     else:
@@ -173,7 +173,7 @@ def main(args=None) -> None:
             # thing preventing a full-backbone backward pass there.
             detach_backbone=detach_backbone,
             gradient_checkpointing=args.gradient_checkpointing,
-            install_backbone_patches=install_backbone_patches,
+            backbone_lora_config=backbone_lora_config,
             dtype=args.dtype,
         )
 
@@ -266,14 +266,14 @@ def main(args=None) -> None:
         seed=args.seed,
         max_train_steps=args.max_train_steps,
         heads_only=True,
-        lora_enabled=lora_enabled,
+        train_lora=lora_enabled,
         checkpoint_dir=checkpoint_dir,
         organism=args.organism,
         num_devices=args.num_devices,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         resume_from=resume_dir if do_resume else None,
         save_every_steps=args.save_every_steps,
-        gradient_clip_global_norm=args.max_grad_norm if args.max_grad_norm > 0 else None,
+        max_grad_norm=args.max_grad_norm if args.max_grad_norm > 0 else None,
         verbose=True,
         log_every=args.log_every,
         use_wandb=args.wandb,

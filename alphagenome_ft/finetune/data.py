@@ -13,8 +13,14 @@ import numpy as np
 import pandas as pd
 import pyBigWig
 from alphagenome.data import genome
-from alphagenome.io import fasta as fasta_lib
 from alphagenome_research.model import one_hot_encoder
+
+try:
+    # alphagenome >= 0.7.0 ships the FASTA extractor in the base package.
+    from alphagenome.io import fasta as fasta_lib
+except ImportError:  # pragma: no cover - older alphagenome + older alphagenome_research
+    # alphagenome_research builds from before June 2026 still carry their own copy.
+    from alphagenome_research.io import fasta as fasta_lib
 
 
 from alphagenome_ft.finetune.config import HeadSpec
@@ -100,33 +106,45 @@ _CHROMSIZES = {
     },
 }
 
+# Model folds (AlphaGenome fold_0..fold_3) are not the numbered partitions
+# (fold0..fold7) in sequences_human.bed.gz. Each model holds out one validation
+# partition and one test partition, matching alphagenome.data.fold_intervals
+# and alphagenome-pytorch/scripts/convert_borzoi_folds.py.
 FOLD_MAPPING = {
     "0": {
         "train": ["fold2", "fold3", "fold4", "fold5", "fold6", "fold7"],
-        "valid": ["fold1"],
-        "test": ["fold0"],
-    },
-    "1": {
-        "train": ["fold0", "fold3", "fold4", "fold5", "fold6", "fold7"],
-        "valid": ["fold2"],
+        "valid": ["fold0"],
         "test": ["fold1"],
     },
-    "2": {
-        "train": ["fold0", "fold1", "fold4", "fold5", "fold6", "fold7"],
+    "1": {
+        "train": ["fold0", "fold1", "fold2", "fold5", "fold6", "fold7"],
         "valid": ["fold3"],
-        "test": ["fold2"],
+        "test": ["fold4"],
+    },
+    "2": {
+        "train": ["fold0", "fold1", "fold3", "fold4", "fold6", "fold7"],
+        "valid": ["fold2"],
+        "test": ["fold5"],
     },
     "3": {
-        "train": ["fold0", "fold1", "fold2", "fold5", "fold6", "fold7"],
-        "valid": ["fold4"],
-        "test": ["fold3"],
+        "train": ["fold0", "fold1", "fold2", "fold3", "fold4", "fold5"],
+        "valid": ["fold6"],
+        "test": ["fold7"],
     },
 }
 
 
+def normalize_model_fold(fold: str | int) -> str:
+    """Accept numeric model IDs and AlphaGenome's fold_0/FOLD_0 names."""
+    key = str(fold).strip().lower().removeprefix("fold_")
+    if key not in FOLD_MAPPING:
+        raise ValueError(f"Invalid model fold {fold!r}; expected 0–3 or fold_0–fold_3.")
+    return key
+
+
 def build_split_lookup(fold_key: str) -> dict[str, str]:
     split_lookup: dict[str, str] = {}
-    mapping = FOLD_MAPPING[fold_key]
+    mapping = FOLD_MAPPING[normalize_model_fold(fold_key)]
     for split_name, fold_list in mapping.items():
         for fold_label in fold_list:
             split_lookup[fold_label] = split_name
@@ -211,7 +229,7 @@ def get_fold_split(
     """Create train/valid/test windows for a Borzoi-style fold split.
 
     Args:
-        fold: Fold identifier (``0``-``3``) used with ``FOLD_MAPPING``.
+        fold: Model fold (``0``–``3`` or ``fold_0``–``fold_3``), not a BED partition.
         window_size: Final window length centered on each source interval.
         organism: Organism key or alias (for example ``HOMO_SAPIENS`` or ``hg38``).
         bed_path: Optional BED/BED.GZ path containing ``chrom start end fold``.
@@ -227,10 +245,7 @@ def get_fold_split(
     """
     organism = _normalize_organism(organism)
 
-    fold_key = str(fold)
-    if fold_key not in FOLD_MAPPING:
-        valid = ", ".join(sorted(FOLD_MAPPING))
-        raise ValueError(f"Invalid fold '{fold}'. Valid folds: {valid}")
+    fold_key = normalize_model_fold(fold)
 
     if bed_path is None:
         if organism not in _DEFAULT_INTERVALS:
@@ -688,7 +703,7 @@ class BigWigDataModule:
             return
 
         order = np.arange(len(windows))
-        if self._shuffle:
+        if self._shuffle and split == "train":
             rng = np.random.default_rng(seed)
             rng.shuffle(order)
         if skip_batches:
@@ -762,6 +777,85 @@ class BigWigDataModule:
         limit = min(target_len, arr.shape[0])
         padded[:limit] = arr[:limit]
         return padded
+
+
+def compute_track_nonzero_means(
+    bigwig_paths: Sequence[Path],
+    intervals: Sequence[genome.Interval],
+    *,
+    max_samples: int | None = 1000,
+    strand_pair_groups: Sequence[tuple[int, int]] | None = None,
+) -> np.ndarray:
+    """Estimate per-track nonzero means using the PyTorch fine-tuning rule.
+
+    Intervals are sampled deterministically and only nonzero BigWig values
+    contribute; NaN counts as zero, as in PyTorch. An infinite value raises
+    rather than saturating to the float32 maximum as the PyTorch helper does.
+    Parity with that helper applies to finite inputs. Strand-paired tracks can
+    share their averaged scale. Invalid BigWig queries propagate pyBigWig's
+    exception.
+    """
+    if not bigwig_paths:
+        raise ValueError("At least one BigWig path is required.")
+    if not intervals:
+        raise ValueError("At least one training interval is required.")
+    if max_samples is not None and max_samples <= 0:
+        raise ValueError("max_samples must be positive when provided.")
+
+    sampled = list(intervals)
+    if max_samples is not None and len(sampled) > max_samples:
+        step = max(1, len(sampled) // max_samples)
+        sampled = sampled[::step][:max_samples]
+
+    sums = np.zeros(len(bigwig_paths), dtype=np.float64)
+    counts = np.zeros(len(bigwig_paths), dtype=np.int64)
+    handles = [pyBigWig.open(str(Path(path))) for path in bigwig_paths]
+    try:
+        for interval in sampled:
+            for index, handle in enumerate(handles):
+                values = handle.values(
+                    interval.chromosome,
+                    interval.start,
+                    interval.end,
+                    numpy=True,
+                )
+                array = np.asarray(values, dtype=np.float32)
+                if np.isinf(array).any():
+                    raise ValueError(
+                        f"Infinite value in {bigwig_paths[index]} at "
+                        f"{interval.chromosome}:{interval.start}-{interval.end}; "
+                        "cannot estimate its nonzero mean."
+                    )
+                array = np.nan_to_num(array, nan=0.0)
+                nonzero = array[array != 0]
+                # Match the PyTorch window reduction before float64 accumulation.
+                sums[index] += nonzero.sum()
+                counts[index] += nonzero.size
+    finally:
+        for handle in handles:
+            handle.close()
+
+    means = np.divide(
+        sums,
+        counts,
+        out=np.ones_like(sums),
+        where=counts > 0,
+    )
+    if strand_pair_groups is not None:
+        seen: set[int] = set()
+        for plus_index, minus_index in strand_pair_groups:
+            pair = (int(plus_index), int(minus_index))
+            if pair[0] == pair[1]:
+                raise ValueError(f"Strand pair must contain distinct tracks: {pair}.")
+            if any(index < 0 or index >= len(means) for index in pair):
+                raise ValueError(f"Strand-pair index out of range: {pair}.")
+            if any(index in seen for index in pair):
+                raise ValueError(f"Track appears in more than one strand pair: {pair}.")
+            seen.update(pair)
+            paired_mean = 0.5 * (means[pair[0]] + means[pair[1]])
+            means[pair[0]] = paired_mean
+            means[pair[1]] = paired_mean
+    return means.astype(np.float32)
 
 
 def build_fasta_index(fasta_path: Path) -> dict[str, int]:

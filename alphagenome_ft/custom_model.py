@@ -36,6 +36,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 import enum
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Callable
@@ -78,8 +79,21 @@ from dataclasses import dataclass, replace
 from alphagenome_research.model import dna_model, model as model_lib, embeddings as embeddings_module
 from alphagenome_research.model.metadata import metadata as metadata_lib
 
+
+def _pytorch_head_parameter_creator(next_creator, shape, dtype, init, context):
+    """Use historical PyTorch absolute truncation bounds for new track heads."""
+    if (context.full_name.startswith("head/")
+            and context.full_name.endswith("/w")
+            and "multi_organism_linear" in context.full_name):
+        stddev = 1.0 / math.sqrt(shape[-2])
+        init = hk.initializers.TruncatedNormal(
+            stddev=stddev, lower=-2.0 / stddev, upper=2.0 / stddev
+        )
+    return next_creator(shape, dtype, init)
+
 from alphagenome_ft import parameter_utils
 from alphagenome_ft import custom_heads as custom_heads_module
+from alphagenome_ft.compat import call_with_is_training
 
 
 def _dummy_splice_site_positions(head_names: Sequence[str]):
@@ -401,6 +415,7 @@ class CustomAlphaGenomeModel:
         custom_forward_fn: Any | None = None,
         custom_heads_list: Sequence[str] | None = None,
         head_configs: dict[str, Any] | None = None,
+        backbone_lora_config: Any | None = None,
     ):
         """Initialize the custom model.
 
@@ -411,6 +426,7 @@ class CustomAlphaGenomeModel:
             custom_forward_fn: Optional custom forward function.
             custom_heads_list: List of head names (custom or predefined) in this model.
             head_configs: Dictionary mapping head names to head configs for loss computation.
+            backbone_lora_config: Optional transformer Q/V LoRA configuration.
         """
         # Copy attributes from base model
         self._device_context = base_model._device_context
@@ -530,6 +546,7 @@ class CustomAlphaGenomeModel:
         # Set by freeze_except_head; training loops may default heads_only optimizers from this.
         self._heads_only_finetune_default = False
         self._heads_only_trainable_head_names: tuple[str, ...] | None = None
+        self._backbone_lora_config = backbone_lora_config
 
     # ========================================================================
     # Parameter Freezing Methods
@@ -623,10 +640,13 @@ class CustomAlphaGenomeModel:
         heads_only: bool = False,
         optimizer_type: str = "adamw",
         gradient_clip_global_norm: float | None = None,
+        train_lora: bool = False,
     ):
         """Create an Optax optimizer for :attr:`_params`.
 
-        See :func:`alphagenome_ft.optimizer_utils.create_optimizer`.
+        Set ``train_lora=True`` with ``heads_only=True`` to optimize adapter
+        leaves alongside the selected heads. See
+        :func:`alphagenome_ft.optimizer_utils.create_optimizer`.
         """
         from alphagenome_ft import optimizer_utils
 
@@ -638,6 +658,7 @@ class CustomAlphaGenomeModel:
             heads_only=heads_only,
             optimizer_type=optimizer_type,
             gradient_clip_global_norm=gradient_clip_global_norm,
+            train_lora=train_lora,
         )
 
     # ========================================================================
@@ -955,6 +976,23 @@ class CustomAlphaGenomeModel:
         """
         if save_full_model:
             return self._params, self._state
+
+        def add_lora_leaves(source, destination):
+            """Copy adapter leaves into a same-structure partial checkpoint tree."""
+            if not isinstance(source, dict):
+                return
+            for key, value in source.items():
+                if isinstance(value, dict):
+                    child: dict = {}
+                    add_lora_leaves(value, child)
+                    if child:
+                        existing = destination.get(key)
+                        if isinstance(existing, dict):
+                            add_lora_leaves(child, existing)
+                        else:
+                            destination[key] = child
+                elif str(key) in {'lora_a', 'lora_b'}:
+                    destination[key] = value
         if save_minimal_model:
             params_to_save: dict = {}
             state_to_save: dict = {}
@@ -1095,6 +1133,8 @@ class CustomAlphaGenomeModel:
                         "alphagenome"
                     ]["head"][head_name]
 
+        if self._backbone_lora_config is not None:
+            add_lora_leaves(self._params, params_to_save)
         return params_to_save, state_to_save
 
     def save_checkpoint(
@@ -1134,6 +1174,13 @@ class CustomAlphaGenomeModel:
             )
             ```
         """
+        if save_minimal_model and self._backbone_lora_config is not None:
+            # Minimal checkpoints restore as encoder-only models, which cannot
+            # carry transformer LoRA; such a checkpoint would save but never load.
+            raise ValueError(
+                "save_minimal_model=True is not supported with backbone LoRA; "
+                "save heads + LoRA (the default) or the full model instead."
+            )
         checkpoint_dir = Path(checkpoint_dir).expanduser().resolve()
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         def _serialize_value(value):
@@ -1169,6 +1216,11 @@ class CustomAlphaGenomeModel:
             'save_full_model': save_full_model,
             'save_minimal_model': save_minimal_model,
             'use_encoder_output': hasattr(self, '_custom_forward_fn') and self._custom_forward_fn is not None,
+            'backbone_lora': (
+                _serialize_head_config(self._backbone_lora_config)
+                if self._backbone_lora_config is not None
+                else None
+            ),
         }
 
         with open(checkpoint_dir / 'config.json', 'w') as f:
@@ -2443,9 +2495,11 @@ def create_model_with_heads(
     use_encoder_output: bool = False,
     detach_backbone: bool = False,
     gradient_checkpointing: bool = False,
+    backbone_lora_config: Any | None = None,
     include_standard_heads: bool = False,
     init_seq_len: int = 2**14,
     install_backbone_patches: Callable[[], None] | None = None,
+    head_init_scheme: str = "jax",
     dtype: str = "bfloat16",
 ) -> CustomAlphaGenomeModel:
     """Create an AlphaGenome model with specified heads replacing standard heads.
@@ -2481,15 +2535,23 @@ def create_model_with_heads(
             backward pass ever touches the backbone, so this is a no-op
             exactly as it is for alphagenome-pytorch's own frozen-backbone
             path (torch.no_grad() there means torch.utils.checkpoint has
-            nothing to recompute either).
+            nothing to recompute either). With ``backbone_lora_config`` this
+            sets ``BackboneLoRAConfig.gradient_checkpointing`` (per-block
+            ``hk.remat`` of encoder, transformer tower and decoder).
+        backbone_lora_config: Optional ``BackboneLoRAConfig``. When set, replace
+            transformer ``q_layer``/``v_layer`` projections with same-path LoRA
+            projections while retaining their pretrained base weights.
+        head_init_scheme: 'jax' preserves native two-standard-deviation
+            truncation; 'pytorch' matches historical absolute [-2, 2] bounds
+            for newly initialized predefined track-head weights.
         include_standard_heads: If True, compute the standard pretrained heads
             in addition to the requested heads. If False, skip standard heads
             to save compute/memory.
         install_backbone_patches: Optional zero-arg callback run right after
             the base pretrained model is loaded/restored, but before this
             function builds/initializes the custom-heads forward function.
-            Use this to monkeypatch backbone modules (e.g.
-            ``alphagenome_ft.lora.install_mha_backbone_lora``) so the patch is
+            Use this to monkeypatch backbone modules (backbone LoRA no longer
+            uses this: pass ``backbone_lora_config``) so the patch is
             NOT yet active during ``dna_model.create``'s own internal orbax
             restore (which requires its restore target to structurally match
             the saved checkpoint exactly — an active patch that adds new
@@ -2543,6 +2605,22 @@ def create_model_with_heads(
     """
     normalized_heads = [custom_heads_module.normalize_head_name(name) for name in heads]
 
+    if backbone_lora_config is not None and use_encoder_output:
+        raise ValueError(
+            "Backbone LoRA requires the transformer; use_encoder_output is incompatible."
+        )
+    if backbone_lora_config is not None and detach_backbone:
+        raise ValueError("detach_backbone would block gradients to backbone LoRA adapters.")
+    if (
+        backbone_lora_config is not None
+        and gradient_checkpointing
+        and not backbone_lora_config.gradient_checkpointing
+    ):
+        # One switch for both paths: with backbone LoRA the per-block remat lives
+        # in the LoRA trunk itself (BackboneLoRAConfig.gradient_checkpointing).
+        import dataclasses as _dc
+        backbone_lora_config = _dc.replace(backbone_lora_config, gradient_checkpointing=True)
+
     # Validate all heads are registered
     for head_name in normalized_heads:
         if not custom_heads_module.is_head_registered(head_name):
@@ -2551,7 +2629,18 @@ def create_model_with_heads(
                 f"Available heads: {custom_heads_module.list_registered_heads()}"
             )
 
-    if gradient_checkpointing:
+    if gradient_checkpointing and backbone_lora_config is not None:
+        # The LoRA trunk does its own per-block remat for the transformer tower and
+        # decoder, and asks the native encoder to remat via a ``remat`` keyword that
+        # alphagenome_research <= 0.3.0 does not have (the call then silently falls back
+        # to an un-checkpointed encoder: a 36 GB OOM at 1 Mbp on an 80 GB GPU). In that
+        # case install our per-block remat for the encoder; it is a no-op for the LoRA
+        # tower/decoder, which are not the patched classes.
+        import inspect as _inspect
+        if "remat" not in _inspect.signature(model_lib.SequenceEncoder.__call__).parameters:
+            from alphagenome_ft.finegrained_remat import install_fine_grained_remat
+            install_fine_grained_remat()
+    if gradient_checkpointing and backbone_lora_config is None:
         # Unlike install_backbone_patches (LoRA), always safe to install
         # eagerly, including before dna_model.create()'s own internal
         # checkpoint restore below: hk.remat only wraps how a computation
@@ -2589,6 +2678,16 @@ def create_model_with_heads(
     # Create forward function with requested heads
     print(f"Initializing heads: {normalized_heads}")
 
+    if head_init_scheme not in {"jax", "pytorch"}:
+        raise ValueError("head_init_scheme must be 'jax' or 'pytorch'")
+
+    def head_parameter_creator(next_creator, shape, dtype, init, context):
+        # Historical PyTorch trunc_normal_(std=s) uses absolute [-2, 2],
+        # whereas Haiku's default bounds are measured in standard deviations.
+        if head_init_scheme == "pytorch":
+            return _pytorch_head_parameter_creator(next_creator, shape, dtype, init, context)
+        return next_creator(shape, dtype, init)
+
     # Set mixed precision policy (trunk only here -- heads are registered
     # per-instance in _build_head_predictions, see dtype docstring above).
     import contextlib
@@ -2602,6 +2701,12 @@ def create_model_with_heads(
 
     def _push_policy_ctx(cls):
         return hk.mixed_precision.push_policy(cls, policy) if policy is not None else contextlib.nullcontext()
+    if policy is not None and backbone_lora_config is not None:
+        from alphagenome_ft.backbone_lora import BackboneLoRAAlphaGenome
+
+        # The LoRA trunk stands in for model_lib.AlphaGenome; its submodules,
+        # including the organism embedding, inherit this policy the same way.
+        hk.mixed_precision.set_policy(BackboneLoRAAlphaGenome, policy)
 
     def _stop_gradient_embeddings(embeddings):
         if embeddings is None:
@@ -2628,16 +2733,13 @@ def create_model_with_heads(
                         num_organisms = len(metadata)
 
                         # Step 1: Run encoder ONLY
-                        encoder = model_lib.SequenceEncoder()
-                        # Per-block hk.remat (installed below, once, when
-                        # gradient_checkpointing is on) already wraps
-                        # SequenceEncoder.__call__ internally at finer
-                        # granularity than an outer hk.remat here would -- see
-                        # finegrained_remat.py for why that granularity matters
-                        # (an outer whole-encoder remat alone isn't enough
-                        # memory headroom once the backbone isn't detached,
-                        # e.g. --mode lora).
-                        trunk, intermediates = encoder(dna_sequence, is_training=False)
+                        # Step 1: Run encoder ONLY (per-block hk.remat, installed
+                        # when gradient_checkpointing is on, already wraps
+                        # SequenceEncoder.__call__ at finer granularity; see
+                        # finegrained_remat.py).
+                        trunk, intermediates = call_with_is_training(
+                            model_lib.SequenceEncoder(), dna_sequence, is_training=False
+                        )
                         encoder_output = trunk  # Save encoder output
 
                         # Create extended embeddings with ONLY encoder output
@@ -2653,10 +2755,11 @@ def create_model_with_heads(
             # Run heads (outside alphagenome scope)
             num_organisms = len(metadata)
             with hk.name_scope('head'):
-                predictions = _build_head_predictions(
-                    normalized_heads, embeddings, organism_index,
-                    splice_site_positions, num_organisms,
-                )
+                with hk.custom_creator(head_parameter_creator):
+                    predictions = _build_head_predictions(
+                        normalized_heads, embeddings, organism_index,
+                        splice_site_positions, num_organisms,
+                    )
 
             return predictions, embeddings
     else:
@@ -2664,26 +2767,41 @@ def create_model_with_heads(
         @hk.transform_with_state
         def _forward_with_custom_heads(dna_sequence, organism_index, splice_site_positions=None):
             """Forward pass with requested heads only."""
-            # Create AlphaGenome trunk (encoder, transformer, decoder)
-            # This will use pretrained params for the backbone
-            # Note: AlphaGenome always creates standard heads based on metadata,
-            # but we only use the embeddings, not the standard head predictions
-            alphagenome = model_lib.AlphaGenome(metadata)
+            if backbone_lora_config is not None:
+                # Transformer q/v LoRA trunk (alphagenome_ft.backbone_lora): keeps
+                # AlphaGenome's parameter paths, adds lora_a/lora_b leaves.
+                from alphagenome_ft.backbone_lora import (
+                    forward_embeddings_with_backbone_lora,
+                )
 
-            # Call forward_trunk directly (not __call__) - we only need
-            # embeddings, never the standard pretrained heads' predictions,
-            # so this also skips computing (and, when gradient_checkpointing
-            # is on, needlessly recomputing) those on every step.
-            # forward_trunk is @hk.name_like('__call__'), so parameter paths
-            # still match a checkpoint saved via the real __call__.
-            # Per-block hk.remat (installed below, once, when
-            # gradient_checkpointing is on) already wraps the encoder/
-            # transformer-tower/decoder internally at finer granularity than
-            # an outer hk.remat around the whole forward_trunk call would --
-            # see finegrained_remat.py for why that granularity matters (an
-            # outer whole-trunk remat alone still OOM'd at ~53GB once the
-            # backbone isn't detached, e.g. --mode lora).
-            embeddings = alphagenome.forward_trunk(dna_sequence, organism_index)
+                embeddings = forward_embeddings_with_backbone_lora(
+                    dna_sequence,
+                    organism_index,
+                    num_organisms=len(metadata),
+                    config=backbone_lora_config,
+                    is_training=False,
+                )
+            else:
+                # Create AlphaGenome trunk (encoder, transformer, decoder);
+                # uses pretrained params for the backbone. AlphaGenome always
+                # creates standard heads based on metadata, but only the
+                # embeddings are used here, not the standard head predictions.
+                alphagenome = model_lib.AlphaGenome(metadata)
+
+                # Call forward_trunk directly (not __call__) - we only need
+                # embeddings, never the standard pretrained heads' predictions,
+                # so this also skips computing (and, when gradient_checkpointing
+                # is on, needlessly recomputing) those on every step.
+                # forward_trunk is @hk.name_like('__call__'), so parameter paths
+                # still match a checkpoint saved via the real __call__.
+                # Per-block hk.remat (installed below, once, when
+                # gradient_checkpointing is on) already wraps the encoder/
+                # transformer-tower/decoder internally at finer granularity than
+                # an outer hk.remat around the whole forward_trunk call would --
+                # see finegrained_remat.py for why that granularity matters (an
+                # outer whole-trunk remat alone still OOM'd at ~53GB once the
+                # backbone isn't detached, e.g. --mode lora).
+                embeddings = alphagenome.forward_trunk(dna_sequence, organism_index)
             if detach_backbone:
                 embeddings = _stop_gradient_embeddings(embeddings)
 
@@ -2691,10 +2809,11 @@ def create_model_with_heads(
             # Get number of organisms from metadata (should be 2: human and mouse)
             num_organisms = len(metadata)
             with hk.name_scope('head'):
-                predictions = _build_head_predictions(
-                    normalized_heads, embeddings, organism_index,
-                    splice_site_positions, num_organisms,
-                )
+                with hk.custom_creator(head_parameter_creator):
+                    predictions = _build_head_predictions(
+                        normalized_heads, embeddings, organism_index,
+                        splice_site_positions, num_organisms,
+                    )
 
             return predictions, embeddings
 
@@ -2770,6 +2889,7 @@ def create_model_with_heads(
         custom_forward_fn=custom_forward,
         custom_heads_list=list(normalized_heads),
         head_configs=head_configs,
+        backbone_lora_config=backbone_lora_config,
     )
 
     print("✓ Model created successfully")
@@ -3004,6 +3124,7 @@ def load_checkpoint(
     detach_backbone: bool = False,
     gradient_checkpointing: bool = False,
     install_backbone_patches: Callable[[], None] | None = None,
+    backbone_lora_config: Any | None = None,
     dtype: str = "bfloat16",
 ) -> CustomAlphaGenomeModel:
     """Load a saved head checkpoint.
@@ -3032,10 +3153,13 @@ def load_checkpoint(
         init_seq_len: Optional sequence length for model initialization. If None and
             use_encoder_output=True, will be inferred from checkpoint parameters.
             This is critical for encoder-only models with flatten pooling.
-        install_backbone_patches: See ``create_model_with_heads`` — forwarded
-            to the internal template-model construction so a resumed LoRA run
-            rebuilds the same LoRA-shaped target tree the checkpoint was
-            saved with.
+        install_backbone_patches: See ``create_model_with_heads``.
+        backbone_lora_config: Fallback ``BackboneLoRAConfig`` for checkpoints
+            whose ``config.json`` records none. A recorded config always wins,
+            so a resumed LoRA run rebuilds the LoRA-shaped target tree the
+            checkpoint was saved with. Checkpoints written by the pre-merge fork
+            (``q_lora``/``v_lora`` keys) are loaded with
+            ``alphagenome_ft.legacy_lora.restore_into_model`` instead.
 
     Returns:
         CustomAlphaGenomeModel with loaded parameters.
@@ -3102,6 +3226,18 @@ def load_checkpoint(
     save_full_model = config['save_full_model']
     save_minimal_model = config.get('save_minimal_model', False)
     use_encoder_output = config.get('use_encoder_output', False)
+    # An explicit ``backbone_lora_config`` argument is used when the checkpoint's
+    # config.json carries none (e.g. a checkpoint written before it was recorded).
+    if config.get('backbone_lora') is not None:
+        from alphagenome_ft.backbone_lora import BackboneLoRAConfig
+
+        backbone_lora_data = config['backbone_lora']
+        backbone_lora_config = BackboneLoRAConfig(
+            rank=int(backbone_lora_data['rank']),
+            alpha=float(backbone_lora_data['alpha']),
+            targets=tuple(backbone_lora_data['targets']),
+            gradient_checkpointing=bool(backbone_lora_data.get('gradient_checkpointing', False)),
+        )
 
     # ``save_minimal_model`` checkpoints match the encoder-only Haiku transform (encoder + heads,
     # no transformer). The restore template in ``create_model_with_heads`` must use the same
@@ -3127,7 +3263,8 @@ def load_checkpoint(
     elif save_full_model:
         print(f"  Model type: Full model")
     else:
-        print(f"  Model type: Heads only")
+        model_type = "Heads + backbone LoRA" if backbone_lora_config else "Heads only"
+        print(f"  Model type: {model_type}")
 
     for head_name, head_config_dict in config['head_configs'].items():
         # Verify head is already registered (required before loading checkpoint)
@@ -3202,6 +3339,7 @@ def load_checkpoint(
         use_encoder_output=template_use_encoder,
         detach_backbone=detach_backbone,
         gradient_checkpointing=gradient_checkpointing,
+        backbone_lora_config=backbone_lora_config,
         init_seq_len=init_for_template,
         install_backbone_patches=install_backbone_patches,
         dtype=dtype,
@@ -3256,7 +3394,17 @@ def load_checkpoint(
             use_encoder_output = True
             print(f"  Inferred use_encoder_output=True (minimal model checkpoint, likely encoder-only)")
 
-    if save_full_model:
+    if save_full_model and backbone_lora_config is not None:
+        # Full model with backbone LoRA. The template was built with the LoRA
+        # forward and the custom heads, and loaded_params has its exact tree, so
+        # swap the saved trees in. Rebuilding from the base model below would run
+        # the native forward and silently ignore the restored lora_a/lora_b.
+        print("Loading full model with backbone LoRA from checkpoint...")
+        custom_model = template_model
+        device = custom_model._device_context._device
+        custom_model._params = jax.device_put(loaded_params, device)
+        custom_model._state = jax.device_put(loaded_state, device)
+    elif save_full_model:
         # Full model checkpoint - load base model structure and use saved params.
         # There are two cases:
         #   1) Standard AlphaGenome full model (no encoder-only head): we can use the
@@ -3384,7 +3532,9 @@ def load_checkpoint(
                         with hk.mixed_precision.push_policy(model_lib.SequenceEncoder, policy):
                             with hk.name_scope('alphagenome'):
                                 # Run encoder ONLY (no transformer/decoder).
-                                trunk, intermediates = model_lib.SequenceEncoder()(dna_sequence, is_training=False)
+                                trunk, intermediates = call_with_is_training(
+                                    model_lib.SequenceEncoder(), dna_sequence, is_training=False
+                                )
                                 encoder_output = trunk  # Shape: (batch, num_positions, encoder_feature_size)
 
                                 # Pad or truncate encoder_output to match expected size (for flatten pooling)
@@ -3689,44 +3839,18 @@ def load_checkpoint(
 
         # Merge loaded head parameters into model
         def merge_head_params(model_params: PyTree, loaded_head_params: PyTree) -> PyTree:
-            """Merge loaded head parameters into model parameters."""
+            """Recursively merge a partial head/adapter checkpoint into a model tree."""
             import copy
-            merged = copy.deepcopy(model_params)
 
-            # Structure 1: Flat keys like 'head/{head_name}/...' (use_encoder_output=True mode)
-            # This happens when heads are created with hk.name_scope('head') outside alphagenome scope
-            if isinstance(loaded_head_params, dict):
-                # Check if we have flat keys starting with 'head/'
-                head_keys = {k: v for k, v in loaded_head_params.items()
-                            if isinstance(k, str) and k.startswith('head/')}
-                if head_keys:
-                    # Merge flat keys directly
-                    for key, value in head_keys.items():
-                        merged[key] = value
+            def merge(base, partial):
+                if not isinstance(partial, dict):
+                    return partial
+                result = copy.deepcopy(base) if isinstance(base, dict) else {}
+                for key, value in partial.items():
+                    result[key] = merge(result.get(key), value)
+                return result
 
-            # Structure 2: alphagenome/head (encoder-only mode, nested)
-            if 'alphagenome/head' in loaded_head_params:
-                if 'alphagenome/head' not in merged:
-                    merged['alphagenome/head'] = {}
-
-                for head_name, head_params in loaded_head_params['alphagenome/head'].items():
-                    merged['alphagenome/head'][head_name] = head_params
-
-            # Structure 3: alphagenome -> head (standard mode, nested)
-            if 'alphagenome' in loaded_head_params:
-                if isinstance(loaded_head_params['alphagenome'], dict):
-                    if 'head' in loaded_head_params['alphagenome']:
-                        if 'alphagenome' not in merged:
-                            merged['alphagenome'] = {}
-                        if not isinstance(merged['alphagenome'], dict):
-                            merged['alphagenome'] = {}
-                        if 'head' not in merged['alphagenome']:
-                            merged['alphagenome']['head'] = {}
-
-                        for head_name, head_params in loaded_head_params['alphagenome']['head'].items():
-                            merged['alphagenome']['head'][head_name] = head_params
-
-            return merged
+            return merge(model_params, loaded_head_params)
 
         custom_model._params = merge_head_params(custom_model._params, loaded_params)
         custom_model._state = merge_head_params(custom_model._state, loaded_state)

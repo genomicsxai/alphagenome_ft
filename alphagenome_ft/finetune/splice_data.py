@@ -210,7 +210,9 @@ class SpliceDataModule:
             return
 
         order = np.arange(len(windows))
-        if self._shuffle:
+        # Only the train split is shuffled (validation keeps BED order), matching
+        # BigWigDataModule.iter_batches; both must agree for CombinedDataModule.
+        if self._shuffle and split == "train":
             rng = np.random.default_rng(seed)
             rng.shuffle(order)
         if skip_batches:

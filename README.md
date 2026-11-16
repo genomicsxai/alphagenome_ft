@@ -4,6 +4,16 @@ A lightweight Python package for finetuning [Google DeepMind's AlphaGenome](http
 
 **Project leads - [Alan Murphy](https://al-murphy.github.io/), [Masayuki (Moon) Nagai](https://masayukinagai.github.io/), [Alejandro Buendia](https://abuendia.github.io/)**
 
+> [!WARNING]
+> 🐛 **Bug fix: fold splits (fixed in 0.1.12).** In versions up to and including
+> 0.1.11, `get_fold_split` and `prepare_intervals_from_fold` held out the wrong
+> Borzoi partitions. As a result, splits did not match the pretrained AlphaGenome
+> fold checkpoints. Starting in 0.1.12, the mapping matches AlphaGenome and Borzoi
+> for all four folds. Runs that used the
+> automatic fold splits should be retrained and re-evaluated. Runs that passed their
+> own train/valid/test BED files are unaffected. See
+> [Fold and target metadata alignment](#fold-and-target-metadata-alignment) for more.
+
 ## Use cases
 
 - If you want to apply AlphaGenome to your MPRA (or other perturbation) data of interest, see [Encoder-only / short sequences (MPRA)](#workflow-1-encoder-only--short-sequences-mpra). [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/finetune_encoder_only_mpra.ipynb)
@@ -46,7 +56,7 @@ A lightweight Python package for finetuning [Google DeepMind's AlphaGenome](http
 
 ## Installation
 
-This package depends on the AlphaGenome stack (`alphagenome` and `alphagenome_research`), which are not on PyPI and must be installed from GitHub. Use the following order.
+This package depends on the AlphaGenome stack (`alphagenome` and `alphagenome_research`). `alphagenome` (≥ 0.7.0) is on PyPI and is installed automatically; `alphagenome_research` is not on PyPI and must be installed from GitHub. Use the following order.
 
 ### Step 1: Install alphagenome-ft
 
@@ -62,22 +72,25 @@ cd alphagenome_ft
 pip install -e .
 ```
 
-This installs `alphagenome-ft` and its PyPI dependencies (JAX, Haiku, optax, etc.). It does **not** install the AlphaGenome model code.
+This installs `alphagenome-ft` and its PyPI dependencies (JAX, Haiku, optax, `alphagenome`, etc.). It does **not** install the AlphaGenome Research model code.
 
-### Step 2: Install AlphaGenome and AlphaGenome Research
+### Step 2: Install AlphaGenome Research
 
-`alphagenome_ft` wraps [AlphaGenome](https://github.com/google-deepmind/alphagenome/) and [AlphaGenome Research](https://github.com/google-deepmind/alphagenome_research/). Install both from GitHub:
+`alphagenome_ft` wraps [AlphaGenome](https://github.com/google-deepmind/alphagenome/) and [AlphaGenome Research](https://github.com/google-deepmind/alphagenome_research/). Install the research package from GitHub:
 
 ```bash
-pip install git+https://github.com/google-deepmind/alphagenome.git
 pip install git+https://github.com/google-deepmind/alphagenome_research.git
 ```
+
+To track the latest base package from GitHub instead of the PyPI release, also run
+`pip install git+https://github.com/google-deepmind/alphagenome.git`.
 
 ### Requirements
 
 - Python ≥ 3.11
+- `alphagenome` ≥ 0.7.0 (on PyPI, installed automatically). Older releases still work when paired with an `alphagenome_research` build from before June 2026, which ships its own FASTA extractor.
 - All other runtime dependencies (JAX, Haiku, optax, orbax-checkpoint, etc.) are installed automatically with `alphagenome-ft`. See `pyproject.toml` for versions.
-- AlphaGenome and AlphaGenome Research must be installed separately as above; they are not on PyPI.
+- AlphaGenome Research must be installed separately from GitHub as above; it is not on PyPI.
 
 ## Quick Start
 There are two options to add new heads to AlphaGenome.
@@ -304,7 +317,7 @@ opt_state = optimizer.init(model._params)
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/genomicsxai/alphagenome_ft/blob/main/notebooks/finetune_rna_lora.ipynb)
 
-**When to use:** Low-rank adapters on the backbone. **Tutorial:** [LoRA-style adapters](docs/lora_adapters.md). For custom Optax loops, use `create_optimizer(..., heads_only=True)` with your LoRA head name so only head (including LoRA) weights update.
+**When to use:** Low-rank adapters on the transformer query/value projections, matching the default `alphagenome-pytorch` LoRA targets. **Tutorial:** [LoRA adapters](docs/lora_adapters.md). Create the model with `backbone_lora_config=BackboneLoRAConfig(...)`; the built-in trainer then defaults to training only the selected heads and LoRA leaves. Custom Optax loops should use `create_optimizer(..., heads_only=True, train_lora=True)`.
 
 ---
 
@@ -545,3 +558,28 @@ If you use the `pypi` environment, create it in the repo under Settings → Envi
 MIT License - see [LICENSE](LICENSE) file for details.
 
 This project extends [AlphaGenome](https://github.com/google-deepmind/alphagenome_research/), which has its own license terms.
+
+
+### Fold and target metadata alignment
+
+Model fold IDs are distinct from the eight partitions in the Borzoi sequence BED.
+`get_fold_split` and `prepare_intervals_from_fold` use these assignments, matching
+`alphagenome-pytorch/scripts/convert_borzoi_folds.py`:
+
+| Model | Validation partition | Test partition | Training partitions |
+| --- | --- | --- | --- |
+| fold_0 | fold0 | fold1 | fold2, fold3, fold4, fold5, fold6, fold7 |
+| fold_1 | fold3 | fold4 | fold0, fold1, fold2, fold5, fold6, fold7 |
+| fold_2 | fold2 | fold5 | fold0, fold1, fold3, fold4, fold6, fold7 |
+| fold_3 | fold6 | fold7 | fold0, fold1, fold2, fold3, fold4, fold5 |
+
+Numeric IDs (`0`–`3`) and model names (`fold_0`–`fold_3`, case insensitive)
+are accepted. Keep the pretrained model version aligned with the selected split.
+
+Targets may specify `strand: "+"`, `strand: "-"`, or `strand: "."` explicitly.
+When omitted, `_forward`/`.forward`/`_plus`/`.plus` or a trailing `+` infer `+`,
+the matching reverse/minus suffixes or a trailing `-` infer `-`, and other labels
+are unstranded (`.`). Explicit strand values override label inference. Stranded
+targets must have equal numbers of positive and negative channels, listed in
+corresponding sample order, because AlphaGenome pairs the k-th `+` track with the
+k-th `-` track for reverse-complement reindexing.

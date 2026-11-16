@@ -18,6 +18,7 @@ from alphagenome_ft.finetune.data import (
     prepare_intervals_from_split,
     build_fasta_index,
     prepare_batch,
+    compute_track_nonzero_means,
 )
 from alphagenome_ft.finetune.splice_data import SpliceDataModule
 from alphagenome_ft.finetune.train import (
@@ -45,6 +46,7 @@ __all__ = [
     'build_fasta_index',
     'prepare_batch',
     'SpliceDataModule',
+    'compute_track_nonzero_means',
     # train
     'register_predefined_heads',
     'create_optimizer',

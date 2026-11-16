@@ -60,6 +60,11 @@ class TrackInfo:
     name: str
     path: Path
     nonzero_mean: float | None = None
+    strand: str | None = None  # Explicit +, -, or .; None infers from the label.
+
+    def __post_init__(self) -> None:
+        if self.strand not in (None, "+", "-", "."):
+            raise ValueError(f"Invalid strand {self.strand!r} for track {self.name!r}.")
 
 
 SPLICE_KINDS = (
@@ -255,7 +260,7 @@ def _parse_targets(entries: Sequence[Mapping[str, Any]]) -> list[TrackInfo]:
             nonzero_mean = float(nonzero_mean)
         if not path.exists():
             raise FileNotFoundError(f'Target file not found: {path}')
-        tracks.append(TrackInfo(name=name, path=path, nonzero_mean=nonzero_mean))
+        tracks.append(TrackInfo(name=name, path=path, nonzero_mean=nonzero_mean, strand=item.get("strand")))
     return tracks
 
 
@@ -288,6 +293,53 @@ def _metadata_from_names(
     return {org: ag_metadata for org in dna_client.Organism}
 
 
+def _infer_track_strand(name: str) -> str:
+    """Infer a track strand from supported forward/reverse label suffixes."""
+    lowered = name.lower()
+    if lowered.endswith(("_forward", ".forward", "_plus", ".plus", "+")):
+        return "+"
+    if lowered.endswith(("_reverse", ".reverse", "_minus", ".minus", "-")):
+        return "-"
+    return "."
+
+
+def _compute_missing_track_means(
+    tracks: Sequence[TrackInfo],
+    intervals: Sequence[Any] | None,
+    *,
+    max_samples: int | None,
+) -> list[TrackInfo]:
+    """Populate an entirely unspecified mean set from training intervals."""
+    if intervals is None or any(track.nonzero_mean is not None for track in tracks):
+        return list(tracks)
+
+    from alphagenome_ft.finetune.data import compute_track_nonzero_means
+
+    strands = [
+        track.strand
+        if track.strand is not None
+        else _infer_track_strand(track.name)
+        for track in tracks
+    ]
+    plus_indices = [index for index, strand in enumerate(strands) if strand == "+"]
+    minus_indices = [index for index, strand in enumerate(strands) if strand == "-"]
+    if len(plus_indices) != len(minus_indices):
+        raise ValueError(
+            "Stranded targets require equal numbers of + and - tracks before "
+            "nonzero means can be estimated."
+        )
+    means = compute_track_nonzero_means(
+        [track.path for track in tracks],
+        intervals,
+        max_samples=max_samples,
+        strand_pair_groups=list(zip(plus_indices, minus_indices)),
+    )
+    return [
+        dataclasses.replace(track, nonzero_mean=float(means[index]))
+        for index, track in enumerate(tracks)
+    ]
+
+
 def _build_track_metadata(
     tracks: Sequence[TrackInfo],
     organism: dna_client.Organism | None,
@@ -300,21 +352,34 @@ def _build_track_metadata(
     real predefined head classes (``alphagenome_research.model.heads``, e.g.
     ``BaseResolutionHead.__init__``'s ``_get_track_means``) read
     ``metadata['nonzero_mean']`` directly to rescale predictions/targets on
-    every forward pass (``predictions_scaling``/``unscale``/``loss``) -
-    without this column they silently fall back to all-ones (no scaling).
-    Confirmed by reading alphagenome_research/model/heads.py directly, not
-    assumed from the column merely existing in the dataframe schema.
+    every forward pass - without this column they silently fall back to
+    all-ones (no scaling).
+
+    Strand comes from ``TrackInfo.strand`` when given, otherwise from common
+    forward/reverse label suffixes (``_infer_track_strand``, as upstream).
+    Stranded targets need equal numbers of + and - tracks (reverse-complement
+    reindexing). Pass ``strand: "."`` per target to reproduce the pre-merge
+    behaviour of this branch (no strand awareness).
     """
-    names = [track.name for track in tracks]
-    df = pd.DataFrame({
-        "name": names,
-        "strand": ["+"] * len(names),
-    })
+    strands = [
+        track.strand if track.strand is not None else _infer_track_strand(track.name)
+        for track in tracks
+    ]
+    if strands.count("+") != strands.count("-"):
+        raise ValueError(
+            "Stranded targets require equal numbers of + and - tracks for reverse-complement "
+            "reindexing. Supply paired tracks in matching order, or strand='.' for unstranded targets."
+        )
+    columns: dict[str, list[Any]] = {
+        "name": [track.name for track in tracks],
+        "strand": strands,
+    }
     if any(track.nonzero_mean is not None for track in tracks):
-        df["nonzero_mean"] = [
-            track.nonzero_mean if track.nonzero_mean is not None else 1.0
+        columns["nonzero_mean"] = [
+            1.0 if track.nonzero_mean is None else float(track.nonzero_mean)
             for track in tracks
         ]
+    df = pd.DataFrame(columns)
     field_name = output_type.name.lower()
     ag_metadata = AlphaGenomeOutputMetadata(**{field_name: df})
     if organism is not None:
@@ -410,7 +475,17 @@ def prepare_head_specs(
     config: Mapping[str, Any],
     *,
     organism: str | None = None,
+    nonzero_mean_intervals: Sequence[Any] | None = None,
+    nonzero_mean_max_samples: int | None = 1000,
 ) -> list[HeadSpec]:
+    """Build head specs and optionally estimate missing predefined-head scales.
+
+    When ``nonzero_mean_intervals`` is provided and none of a predefined head's
+    targets declares ``nonzero_mean``, scales are computed from those training
+    intervals using the same nonzero-value reduction as ``alphagenome-pytorch``.
+    If any target declares a value, the existing explicit/default-1.0 behavior
+    is retained for that head.
+    """
     heads_cfg = config.get('heads')
     if not heads_cfg:
         raise ValueError('Config must define a non-empty "heads" list.')
@@ -485,6 +560,11 @@ def prepare_head_specs(
                 )
             )
         elif source == 'predefined':
+            tracks = _compute_missing_track_means(
+                tracks,
+                nonzero_mean_intervals,
+                max_samples=nonzero_mean_max_samples,
+            )
             kind_name = entry.get('kind')
             if not kind_name:
                 raise ValueError(

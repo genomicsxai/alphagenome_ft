@@ -158,6 +158,72 @@ class TestCheckpointSaveLoad:
         # Verify parameter count matches
         assert loaded_model.count_parameters() == trained_model.count_parameters()
     
+    def test_full_model_checkpoint_keeps_backbone_lora(
+        self,
+        registered_mpra_head,
+        temp_checkpoint_dir,
+        organism_index,
+        device,
+    ):
+        """A full checkpoint of a LoRA model must restore the LoRA forward, not the native one."""
+        from alphagenome_research.model import dna_model
+        from alphagenome_ft.backbone_lora import BackboneLoRAConfig
+
+        require_kaggle_credentials()
+        config = BackboneLoRAConfig(rank=2)
+        model = create_model_with_heads(
+            'all_folds',
+            heads=[registered_mpra_head],
+            device=device,
+            backbone_lora_config=config,
+        )
+        # Nonzero B so the adapters change the output; dropping them would show.
+        model._params = jax.tree_util.tree_map_with_path(
+            lambda path, x: jnp.full_like(x, 0.01) if path[-1].key == 'lora_b' else x,
+            model._params,
+        )
+
+        # A short random sequence keeps the two CPU forward passes fast.
+        sequence = jax.nn.one_hot(
+            jax.random.randint(jax.random.PRNGKey(0), (1, 2**14), 0, 4), 4, dtype=jnp.float32
+        )
+        strand_reindexing = model._metadata[dna_model.Organism.HOMO_SAPIENS].strand_reindexing
+
+        def predict(m):
+            with m._device_context:
+                return m._predict(
+                    m._params,
+                    m._state,
+                    sequence,
+                    organism_index,
+                    requested_outputs=frozenset(),
+                    negative_strand_mask=jnp.zeros(1, dtype=bool),
+                    strand_reindexing=strand_reindexing,
+                )
+
+        original = predict(model)
+        checkpoint_path = temp_checkpoint_dir / 'full_lora'
+        model.save_checkpoint(checkpoint_path, save_full_model=True)
+        loaded = load_checkpoint(checkpoint_path, base_model_version='all_folds', device=device)
+
+        assert loaded._backbone_lora_config == config
+        lora_leaves = lambda m: {
+            jax.tree_util.keystr(path): np.asarray(x)
+            for path, x in jax.tree_util.tree_leaves_with_path(m._params)
+            if path[-1].key in ('lora_a', 'lora_b')
+        }
+        saved, restored = lora_leaves(model), lora_leaves(loaded)
+        assert saved and saved.keys() == restored.keys()
+        for key in saved:
+            np.testing.assert_array_equal(restored[key], saved[key], err_msg=key)
+        reloaded = predict(loaded)
+        assert 'test_mpra_head' in reloaded
+        for a, b in zip(jax.tree_util.tree_leaves(reloaded['test_mpra_head']),
+                        jax.tree_util.tree_leaves(original['test_mpra_head'])):
+            np.testing.assert_array_equal(
+                np.asarray(jax.device_get(a), np.float32), np.asarray(jax.device_get(b), np.float32)
+            )
+
     def test_loaded_model_predictions(
         self,
         trained_model,

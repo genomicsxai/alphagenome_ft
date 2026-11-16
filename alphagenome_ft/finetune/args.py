@@ -131,11 +131,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mode", choices=["linear-probe", "lora"], default="linear-probe",
                          help="'linear-probe' (default): freeze + detach the backbone, "
                               "train only the heads. 'lora': freeze the backbone but do "
-                              "NOT detach it; instead monkeypatch alphagenome_research's "
-                              "MHABlock so the --lora-targets q/v projections get a "
-                              "trainable low-rank adapter (see "
-                              "alphagenome_ft.lora.install_mha_backbone_lora), and train "
-                              "those adapters + heads. Mirrors alphagenome-pytorch's "
+                              "NOT detach it; instead build the trunk with "
+                              "alphagenome_ft.backbone_lora so the --lora-targets q/v "
+                              "projections get a trainable low-rank adapter (same "
+                              "parameter paths as the pretrained model, plus "
+                              "lora_a/lora_b), and train those adapters + heads. Mirrors alphagenome-pytorch's "
                               "--mode lora.")
     parser.add_argument("--lora-rank", type=int, default=8,
                          help="LoRA rank for --mode lora. Matches alphagenome-pytorch's "
@@ -147,8 +147,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lora-targets", default="q_proj,v_proj",
                          help="Comma-separated backbone attention projections to adapt "
                               "for --mode lora, using alphagenome-pytorch's naming "
-                              "(q_proj/k_proj/v_proj — translated internally to this "
-                              "JAX model's q_layer/k_layer/v_layer). Matches "
+                              "(q_proj/v_proj — translated internally to this "
+                              "JAX model's q_layer/v_layer; k_proj is not supported). Matches "
                               "alphagenome-pytorch's --lora-targets default.")
     parser.add_argument("--max-train-steps", type=int, default=None,
                          help="Optional global cap on optimizer updates, for "

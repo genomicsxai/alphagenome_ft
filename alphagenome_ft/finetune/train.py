@@ -98,8 +98,8 @@ def register_predefined_heads(head_specs: Sequence[HeadSpec]) -> None:
 ## optax.multi_transform, no gradient clipping) - a duplicate of, and shadowed
 ## the import of, alphagenome_ft.optimizer_utils.create_optimizer below, which
 ## already does the same heads_only masking AND supports
-## gradient_clip_global_norm. Removed the local duplicate so the import is
-## what actually runs, and threaded gradient_clip_global_norm through train().
+## gradient clipping (``max_grad_norm`` here). Removed the local duplicate so the
+## import is what actually runs.
 
 
 def _splice_head_track_names(spec: HeadSpec) -> list[str]:
@@ -124,6 +124,40 @@ def _splice_head_track_names(spec: HeadSpec) -> list[str]:
     if spec.kind == "splice_sites_junction":
         return [Path(p).stem for p in ss.star_junctions]
     raise ValueError(f"No per-track names for head kind {spec.kind!r}.")
+
+
+# Kept under its historical name: upstream's tests (and some callers) import it from here.
+_label_params_for_heads = label_params_for_trainable_heads
+
+
+def stop_frozen_parameter_gradients(params, labels):
+    """Freeze weight derivatives while retaining derivatives through activations."""
+    return jax.tree_util.tree_map(
+        lambda parameter, label: parameter if label == "head" else jax.lax.stop_gradient(parameter),
+        params, labels,
+    )
+
+
+def _resolve_lora_training_mode(
+    model: CustomAlphaGenomeModel,
+    *,
+    heads_only: bool | None,
+    train_lora: bool | None,
+) -> tuple[bool, bool]:
+    """Infer safe trainer defaults and reject accidental full-backbone LoRA runs."""
+    has_backbone_lora = getattr(model, "_backbone_lora_config", None) is not None
+    resolved_train_lora = has_backbone_lora if train_lora is None else train_lora
+    if heads_only is None:
+        resolved_heads_only = has_backbone_lora or resolved_train_lora
+    else:
+        resolved_heads_only = heads_only
+    if resolved_train_lora and not resolved_heads_only:
+        raise ValueError(
+            "train_lora=True requires heads_only=True; otherwise the pretrained "
+            "backbone would also be updated. Pass heads_only=True, or set "
+            "train_lora=False for full-model finetuning."
+        )
+    return bool(resolved_heads_only), bool(resolved_train_lora)
 
 
 def _replicate_tree(tree, devices):
@@ -171,14 +205,15 @@ def train(
     num_epochs: int,
     seed: int = 42,
     max_train_steps: int | None = None,
-    heads_only: bool = False,
-    lora_enabled: bool = False,
+    max_grad_norm: float | None = 1.0,
+    heads_only: bool | None = None,
     checkpoint_dir: Path | None = None,
     organism: str = "HOMO_SAPIENS",
     best_metric: str = "valid_loss",
     best_metric_mode: str = "min",
     early_stopping_patience: int = 0,
     early_stopping_min_delta: float = 0.0,
+    early_stopping_min_epochs: int = 0,
     verbose: bool = False,
     use_wandb: bool = False,
     wandb_project: str | None = None,
@@ -189,13 +224,13 @@ def train(
     gradient_accumulation_steps: int = 1,
     resume_from: Path | None = None,
     save_every_steps: int | None = None,
-    gradient_clip_global_norm: float | None = None,
     log_every: int = 50,
     modality_weights: dict[str, float] | None = None,
     warmup_steps: int = 0,
     lr_schedule: str = "constant",
     compute_pearson: bool = True,
     metrics_per_sample: bool = False,
+    train_lora: bool | None = None,
 ) -> None:
     """Run fine-tuning with pmapped train/eval steps.
 
@@ -208,20 +243,20 @@ def train(
         num_epochs: Maximum number of epochs to run.
         seed: Base RNG seed used for per-epoch training shuffles.
         max_train_steps: Optional global cap on optimizer updates across all epochs.
-        heads_only: If True, freeze backbone and optimize selected heads only.
-        lora_enabled: If True (requires ``heads_only=True``), also keep
-            backbone LoRA adapter params trainable alongside the heads —
-            matches alphagenome-pytorch's ``--mode lora``. The caller is
-            responsible for having installed the LoRA-patched backbone (see
-            ``alphagenome_ft.lora.install_mha_backbone_lora``) and for NOT
-            passing ``detach_backbone=True`` to model construction (LoRA
-            needs gradients to reach the adapters through the backbone).
+        max_grad_norm: Clip gradients to this global norm before the AdamW
+            update. Defaults to 1.0 to match the PyTorch pipeline's
+            ``--max-grad-norm`` default. Pass ``None`` (or 0) to disable
+            clipping, which reproduces the pre-parity JAX behaviour.
+        heads_only: If True, freeze the backbone and optimize selected heads
+            only. ``None`` (the default) enables this automatically for a model
+            created with ``backbone_lora_config`` or when ``train_lora=True``.
         checkpoint_dir: Optional output directory for ``best``/``last`` checkpoints.
         organism: Organism enum name used for model organism indexing.
         best_metric: Metric name used for best-checkpoint and early-stopping tracking.
         best_metric_mode: Improvement direction for ``best_metric`` (``min`` or ``max``).
         early_stopping_patience: Stop after this many non-improving epochs (0 disables).
         early_stopping_min_delta: Minimum metric change required to count as improvement.
+        early_stopping_min_epochs: Do not stop before this many epochs have completed.
         verbose: If True, print per-step progress and extra diagnostics.
         use_wandb: If True, log metrics to Weights & Biases.
         wandb_project: Optional W&B project name override.
@@ -270,11 +305,6 @@ def train(
             reported average train loss (which only reflects steps *after*
             the resume point when resuming mid-epoch — a minor, accepted
             approximation).
-        gradient_clip_global_norm: If set, clip gradients to this global norm
-            before the optimizer update (``optax.clip_by_global_norm``, via
-            ``alphagenome_ft.optimizer_utils.create_optimizer`` — see that
-            function's docstring). Matches alphagenome-pytorch's
-            ``--max-grad-norm``. ``None`` (default) disables clipping.
         log_every: Log per-head training loss (to ``checkpoint_dir``'s
             ``training_log.csv``, and to W&B if enabled) every this many
             optimizer steps. Matches alphagenome-pytorch's ``--log-every``.
@@ -298,6 +328,11 @@ def train(
             biological sample, for splice_usage/splice_junctions) Pearson
             correlation. No effect if ``compute_pearson`` is False. Matches
             alphagenome-pytorch's ``--metrics-per-sample``. Default False.
+        train_lora: Train LoRA adapter leaves in addition to the selected heads.
+            ``None`` (the default) enables this automatically when the model was
+            created with ``backbone_lora_config``. ``train_lora=True`` with
+            ``heads_only=False`` is rejected to prevent accidental full-backbone
+            updates.
 
     Notes:
         Total planned steps are computed before training from train-set size and
@@ -365,19 +400,28 @@ def train(
         )
     devices = available_devices[:num_devices]
 
+    heads_only, train_lora = _resolve_lora_training_mode(
+        model,
+        heads_only=heads_only,
+        train_lora=train_lora,
+    )
+
     wb_config = {
         "learning_rate": learning_rate,
         "weight_decay": weight_decay,
+        "max_grad_norm": max_grad_norm,
         "num_epochs": num_epochs,
         "batch_size": data_module._batch_size,
         "steps_per_epoch": steps_per_epoch,
         "total_train_steps": total_train_steps,
         "heads_only": heads_only,
+        "train_lora": train_lora,
         "organism": organism,
         "num_devices": num_devices,
         "best_metric": best_metric,
         "best_metric_mode": best_metric_mode,
         "early_stopping_patience": early_stopping_patience,
+        "early_stopping_min_epochs": early_stopping_min_epochs,
         "seed": seed,
         **(wandb_config or {}),
     }
@@ -397,8 +441,6 @@ def train(
             "Single-host multi-GPU training currently requires drop_last=True so every "
             "batch can be sharded evenly across devices."
         )
-    if lora_enabled and not heads_only:
-        raise ValueError("lora_enabled requires heads_only=True.")
     if heads_only:
         model.freeze_backbone()
 
@@ -409,8 +451,8 @@ def train(
         learning_rate=lr_or_schedule,
         weight_decay=weight_decay,
         heads_only=heads_only,
-        lora_enabled=lora_enabled,
-        gradient_clip_global_norm=gradient_clip_global_norm,
+        train_lora=train_lora,
+        gradient_clip_global_norm=max_grad_norm,
     )
     opt_state = optimizer.init(model._params)
     modality_weights = modality_weights or {}
@@ -463,7 +505,7 @@ def train(
     _trainable_labels = None
     if heads_only:
         _trainable_labels = label_params_for_trainable_heads(
-            model._params, head_names, lora_enabled=lora_enabled,
+            model._params, head_names, include_lora=train_lora,
         )
 
     @functools.partial(jax.pmap, axis_name="data")
@@ -478,10 +520,7 @@ def train(
 
         def loss_fn(current_params):
             if _trainable_labels is not None:
-                current_params = jax.tree_util.tree_map(
-                    lambda label, x: x if label == "head" else jax.lax.stop_gradient(x),
-                    _trainable_labels, current_params,
-                )
+                current_params = stop_frozen_parameter_gradients(current_params, _trainable_labels)
             predictions = model._predict(
                 current_params,
                 state,
@@ -490,6 +529,7 @@ def train(
                 negative_strand_mask=batch["negative_strand_mask"],
                 strand_reindexing=batch["strand_reindexing"],
                 **_predict_extra_kwargs(batch),
+                requested_outputs=frozenset(),
             )
             head_losses = {}
             for head_name in head_names:
@@ -581,6 +621,7 @@ def train(
             negative_strand_mask=batch["negative_strand_mask"],
             strand_reindexing=batch["strand_reindexing"],
             **_predict_extra_kwargs(batch),
+            requested_outputs=frozenset(),
         )
         head_losses = {}
         for head_name in head_names:
@@ -979,7 +1020,11 @@ def train(
                 _write_train_state(checkpoint_dir / "last", resume_epoch=epoch + 1, resume_epoch_step=0)
                 _save_opt_state(checkpoint_dir / "last")
 
-            if early_stopping_patience > 0 and epochs_since_improvement >= early_stopping_patience:
+            if (
+                early_stopping_patience > 0
+                and epoch >= early_stopping_min_epochs
+                and epochs_since_improvement >= early_stopping_patience
+            ):
                 print(f"\n  Early stopping: no improvement for {epochs_since_improvement} epoch(s)")
                 break
             if stop_training:
