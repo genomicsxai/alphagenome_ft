@@ -291,6 +291,63 @@ class TestTopKSplicePositions:
         np.testing.assert_array_equal(np.asarray(positions[0, 0]), [0, 1, 2, 3, -1, -1])
 
 
+    def test_selects_on_probabilities_and_applies_threshold(self):
+        logits = jnp.full((1, 6, 5), -10.0).at[0, :, 4].set(0.0)
+        logits = logits.at[0, 1, 0].set(3.0)           # p(donor+) ~ 0.95
+        logits = logits.at[0, 4, 0].set(5.0).at[0, 4, 4].set(8.0)  # high logit, p ~ 0.05
+        logits = logits.at[0, 2, 0].set(0.0)           # p = 0.5
+        positions = top_k_splice_positions(logits, top_k=4, threshold=0.1)
+        np.testing.assert_array_equal(np.asarray(positions[0, 0]), [1, 2, -1, -1])
+        assert bool(jnp.all(positions[0, 1:] == -1))
+
+    def test_matches_alphagenome_research(self):
+        from alphagenome_research.model import splicing
+
+        logits = 3 * jax.random.normal(jax.random.PRNGKey(0), (2, 300, 5))
+        ours = top_k_splice_positions(logits, top_k=64, threshold=0.1)
+        ref = splicing.generate_splice_site_positions(
+            jax.nn.softmax(logits, axis=-1), alt=None, splice_sites=None,
+            k=64, pad_to_length=64, threshold=0.1,
+        )
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(ref))
+
+
+class TestRawJunctionEventsNoCap:
+    def test_rows_grow_instead_of_truncating(self):
+        dm = SpliceDataModule.__new__(SpliceDataModule)
+        dm._junction_event_pad_size = 4
+        assert dm._junction_event_rows(0) == 4
+        assert dm._junction_event_rows(4) == 4
+        assert dm._junction_event_rows(5) == 8
+        assert dm._junction_event_rows(33) == 64
+
+
+def test_cli_defaults_aligned():
+    from alphagenome_ft.finetune.args import parse_args
+
+    args = parse_args([
+        "--checkpoint-path", "ckpt", "--genome", "g.fa",
+        "--train-bed", "t.bed", "--val-bed", "v.bed",
+        "--star-junctions", "a.tab", "--bigwig", "a.bw",
+        "--output-dir", "out", "--run-name", "r",
+    ])
+    assert args.splice_num_segments == 1
+    # alphagenome-pytorch defaults
+    assert args.weight_decay == 0.1
+    assert args.warmup_steps == 500
+    assert args.lr_schedule == "cosine"
+    assert args.mode == "lora"
+    assert args.sequence_length == 131072
+    assert args.pretrained_head_samples is None
+    assert args.rope_init == "truncated_normal"
+    assert args.batch_size == 1
+    assert args.lora_alpha == 16 and isinstance(args.lora_alpha, int)
+    assert args.seed == 1234
+    assert args.max_splice_sites == 256
+    assert args.junction_top_k == 512
+    assert args.splice_site_threshold == 0.1
+
+
 class TestBuildJunctionMatrix:
     """Cross-check the vectorized JAX rebuild against the trusted pandas reference."""
 
@@ -496,7 +553,7 @@ class TestSpliceTrainingSmoke:
             filter_to_junctions=False,
             max_splice_sites=16,
             emit_raw_junction_events=True,
-            max_junctions_per_window=32,
+            junction_event_pad_size=32,
         )
 
         run_train(

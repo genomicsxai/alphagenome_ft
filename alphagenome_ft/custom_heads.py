@@ -169,6 +169,7 @@ def register_junction_position_source(
     *,
     top_k: int,
     classification_head_id: str,
+    splice_site_threshold: float = 0.1,
 ) -> None:
     """Record that a junction head derives positions from a classification head's logits.
 
@@ -178,12 +179,13 @@ def register_junction_position_source(
     normalized_name = normalize_head_name(head_name)
     _JUNCTION_POSITION_SOURCE_REGISTRY[normalized_name] = {
         "top_k": top_k,
+        "splice_site_threshold": splice_site_threshold,
         "classification_head_id": normalize_head_name(classification_head_id),
     }
 
 
 def get_junction_position_source(head_name: HeadNameLike) -> dict[str, Any] | None:
-    """Return ``{"top_k", "classification_head_id"}`` for a predicted-mode junction head, else None."""
+    """Return ``{"top_k", "splice_site_threshold", "classification_head_id"}`` for a predicted-mode junction head, else None."""
     return _JUNCTION_POSITION_SOURCE_REGISTRY.get(normalize_head_name(head_name))
 
 
@@ -415,7 +417,7 @@ def register_predefined_head(
             raise TypeError(
                 f"Expected predefined head config for '{normalized_name}', got {type(cfg)!r}."
             )
-        return predefined_heads.create_head(cfg, metadata)
+        return _with_pytorch_target_scaling(predefined_heads.create_head(cfg, metadata))
 
     _HEAD_REGISTRY[normalized_name] = _predefined_factory
     _HEAD_CONFIG_REGISTRY[normalized_name] = config_with_alias_name
@@ -525,7 +527,36 @@ def create_predefined_head_from_config(
     metadata: Mapping,
 ) -> predefined_heads.Head:
     """Instantiate a predefined head from an explicit config."""
-    return predefined_heads.create_head(config, metadata)
+    return _with_pytorch_target_scaling(predefined_heads.create_head(config, metadata))
+
+
+# alphagenome-pytorch's targets_scaling divides by (track_mean * resolution + 1e-8).
+_TARGET_SCALING_EPS = 1e-8
+
+
+def _with_pytorch_target_scaling(head):
+    """Give a GenomeTracksHead alphagenome-pytorch's target scaling.
+
+    Identical to ``alphagenome_research.model.heads.targets_scaling`` except
+    for the ``+ 1e-8`` in the track-mean denominator that alphagenome-pytorch's
+    ``targets_scaling`` adds (prediction unscaling has no epsilon on either
+    side, so ``unscale`` is left alone). Applied per instance so the upstream
+    module is not patched globally.
+    """
+    if not isinstance(head, predefined_heads.GenomeTracksHead):
+        return head
+    import jax.numpy as jnp
+
+    def scale(x, organism_index, resolution):
+        track_means = predefined_heads._get_param_for_index(head._track_means, organism_index)
+        x = x / (track_means[:, None] * resolution + _TARGET_SCALING_EPS).astype(x.dtype)
+        if head._apply_squashing:
+            x = jnp.power(x, 0.75)
+        clip = predefined_heads._SOFT_CLIP_VALUE
+        return jnp.where(x > clip, 2.0 * jnp.sqrt(x * clip) - clip, x)
+
+    object.__setattr__(head, "scale", scale)
+    return head
 
 
 def create_predefined_head(

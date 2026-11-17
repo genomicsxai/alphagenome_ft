@@ -90,6 +90,7 @@ def register_predefined_heads(head_specs: Sequence[HeadSpec]) -> None:
             register_junction_position_source(
                 spec.head_id,
                 top_k=spec.splice_source.junction_top_k,
+                splice_site_threshold=spec.splice_source.splice_site_threshold,
                 classification_head_id=spec.splice_source.classification_head_id,
             )
 
@@ -124,6 +125,334 @@ def _splice_head_track_names(spec: HeadSpec) -> list[str]:
     if spec.kind == "splice_sites_junction":
         return [Path(p).stem for p in ss.star_junctions]
     raise ValueError(f"No per-track names for head kind {spec.kind!r}.")
+
+
+# --- Validation metrics, aligned with alphagenome-pytorch -------------------
+#
+# Every definition below mirrors alphagenome-pytorch's
+# ``extensions/finetuning/training.py`` (``validate_multihead``,
+# ``_extract_splice_pearson_pairs``, ``_extract_junction_pearson_per_sample``,
+# ``_extract_usage_pearson_per_sample``) and ``alphagenome_pytorch.metrics``,
+# including metric key names, so epoch logs from the two repos are directly
+# comparable. Pooled Pearson correlations are accumulated as float64
+# sufficient statistics instead of concatenating every value (PyTorch's
+# approach); this is the same quantity, computed in bounded memory.
+
+_PEARSON_EPS = 1e-8  # alphagenome_pytorch.metrics.pearson_r default eps
+_SPLICE_CLS_NAMES = ("donor_pos", "acceptor_pos", "donor_neg", "acceptor_neg", "no_site")
+_JUNCTION_COUNT_VARIANTS = ("full", "nonzero")  # log1p before Pearson
+_JUNCTION_VARIANTS = ("full", "nonzero", "psi5", "psi3")
+_PSI_EPS = 1e-8
+
+
+def _pearson_r_1d(pred, true) -> float:
+    """``alphagenome_pytorch.metrics.pearson_r`` on two flat arrays."""
+    pred = np.asarray(pred, dtype=np.float64).ravel()
+    true = np.asarray(true, dtype=np.float64).ravel()
+    pc = pred - pred.mean()
+    tc = true - true.mean()
+    denom = np.sqrt((pc * pc).sum()) * np.sqrt((tc * tc).sum())
+    return float((pc * tc).sum() / (denom + _PEARSON_EPS))
+
+
+class _PearsonSums:
+    """Pooled Pearson r from streamed sufficient statistics (float64).
+
+    Equal to ``pearson_r(cat(pred), cat(true))`` over everything added;
+    ``shape`` gives independent accumulators (e.g. one per channel).
+    """
+
+    _KEYS = ("n", "sx", "sy", "sxy", "sx2", "sy2")
+
+    def __init__(self, shape=()):
+        for k in self._KEYS:
+            setattr(self, k, np.zeros(shape, dtype=np.float64))
+
+    def add(self, pred, true, weight=None, axis=None) -> None:
+        pred = np.asarray(pred, dtype=np.float64)
+        true = np.asarray(true, dtype=np.float64)
+        w = np.ones_like(pred) if weight is None else np.asarray(weight, dtype=np.float64)
+        self.n = self.n + np.sum(w, axis=axis)
+        self.sx = self.sx + np.sum(w * pred, axis=axis)
+        self.sy = self.sy + np.sum(w * true, axis=axis)
+        self.sxy = self.sxy + np.sum(w * pred * true, axis=axis)
+        self.sx2 = self.sx2 + np.sum(w * pred * pred, axis=axis)
+        self.sy2 = self.sy2 + np.sum(w * true * true, axis=axis)
+
+    def add_stats(self, stats: Mapping[str, np.ndarray]) -> None:
+        for k in self._KEYS:
+            setattr(self, k, getattr(self, k) + np.asarray(stats[k], dtype=np.float64))
+
+    def r(self):
+        """Pearson r; NaN where fewer than 2 values (PyTorch skips those)."""
+        n = self.n
+        with np.errstate(divide="ignore", invalid="ignore"):
+            num = self.sxy - self.sx * self.sy / n
+            vx = np.clip(self.sx2 - self.sx * self.sx / n, 0, None)
+            vy = np.clip(self.sy2 - self.sy * self.sy / n, 0, None)
+            r = num / (np.sqrt(vx) * np.sqrt(vy) + _PEARSON_EPS)
+        return np.where(n > 1, r, np.nan)
+
+
+def _device_pearson_stats(pred, true, weight, axis):
+    """Per-batch sufficient statistics on device (summed over ``axis``)."""
+    pred = pred.astype(jnp.float32)
+    true = true.astype(jnp.float32)
+    w = weight.astype(jnp.float32)
+    return {
+        "n": jnp.sum(w, axis=axis),
+        "sx": jnp.sum(w * pred, axis=axis),
+        "sy": jnp.sum(w * true, axis=axis),
+        "sxy": jnp.sum(w * pred * true, axis=axis),
+        "sx2": jnp.sum(w * pred * pred, axis=axis),
+        "sy2": jnp.sum(w * true * true, axis=axis),
+    }
+
+
+def _profile_pearson_r(pred, true):
+    """``alphagenome_pytorch.metrics.profile_pearson_r``: Pearson over positions
+    (axis 1) per (region, track). ``pred``/``true``: (B, S, T) -> (B, T)."""
+    pred = pred.astype(jnp.float32)
+    true = true.astype(jnp.float32)
+    pc = pred - pred.mean(axis=1, keepdims=True)
+    tc = true - true.mean(axis=1, keepdims=True)
+    num = (pc * tc).sum(axis=1)
+    denom = jnp.sqrt((pc * pc).sum(axis=1)) * jnp.sqrt((tc * tc).sum(axis=1))
+    return num / (denom + _PEARSON_EPS)
+
+
+def _usage_device_stats(pred, target):
+    """splice_usage stats, as ``_extract_splice_pearson_pairs`` (usage) and
+    ``_extract_usage_pearson_per_sample``: predictions are sigmoid
+    probabilities; "full" pools every channel at positions where any channel's
+    target > 0; per-sample pools channel ``c`` where its own target > 0."""
+    full_w = jnp.broadcast_to(jnp.any(target > 0, axis=-1, keepdims=True), target.shape)
+    per_w = target > 0
+    return {
+        "full": _device_pearson_stats(pred, target, full_w, axis=None),
+        "per_channel": _device_pearson_stats(pred, target, per_w, axis=(0, 1)),
+    }
+
+
+def _junction_variants(pred, target, positions):
+    """Host-side mirror of ``_extract_splice_pearson_pairs`` (junction head).
+
+    ``pred``/``target``: (B, D, A, 2T) with positive-strand tissues first;
+    ``positions``: (B, 4, K) [pos_donor, pos_acceptor, neg_donor, neg_acceptor].
+    Returns {variant: (pred_flat, true_flat)} for full/nonzero/psi5/psi3 and
+    binary_cls (pred scores vs target > 0), pooled over both strands.
+    """
+    pred = np.asarray(pred, dtype=np.float32)
+    target = np.asarray(target, dtype=np.float32)
+    positions = np.asarray(positions)
+    n_t = pred.shape[-1] // 2
+    out = {k: ([], []) for k in (*_JUNCTION_VARIANTS, "binary_cls")}
+    for sl, d_row, a_row in ((slice(None, n_t), 0, 1), (slice(n_t, None), 2, 3)):
+        p = pred[..., sl]
+        t = target[..., sl]
+        pairs = (positions[:, d_row, :] >= 0)[:, :, None] & (positions[:, a_row, :] >= 0)[:, None, :]
+        m4 = np.broadcast_to(pairs[..., None], p.shape)
+        if m4.any():
+            out["full"][0].append(p[m4]); out["full"][1].append(t[m4])
+            out["binary_cls"][0].append(p[m4]); out["binary_cls"][1].append((t[m4] > 0).astype(np.float32))
+        nz = m4 & (t > 0)
+        if nz.any():
+            out["nonzero"][0].append(p[nz]); out["nonzero"][1].append(t[nz])
+        t_d = t.sum(axis=2, keepdims=True)
+        p_d = p.sum(axis=2, keepdims=True)
+        v5 = m4 & np.broadcast_to(t_d > 0, m4.shape)
+        if v5.any():
+            out["psi5"][0].append((p / (p_d + _PSI_EPS))[v5]); out["psi5"][1].append((t / (t_d + _PSI_EPS))[v5])
+        t_a = t.sum(axis=1, keepdims=True)
+        p_a = p.sum(axis=1, keepdims=True)
+        v3 = m4 & np.broadcast_to(t_a > 0, m4.shape)
+        if v3.any():
+            out["psi3"][0].append((p / (p_a + _PSI_EPS))[v3]); out["psi3"][1].append((t / (t_a + _PSI_EPS))[v3])
+    return {
+        k: (np.concatenate(ps), np.concatenate(ts)) for k, (ps, ts) in out.items() if ps
+    }
+
+
+def _junction_per_sample(pred, target, positions):
+    """Host-side mirror of ``_extract_junction_pearson_per_sample``: per
+    biological sample ``s``, both strands' valid pairs pooled; returns a list
+    of {"full": (p, t), "nonzero": (p, t) | None}."""
+    pred = np.asarray(pred, dtype=np.float32)
+    target = np.asarray(target, dtype=np.float32)
+    positions = np.asarray(positions)
+    n_t = pred.shape[-1] // 2
+    per = [([], []) for _ in range(n_t)]
+    for off, d_row, a_row in ((0, 0, 1), (n_t, 2, 3)):
+        pairs = (positions[:, d_row, :] >= 0)[:, :, None] & (positions[:, a_row, :] >= 0)[:, None, :]
+        for s_idx in range(n_t):
+            per[s_idx][0].append(pred[..., off + s_idx][pairs])
+            per[s_idx][1].append(target[..., off + s_idx][pairs])
+    result = []
+    for ps, ts in per:
+        p = np.concatenate(ps); t = np.concatenate(ts)
+        nz = t > 0
+        result.append({"full": (p, t), "nonzero": (p[nz], t[nz]) if nz.any() else None})
+    return result
+
+
+def _cls_active_and_background(logits, target, rng):
+    """Mirror of PyTorch's classification auPRC sampling: every active
+    (any target > 0) position plus an equal-sized random background subsample."""
+    logits = np.asarray(logits, dtype=np.float32).reshape(-1, 5)
+    target = np.asarray(target, dtype=np.float32).reshape(-1, 5)
+    active = target.any(axis=-1)
+    n_active = int(active.sum())
+    if n_active == 0:
+        return None
+    bg = np.flatnonzero(~active)
+    parts_l, parts_t = [logits[active]], [target[active]]
+    if bg.size:
+        pick = bg[rng.permutation(bg.size)[: min(n_active, bg.size)]]
+        parts_l.append(logits[pick]); parts_t.append(target[pick])
+    return np.concatenate(parts_l), np.concatenate(parts_t)
+
+
+class _ValidationMetrics:
+    """Accumulates and finalizes alphagenome-pytorch's validation metrics."""
+
+    def __init__(self, per_sample: bool, seed: int = 0):
+        self.per_sample = per_sample
+        self.rng = np.random.default_rng(seed)
+        self.profile_r: dict[str, list] = {}
+        self.pred_counts: dict[str, list] = {}
+        self.true_counts: dict[str, list] = {}
+        self.usage_full: dict[str, _PearsonSums] = {}
+        self.usage_per_channel: dict[str, _PearsonSums] = {}
+        self.junction: dict[str, dict[str, _PearsonSums]] = {}
+        self.junction_nonzero: dict[str, list] = {}  # [n_nonzero, n_total]
+        self.junction_bincls: dict[str, tuple[list, list]] = {}
+        self.junction_per_sample: dict[str, list] = {}
+        self.cls: dict[str, tuple[list, list]] = {}
+
+    # Genome tracks (rna_seq etc.): profile r per (region, track) + counts.
+    def add_genome_tracks(self, name, profile_r, pred_counts, true_counts):
+        self.profile_r.setdefault(name, []).append(np.asarray(profile_r, np.float64))
+        self.pred_counts.setdefault(name, []).append(np.asarray(pred_counts, np.float64))
+        self.true_counts.setdefault(name, []).append(np.asarray(true_counts, np.float64))
+
+    def add_usage(self, name, stats):
+        full = self.usage_full.setdefault(name, _PearsonSums())
+        full.add_stats(stats["full"])
+        n_ch = np.asarray(stats["per_channel"]["n"]).shape
+        pc = self.usage_per_channel.setdefault(name, _PearsonSums(n_ch))
+        pc.add_stats(stats["per_channel"])
+
+    def add_junction(self, name, pred, target, positions):
+        variants = _junction_variants(pred, target, positions)
+        if "full" not in variants:
+            return
+        sums = self.junction.setdefault(name, {v: _PearsonSums() for v in _JUNCTION_VARIANTS})
+        for v in _JUNCTION_VARIANTS:
+            if v in variants:
+                p, t = variants[v]
+                if v in _JUNCTION_COUNT_VARIANTS:
+                    p, t = np.log1p(p.astype(np.float64)), np.log1p(t.astype(np.float64))
+                sums[v].add(p, t)
+        full_t = variants["full"][1]
+        cnt = self.junction_nonzero.setdefault(name, [0, 0])
+        cnt[0] += int((full_t > 0).sum()); cnt[1] += int(full_t.size)
+        bp, bt = self.junction_bincls.setdefault(name, ([], []))
+        bp.append(variants["binary_cls"][0]); bt.append(variants["binary_cls"][1])
+        if self.per_sample:
+            ps = _junction_per_sample(pred, target, positions)
+            acc = self.junction_per_sample.setdefault(
+                name, [{"full": _PearsonSums(), "nonzero": _PearsonSums()} for _ in ps]
+            )
+            for s_idx, data in enumerate(ps):
+                for v in ("full", "nonzero"):
+                    if data[v] is not None:
+                        p, t = data[v]
+                        acc[s_idx][v].add(np.log1p(p.astype(np.float64)), np.log1p(t.astype(np.float64)))
+
+    def add_classification(self, name, logits, target):
+        picked = _cls_active_and_background(logits, target, self.rng)
+        if picked is None:
+            return
+        lg, tg = self.cls.setdefault(name, ([], []))
+        lg.append(picked[0]); tg.append(picked[1])
+
+    def finalize(self) -> tuple[dict, list[dict], dict]:
+        """Returns (metrics, per_sample_rows, histograms) with PyTorch's keys."""
+        metrics: dict = {}
+        histograms: dict = {}
+        for name, chunks in self.profile_r.items():
+            r = np.concatenate(chunks, axis=0)
+            metrics[f"{name}_1bp_profile_pearson_r_mean"] = float(r.mean())
+            metrics[f"{name}_1bp_profile_pearson_r_std"] = float(r.std(ddof=1)) if r.size > 1 else float("nan")
+            histograms[f"{name}_1bp_profile_pearson_r_values"] = r.ravel().tolist()
+            pc = np.concatenate(self.pred_counts[name], axis=0)
+            tc = np.concatenate(self.true_counts[name], axis=0)
+            if pc.shape[0] > 1:
+                per_track = [_pearson_r_1d(pc[:, j], tc[:, j]) for j in range(pc.shape[1])]
+                metrics[f"{name}_1bp_count_pearson_r"] = float(np.mean(per_track))
+            else:
+                metrics[f"{name}_1bp_count_pearson_r"] = float("nan")
+        for name, sums in self.usage_full.items():
+            r = float(sums.r())
+            if math.isfinite(r):
+                metrics[f"{name}_pearson_r"] = r
+        for name, by_variant in self.junction.items():
+            for v, sums in by_variant.items():
+                r = float(sums.r())
+                if math.isfinite(r):
+                    metrics[f"{name}_pearson_r" + ("" if v == "full" else f"_{v}")] = r
+            nz, total = self.junction_nonzero[name]
+            if total:
+                metrics[f"{name}_target_nonzero_frac"] = nz / total
+        if self.junction_bincls or self.cls:
+            from sklearn.metrics import average_precision_score
+        for name, (bp, bt) in self.junction_bincls.items():
+            p = np.concatenate(bp); t = np.concatenate(bt)
+            if t.sum() > 0 and p.shape[0] > 1:
+                metrics[f"{name}_auprc_junction"] = float(average_precision_score(t, p))
+        for name, (lg, tg) in self.cls.items():
+            logits = np.concatenate(lg).astype(np.float64)
+            true = np.concatenate(tg)
+            if true.shape[0] == 0:
+                continue
+            e = np.exp(logits - logits.max(axis=-1, keepdims=True))
+            probs = e / e.sum(axis=-1, keepdims=True)
+            for i, cls_name in enumerate(_SPLICE_CLS_NAMES):
+                if true[:, i].sum() > 0:
+                    metrics[f"{name}_auprc_{cls_name}"] = float(
+                        average_precision_score(true[:, i], probs[:, i])
+                    )
+            cols = [i for i, c in enumerate(_SPLICE_CLS_NAMES) if c != "no_site" and true[:, i].sum() > 0]
+            if cols:
+                aps = [metrics[f"{name}_auprc_{_SPLICE_CLS_NAMES[i]}"] for i in cols]
+                metrics[f"{name}_auprc_macro"] = sum(aps) / len(aps)
+                w = [float(true[:, i].sum()) for i in cols]
+                metrics[f"{name}_auprc_weighted"] = sum(a * wi / sum(w) for a, wi in zip(aps, w))
+
+        rows: list[dict] = []
+        if self.per_sample:
+            # Row count follows the junction head's sample count, falling back
+            # to splice_usage's channel count (as in PyTorch).
+            n_s = None
+            for acc in self.junction_per_sample.values():
+                n_s = len(acc); break
+            if n_s is None:
+                for sums in self.usage_per_channel.values():
+                    n_s = int(np.asarray(sums.n).shape[0]); break
+            if n_s is not None:
+                rows = [{} for _ in range(n_s)]
+                for name, acc in self.junction_per_sample.items():
+                    for s_idx in range(min(n_s, len(acc))):
+                        for v, key in (("full", f"{name}_pearson_r"), ("nonzero", f"{name}_pearson_r_nonzero")):
+                            r = float(acc[s_idx][v].r())
+                            if math.isfinite(r):
+                                rows[s_idx][key] = r
+                for name, sums in self.usage_per_channel.items():
+                    r = np.atleast_1d(sums.r())
+                    for s_idx in range(min(n_s, r.shape[0])):
+                        if math.isfinite(float(r[s_idx])):
+                            rows[s_idx][f"{name}_pearson_r"] = float(r[s_idx])
+        return metrics, rows, histograms
 
 
 # Kept under its historical name: upstream's tests (and some callers) import it from here.
@@ -563,53 +892,40 @@ def train(
         new_params = optax.apply_updates(params, updates)
         return new_params, new_opt_state
 
-    # Heads with a per-position/per-track prediction directly comparable to a
-    # raw target (unlike splice_site, whose classification output has no
-    # correlation-shaped counterpart) -- matches alphagenome-pytorch's Pearson
-    # scope. splice_usage/splice_junctions additionally get a per-track
-    # ("per-sample", since their tracks are 1:1 with a source sample/file --
-    # see _splice_head_track_names) breakdown under --metrics-per-sample;
-    # rna_seq has no such 1:1 track-to-sample mapping, matching PyTorch's own
-    # scoping of --metrics-per-sample.
-    _PEARSON_HEADS = ("rna_seq", "splice_usage", "splice_junctions")
-    _PER_SAMPLE_PEARSON_HEADS = ("splice_usage", "splice_junctions")
+    # Validation metric kinds per head, matching alphagenome-pytorch's
+    # validate_multihead: genome tracks (profile/count Pearson), splice_usage,
+    # splice_junctions (log1p/psi Pearson + auPRC) and splice_site
+    # classification (per-class auPRC). Dispatch is by predefined head kind.
+    _SPLICE_METRIC_KINDS = {
+        "splice_sites_classification": "classification",
+        "splice_sites_usage": "usage",
+        "splice_sites_junction": "junction",
+    }
 
-    def _pearson_partial_stats(pred, target, mask=None, *, per_track: bool):
-        """Streaming sufficient statistics (n, sum_x, sum_y, sum_xy, sum_x2,
-        sum_y2) for a pooled Pearson r, optionally kept separate per track
-        (last axis) instead of reduced to a scalar. Exact once finalized
-        across batches (see _finalize_pearson in the validation loop below)
-        -- not an average of per-batch correlations.
-        """
-        pred = pred.astype(jnp.float32)
-        target = target.astype(jnp.float32)
-        weight = jnp.ones_like(pred) if mask is None else mask.astype(jnp.float32)
-        reduce_axes = tuple(range(pred.ndim - 1)) if per_track else tuple(range(pred.ndim))
-        return {
-            "n": jnp.sum(weight, axis=reduce_axes),
-            "sum_x": jnp.sum(pred * weight, axis=reduce_axes),
-            "sum_y": jnp.sum(target * weight, axis=reduce_axes),
-            "sum_xy": jnp.sum(pred * target * weight, axis=reduce_axes),
-            "sum_x2": jnp.sum(pred * pred * weight, axis=reduce_axes),
-            "sum_y2": jnp.sum(target * target * weight, axis=reduce_axes),
-        }
+    def _metric_kind(head_name):
+        spec = head_specs_by_id.get(head_name)
+        kind = getattr(spec, "kind", None)
+        if kind in _SPLICE_METRIC_KINDS:
+            return _SPLICE_METRIC_KINDS[kind]
+        return "genome_tracks"
 
-    def _head_pearson_inputs(head_name, predictions, target):
-        """(prediction_array, mask_or_None) directly comparable to ``target``
-        for the given head. splice_junctions' pairwise donor x acceptor
-        predictions include real padding (invalid position pairs / padding
-        tissues) that must be excluded via its mask, unlike rna_seq/
-        splice_usage, whose custom heads here are built with exactly the
-        right number of tracks (no padding).
-        """
-        head_pred = predictions[head_name]
-        if head_name == "rna_seq":
-            return head_pred["predictions_1bp"], None
-        if head_name == "splice_usage":
-            return head_pred["predictions"], None
-        if head_name == "splice_junctions":
-            return head_pred["predictions"], head_pred["splice_junction_mask"]
-        raise ValueError(f"No Pearson prediction mapping for head {head_name!r}.")
+    from alphagenome_ft.custom_heads import get_junction_position_source
+    from alphagenome_ft.finetune.splice_positions import build_junction_matrix
+
+    def _junction_eval_target(head_name, batch, head_pred):
+        """Target aligned to the positions the head scored: rebuilt from raw
+        events in predicted mode (PyTorch's _get_junction_targets)."""
+        if get_junction_position_source(head_name) is None:
+            return batch[f"targets_{head_name}"]
+        positions = head_pred["splice_site_positions"]
+        return build_junction_matrix(
+            positions,
+            batch["junction_d_rel"],
+            batch["junction_a_rel"],
+            batch["junction_is_pos_strand"],
+            batch["junction_counts"],
+            max_splice_sites=positions.shape[-1],
+        )
 
     @functools.partial(jax.pmap, axis_name="data")
     def eval_step(params, state, batch):
@@ -634,23 +950,44 @@ def train(
             head_losses,
         )
 
-        pearson_stats: dict = {}
+        # Per-device metric inputs; the host concatenates devices and batches.
+        # Large per-position tensors are reduced on device (genome tracks,
+        # usage); sparse splice tensors come back whole for host-side masking.
+        metric_inputs: dict = {}
         if compute_pearson:
-            for head_name in _PEARSON_HEADS:
-                if head_name not in head_names:
-                    continue
-                target = _head_batch(batch, head_name)["targets"]
-                pred_array, mask = _head_pearson_inputs(head_name, predictions, target)
-                stats = {"agg": _pearson_partial_stats(pred_array, target, mask, per_track=False)}
-                if metrics_per_sample and head_name in _PER_SAMPLE_PEARSON_HEADS:
-                    stats["per_track"] = _pearson_partial_stats(
-                        pred_array, target, mask, per_track=True
+            for head_name in head_names:
+                head_pred = predictions[head_name]
+                target = batch[f"targets_{head_name}"]
+                kind = _metric_kind(head_name)
+                if kind == "genome_tracks":
+                    if "predictions_1bp" not in head_pred:
+                        continue
+                    pred = head_pred["predictions_1bp"].astype(jnp.float32)
+                    true = target.astype(jnp.float32)
+                    metric_inputs[head_name] = {
+                        "profile_r": _profile_pearson_r(pred, true),
+                        "pred_counts": pred.sum(axis=1),
+                        "true_counts": true.sum(axis=1),
+                    }
+                elif kind == "usage":
+                    stats = _usage_device_stats(
+                        head_pred["predictions"].astype(jnp.float32), target.astype(jnp.float32),
                     )
-                pearson_stats[head_name] = stats
-            pearson_stats = jax.tree_util.tree_map(
-                lambda x: jax.lax.pmean(x, axis_name="data"), pearson_stats,
-            )
-        return head_losses, pearson_stats
+                    metric_inputs[head_name] = jax.tree_util.tree_map(
+                        lambda x: jax.lax.psum(x, axis_name="data"), stats,
+                    )
+                elif kind == "junction":
+                    metric_inputs[head_name] = {
+                        "pred": head_pred["predictions"].astype(jnp.float32),
+                        "target": _junction_eval_target(head_name, batch, head_pred).astype(jnp.float32),
+                        "positions": head_pred["splice_site_positions"],
+                    }
+                elif kind == "classification":
+                    metric_inputs[head_name] = {
+                        "logits": head_pred["logits"].astype(jnp.float32),
+                        "target": target.astype(jnp.float32),
+                    }
+        return head_losses, metric_inputs
 
     if verbose:
         print("JIT-compiling step functions (first call will be slow)...")
@@ -894,15 +1231,11 @@ def train(
 
             valid_metrics: Mapping[str, float] | None = None
             pearson_metrics: dict[str, float] = {}
+            per_sample_rows: list[dict] = []
+            metric_histograms: dict[str, list] = {}
             if "valid" in data_module._intervals and len(data_module._intervals["valid"]) > 0:
                 losses = {head: [] for head in head_names}
-                # Raw per-batch stats accumulated as SUMS (not per-batch
-                # means), keyed [head_name][kind]["n"/"sum_x"/...] -- summing
-                # (rather than averaging) sufficient statistics across
-                # batches is what makes the final Pearson r an exact pooled
-                # correlation over the whole validation set, not an average
-                # of per-batch correlations.
-                pearson_totals: dict[str, dict[str, dict[str, float]]] = {}
+                val_metrics_acc = _ValidationMetrics(per_sample=metrics_per_sample, seed=seed)
                 # Explicit seed, not the default (None): CombinedDataModule
                 # passes this same seed to both its underlying modules, so an
                 # explicit shared value is what keeps their independent
@@ -914,24 +1247,44 @@ def train(
                     batch = prepare_batch(batch_np, organism_index_value, head_names)
                     batch = _shard_batch(batch, num_devices)
                     batch["strand_reindexing"] = strand_reindexing_replicated
-                    head_losses, batch_pearson_stats = eval_step(
+                    head_losses, batch_metric_inputs = eval_step(
                         replicated_params, replicated_state, batch,
                     )
                     for head_name in head_names:
                         losses[head_name].append(float(np.asarray(head_losses[head_name])[0]))
-                    for head_name, stats_by_kind in batch_pearson_stats.items():
-                        host_stats = {
-                            kind: {k: np.asarray(v)[0] for k, v in stats.items()}
-                            for kind, stats in stats_by_kind.items()
-                        }
-                        if head_name not in pearson_totals:
-                            pearson_totals[head_name] = host_stats
-                        else:
-                            for kind, stats in host_stats.items():
-                                for k, v in stats.items():
-                                    pearson_totals[head_name][kind][k] = (
-                                        pearson_totals[head_name][kind][k] + v
-                                    )
+
+                    def _host_all_devices(x):
+                        x = np.asarray(x)
+                        return x.reshape(-1, *x.shape[2:])
+
+                    for head_name, inputs in batch_metric_inputs.items():
+                        kind = _metric_kind(head_name)
+                        if kind == "genome_tracks":
+                            val_metrics_acc.add_genome_tracks(
+                                head_name,
+                                _host_all_devices(inputs["profile_r"]),
+                                _host_all_devices(inputs["pred_counts"]),
+                                _host_all_devices(inputs["true_counts"]),
+                            )
+                        elif kind == "usage":
+                            # Already psum'd across devices: take device 0.
+                            val_metrics_acc.add_usage(
+                                head_name,
+                                jax.tree_util.tree_map(lambda x: np.asarray(x)[0], inputs),
+                            )
+                        elif kind == "junction":
+                            val_metrics_acc.add_junction(
+                                head_name,
+                                _host_all_devices(inputs["pred"]),
+                                _host_all_devices(inputs["target"]),
+                                _host_all_devices(inputs["positions"]),
+                            )
+                        elif kind == "classification":
+                            val_metrics_acc.add_classification(
+                                head_name,
+                                _host_all_devices(inputs["logits"]),
+                                _host_all_devices(inputs["target"]),
+                            )
 
                 valid_metrics = {
                     head: float(np.mean(values)) for head, values in losses.items() if values
@@ -941,31 +1294,27 @@ def train(
                     ", ".join(f"{k}={v:.4f}" for k, v in valid_metrics.items()),
                 )
 
-                def _finalize_pearson_r(stats: Mapping[str, np.ndarray]) -> np.ndarray:
-                    n, sx, sy = stats["n"], stats["sum_x"], stats["sum_y"]
-                    sxy, sx2, sy2 = stats["sum_xy"], stats["sum_x2"], stats["sum_y2"]
-                    numerator = n * sxy - sx * sy
-                    denom_sq = np.clip(n * sx2 - sx**2, 0, None) * np.clip(n * sy2 - sy**2, 0, None)
-                    denom = np.sqrt(denom_sq)
-                    with np.errstate(divide="ignore", invalid="ignore"):
-                        return np.where(denom > 0, numerator / np.where(denom > 0, denom, 1.0), np.nan)
+                if compute_pearson:
+                    pearson_metrics, per_sample_rows, metric_histograms = val_metrics_acc.finalize()
+                    if pearson_metrics:
+                        print(
+                            "  Validation metrics (alphagenome-pytorch definitions):",
+                            ", ".join(
+                                f"{k}={v:.4f}" for k, v in pearson_metrics.items()
+                                if not k.endswith("_std")
+                            ),
+                        )
 
-                aggregate_pearson: dict[str, float] = {}
-                for head_name, stats_by_kind in pearson_totals.items():
-                    agg_r = float(_finalize_pearson_r(stats_by_kind["agg"]))
-                    aggregate_pearson[f"pearson_r_{head_name}"] = agg_r
-                    pearson_metrics[f"pearson_r_{head_name}"] = agg_r
-                    if "per_track" in stats_by_kind:
-                        track_names = _splice_head_track_names(head_specs_by_id[head_name])
-                        per_track_r = np.atleast_1d(_finalize_pearson_r(stats_by_kind["per_track"]))
-                        for name, r in zip(track_names, per_track_r):
-                            pearson_metrics[f"pearson_r_{head_name}_{name}"] = float(r)
-
-                if aggregate_pearson:
-                    print(
-                        "  Validation Pearson r:",
-                        ", ".join(f"{k}={v:.4f}" for k, v in aggregate_pearson.items()),
-                    )
+            # Resolved before logging so the epoch row can carry is_best, as
+            # alphagenome-pytorch's epoch_log.csv does.
+            metric_label, metric_value = resolve_metric(best_metric, train_loss_avg, valid_metrics)
+            epoch_is_best = bool(
+                metric_value is not None and math.isfinite(metric_value)
+                and is_improved(metric_value, best_value)
+            )
+            epoch_lr = float(
+                lr_or_schedule(global_step) if callable(lr_or_schedule) else lr_or_schedule
+            )
 
             if train_loss_avg is not None:
                 logger.log_epoch(
@@ -983,17 +1332,20 @@ def train(
                                     f"val_{head}_loss": v
                                     for head, v in valid_metrics.items()
                                 },
-                                **{f"val_{k}": v for k, v in pearson_metrics.items()},
+                                **pearson_metrics,
                             }
                             if valid_metrics is not None
                             else {}
                         ),
                     },
+                    per_sample=per_sample_rows,
+                    histograms=metric_histograms,
+                    learning_rate=epoch_lr,
+                    is_best=epoch_is_best,
                 )
 
-            metric_label, metric_value = resolve_metric(best_metric, train_loss_avg, valid_metrics)
             if metric_value is not None and math.isfinite(metric_value):
-                if is_improved(metric_value, best_value):
+                if epoch_is_best:
                     best_value = metric_value
                     epochs_since_improvement = 0
                     if logger.wandb is not None:

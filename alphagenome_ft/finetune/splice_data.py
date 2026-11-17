@@ -65,7 +65,7 @@ class SpliceDataModule:
         max_splice_sites: int = 256,
         drop_last: bool = False,
         emit_raw_junction_events: bool = False,
-        max_junctions_per_window: int = 1024,
+        junction_event_pad_size: int = 1024,
     ) -> None:
         """Initialize streaming sequence/splice-target batch generation.
 
@@ -106,9 +106,10 @@ class SpliceDataModule:
                 known until forward time (see
                 ``alphagenome_ft.finetune.splice_positions.build_junction_matrix``).
                 Only meaningful together with a ``splice_junctions`` head kind.
-            max_junctions_per_window: Padded row count ``M`` for the raw
+            junction_event_pad_size: Minimum padded row count for the raw
                 junction event lists (one row per (sample, junction) pair
-                inside the window); only used when
+                inside the window); a batch with more events grows it by
+                powers of two, so no event is ever dropped. Only used when
                 ``emit_raw_junction_events=True``.
         """
         if not head_kinds:
@@ -125,8 +126,9 @@ class SpliceDataModule:
         self._drop_last = drop_last
         self._max_splice_sites = max_splice_sites
         self._emit_raw_junction_events = emit_raw_junction_events
-        self._max_junctions_per_window = max_junctions_per_window
-        self._warned_max_junctions_truncated = False
+        if junction_event_pad_size < 1:
+            raise ValueError("junction_event_pad_size must be >= 1.")
+        self._junction_event_pad_size = junction_event_pad_size
         self._encoder = one_hot_encoder.DNAOneHotEncoder(dtype=np.float32)
 
         self.star_junction_files = [str(p) for p in star_junction_files]
@@ -215,6 +217,11 @@ class SpliceDataModule:
         if self._shuffle and split == "train":
             rng = np.random.default_rng(seed)
             rng.shuffle(order)
+        if split != "train" and self._drop_last:
+            # Evaluation never drops windows: pad the final partial batch by
+            # wrapping around to the start, as torch's DistributedSampler does
+            # for alphagenome-pytorch's validation loader.
+            order = _pad_order_to_batch_multiple(order, self._batch_size)
         if skip_batches:
             # Resuming mid-epoch: the shuffle above is a deterministic
             # function of (len(windows), seed), so slicing off the already
@@ -251,50 +258,60 @@ class SpliceDataModule:
     def _raw_junction_events(
         self, chrom: str, start: int, seq_len: int
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Padded, per-(sample, junction) event list for predicted-mode rebuild.
+        """Unpadded, per-(sample, junction) event list for predicted-mode rebuild.
 
         One row per (sample, junction-inside-window) pair — samples are
         *not* merged into a shared event, matching how
         ``junctions_to_junction_matrix`` accumulates each sample into its
-        own channel independently. See
-        ``alphagenome_ft.finetune.splice_positions.build_junction_matrix``,
-        which consumes exactly this layout.
+        own channel independently. Junctions whose strand is neither "+" nor
+        "-" are skipped, as in ``junctions_to_junction_matrix``. Every event
+        is kept (no cap); ``_make_batch`` pads the rows to a shared length.
+        See ``alphagenome_ft.finetune.splice_positions.build_junction_matrix``,
+        which consumes this layout.
         """
-        m = self._max_junctions_per_window
         n_samples = len(self._all_juncs)
-        d_rel = np.full(m, -1, dtype=np.int32)
-        a_rel = np.full(m, -1, dtype=np.int32)
-        is_pos_strand = np.zeros(m, dtype=bool)
-        counts = np.zeros((m, n_samples), dtype=np.float32)
-
         end = start + seq_len
-        row = 0
+        d_rel: list[int] = []
+        a_rel: list[int] = []
+        is_pos_strand: list[bool] = []
+        sample_rows: list[int] = []
+        sample_counts: list[float] = []
         for sample_idx, junc_df in enumerate(self._juncs_for_chrom(chrom)):
             mask = (
                 (junc_df["exon_start"] > start)
                 & (junc_df["exon_start"] <= end)
                 & (junc_df["exon_end"] > start)
                 & (junc_df["exon_end"] <= end)
+                & junc_df["strand"].isin(("+", "-"))
             )
             local = junc_df.loc[mask]
-            for _, junc in local.iterrows():
-                if row >= m:
-                    if not self._warned_max_junctions_truncated:
-                        print(
-                            f"SpliceDataModule: window {chrom}:{start}-{end} has more than "
-                            f"max_junctions_per_window={m} (sample, junction) pairs; "
-                            "extra events are dropped from the predicted-mode raw event "
-                            "list. Increase max_junctions_per_window if this matters."
-                        )
-                        self._warned_max_junctions_truncated = True
-                    break
-                d_rel[row] = int(junc["exon_start"]) - 1 - start
-                a_rel[row] = int(junc["exon_end"]) - 1 - start
-                is_pos_strand[row] = junc["strand"] == "+"
-                counts[row, sample_idx] = float(junc["count"])
-                row += 1
+            d_rel.extend((local["exon_start"].to_numpy(dtype=np.int64) - 1 - start).tolist())
+            a_rel.extend((local["exon_end"].to_numpy(dtype=np.int64) - 1 - start).tolist())
+            is_pos_strand.extend((local["strand"] == "+").tolist())
+            sample_rows.extend([sample_idx] * len(local))
+            sample_counts.extend(local["count"].astype(float).tolist())
 
-        return d_rel, a_rel, is_pos_strand, counts
+        m = len(d_rel)
+        counts = np.zeros((m, n_samples), dtype=np.float32)
+        counts[np.arange(m), np.asarray(sample_rows, dtype=np.int64)] = sample_counts
+        return (
+            np.asarray(d_rel, dtype=np.int32).reshape(m),
+            np.asarray(a_rel, dtype=np.int32).reshape(m),
+            np.asarray(is_pos_strand, dtype=bool).reshape(m),
+            counts,
+        )
+
+    def _junction_event_rows(self, max_events: int) -> int:
+        """Padded event-row count for a batch: the smallest power-of-two
+        multiple of ``junction_event_pad_size`` that holds ``max_events``.
+
+        Never truncates; bucketing keeps the number of distinct shapes (and
+        hence jit retraces) logarithmic in the largest window's event count.
+        """
+        rows = self._junction_event_pad_size
+        while rows < max_events:
+            rows *= 2
+        return rows
 
     def _window_targets(self, chrom: str, start: int, seq_len: int) -> dict[str, np.ndarray]:
         """Compute the shared per-window splice arrays used by all head kinds."""
@@ -406,17 +423,31 @@ class SpliceDataModule:
             ).astype(np.int32)
 
         if self._emit_raw_junction_events:
-            batch["junction_d_rel"] = np.stack(
-                [w["junction_d_rel"] for w in per_window], axis=0
+            rows = self._junction_event_rows(
+                max(len(w["junction_d_rel"]) for w in per_window)
             )
-            batch["junction_a_rel"] = np.stack(
-                [w["junction_a_rel"] for w in per_window], axis=0
-            )
-            batch["junction_is_pos_strand"] = np.stack(
-                [w["junction_is_pos_strand"] for w in per_window], axis=0
-            )
-            batch["junction_counts"] = np.stack(
-                [w["junction_counts"] for w in per_window], axis=0
-            ).astype(np.float32)
+            n_samples = len(self._all_juncs)
+            d_rel = np.full((len(per_window), rows), -1, dtype=np.int32)
+            a_rel = np.full((len(per_window), rows), -1, dtype=np.int32)
+            is_pos_strand = np.zeros((len(per_window), rows), dtype=bool)
+            counts = np.zeros((len(per_window), rows, n_samples), dtype=np.float32)
+            for i, w in enumerate(per_window):
+                m = len(w["junction_d_rel"])
+                d_rel[i, :m] = w["junction_d_rel"]
+                a_rel[i, :m] = w["junction_a_rel"]
+                is_pos_strand[i, :m] = w["junction_is_pos_strand"]
+                counts[i, :m] = w["junction_counts"]
+            batch["junction_d_rel"] = d_rel
+            batch["junction_a_rel"] = a_rel
+            batch["junction_is_pos_strand"] = is_pos_strand
+            batch["junction_counts"] = counts
 
         return batch
+
+
+def _pad_order_to_batch_multiple(order: np.ndarray, batch_size: int) -> np.ndarray:
+    """Wrap-pad ``order`` to a multiple of ``batch_size`` (DistributedSampler-style)."""
+    remainder = len(order) % batch_size
+    if remainder == 0:
+        return order
+    return np.concatenate([order, np.resize(order, batch_size - remainder)])

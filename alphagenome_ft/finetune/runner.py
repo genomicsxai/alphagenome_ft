@@ -27,6 +27,7 @@ from alphagenome_ft.finetune.combined_data import (
     CombinedDataModule,
     compute_track_means,
     load_interval_list,
+    read_chrom_sizes,
 )
 from alphagenome_ft.finetune.workarounds import (
     apply_pretrained_head_samples,
@@ -95,6 +96,8 @@ def main(args=None) -> None:
             entry["junction_position_source"] = args.junction_position_source
             if args.junction_position_source == "predicted":
                 entry["classification_head_id"] = head_ids["splice_sites_classification"]
+                entry["junction_top_k"] = args.junction_top_k
+                entry["splice_site_threshold"] = args.splice_site_threshold
         heads_cfg.append(entry)
 
     track_means = compute_track_means(
@@ -179,10 +182,8 @@ def main(args=None) -> None:
 
         if args.rope_init == "truncated_normal":
             print(f"Re-initializing junction head RoPE embeddings "
-                  f"(std={args.rope_init_std}) — explicit ablation only; the "
-                  f"fresh model's own init (--rope-init none, the default) "
-                  f"is already TruncatedNormal-ish and correct, see args.py "
-                  f"docstring.")
+                  f"(truncated_normal, std={args.rope_init_std}), as "
+                  f"alphagenome-pytorch's default --rope-init.")
             reinit_junction_rope_embeddings(
                 model, head_ids["splice_sites_junction"], std=args.rope_init_std, seed=args.seed,
             )
@@ -194,16 +195,22 @@ def main(args=None) -> None:
                 model, head_ids["splice_sites_junction"], std=0.0, seed=args.seed,
             )
 
-        apply_pretrained_head_samples(model, args.pretrained_head_samples, organism_index)
+        if args.pretrained_head_samples:
+            apply_pretrained_head_samples(model, args.pretrained_head_samples, organism_index)
 
-    if args.usage_num_segments > 1:
-        model.set_usage_num_segments(
-            head_ids["splice_sites_usage"], args.usage_num_segments,
-        )
+    if args.splice_num_segments > 1:
+        # As alphagenome-pytorch's --splice-num-segments: classification + usage.
+        for kind in ("splice_sites_classification", "splice_sites_usage"):
+            model.set_splice_num_segments(head_ids[kind], args.splice_num_segments)
 
+    chrom_sizes = read_chrom_sizes(args.genome)
     intervals = {
-        "train": load_interval_list(args.train_bed, window_size=args.sequence_length),
-        "valid": load_interval_list(args.val_bed, window_size=args.sequence_length),
+        "train": load_interval_list(
+            args.train_bed, window_size=args.sequence_length, chrom_sizes=chrom_sizes,
+        ),
+        "valid": load_interval_list(
+            args.val_bed, window_size=args.sequence_length, chrom_sizes=chrom_sizes,
+        ),
     }
 
     # Pre-filter to chromosomes common to all --bigwig files using
@@ -228,12 +235,14 @@ def main(args=None) -> None:
         "splice_junctions": head_ids["splice_sites_junction"],
     }
 
+    # --batch-size is per device (as alphagenome-pytorch's per-GPU batch).
+    global_batch_size = args.batch_size * args.num_devices
     splice_module = SpliceDataModule(
         intervals=intervals,
         fasta_path=args.genome,
         star_junction_files=args.star_junctions,
         head_kinds=data_head_kinds,
-        batch_size=args.batch_size,
+        batch_size=global_batch_size,
         shuffle=True,
         ssu_files=args.ssu,
         gtf_file=args.gtf,
@@ -250,7 +259,7 @@ def main(args=None) -> None:
         intervals=intervals,
         fasta_path=args.genome,
         head_specs=[rna_seq_spec],
-        batch_size=args.batch_size,
+        batch_size=global_batch_size,
         shuffle=True,
         drop_last=args.num_devices > 1,
     )

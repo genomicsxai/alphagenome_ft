@@ -156,45 +156,59 @@ def _resolve_user_metadata(
     return {organism: metadata for organism in dna_client.Organism}
 
 
-def _cast_head_params_to_bfloat16(params: dict) -> dict:
-    """Cast every head-owned parameter leaf (module path containing "head/")
-    to bfloat16, leaving backbone ("alphagenome/..." trunk) leaves untouched.
-
-    Why this exists instead of hk.mixed_precision.set_policy(type(head), ...):
-    real predefined heads' __call__ does
-    hk.to_module(self.predict)(self._name)(...) (alphagenome_research/model/
-    heads.py) -- hk.to_module dynamically creates a NEW anonymous module
-    class on every invocation, so registering a policy against
-    type(head) (e.g. SpliceSitesUsageHead) targets a class Haiku's
-    interceptor never actually sees; the real computation runs under the
-    dynamically-created wrapper class instead. That made an earlier version
-    of this dtype-selection feature silently a no-op for every head (verified
-    empirically: splice_usage logits stayed float32 with dtype="bfloat16"
-    selected). Casting the stored parameter values directly sidesteps
-    Haiku's per-class interceptor machinery entirely -- hk.get_parameter
-    just returns whatever's already in the params dict passed to .apply(),
-    so if that's bfloat16, computation is bfloat16, unconditionally.
-
-    Trade-off vs the trunk's approach (jmp policy: fp32 "master" params,
-    bf16 casts applied per forward call): head params here are stored as
-    bfloat16 directly, with no separate fp32 master copy. For eval/inference
-    this is immaterial. For real training, Adam's moment estimates would
-    then accumulate against bf16-precision parameter values for heads
-    specifically (trunk backbone params are unaffected either way -- they're
-    frozen in every mode this project trains with). No measured evidence
-    this matters (a separate ablation this session found dtype had
-    negligible effect on rna_seq training loss over 15 steps), but flagged
-    here rather than silently assumed away.
-    """
+def _cast_head_params(params: dict, dtype) -> dict:
+    """Cast every head-owned floating leaf (module path containing "head/")
+    to ``dtype``, leaving backbone ("alphagenome/..." trunk) leaves untouched."""
     import jax.numpy as jnp
     return {
         module_path: (
-            {name: (arr.astype(jnp.bfloat16) if jnp.issubdtype(arr.dtype, jnp.floating) else arr)
+            {name: (arr.astype(dtype) if jnp.issubdtype(arr.dtype, jnp.floating) else arr)
              for name, arr in leaf.items()}
             if "head/" in module_path else leaf
         )
         for module_path, leaf in params.items()
     }
+
+
+def _cast_head_params_to_float32(params: dict) -> dict:
+    """Upcast head params to float32 master copies.
+
+    Checkpoints saved before head params were kept in float32 store them as
+    bfloat16; upcasting on load restores fp32 master weights so optimizer
+    updates are not rounded away. Compute dtype is applied separately at
+    parameter-read time by ``_bfloat16_head_getter``.
+    """
+    import jax.numpy as jnp
+    return _cast_head_params(params, jnp.float32)
+
+
+def _bfloat16_head_getter(next_getter, value, context):
+    """Haiku custom getter: read head params as bfloat16 for compute.
+
+    Head params are stored as float32 master weights (like the trunk under
+    its jmp ``params=float32,compute=bfloat16`` policy, and like
+    alphagenome-pytorch under autocast); this casts each floating param to
+    bfloat16 when a head reads it, so head compute is bfloat16 while
+    gradients flow back to (and optimizer updates apply to) the fp32 copy.
+
+    Why not hk.mixed_precision.set_policy(type(head), ...): predefined heads'
+    __call__ does hk.to_module(self.predict)(self._name)(...), which creates
+    a new anonymous module class per call, so a per-class policy never fires.
+    A custom getter applies to every hk.get_parameter in its scope
+    regardless of module class.
+    """
+    del context
+    import jax.numpy as jnp
+    if jnp.issubdtype(value.dtype, jnp.floating):
+        value = value.astype(jnp.bfloat16)
+    return next_getter(value)
+
+
+def _head_compute_dtype_ctx(dtype: str):
+    import contextlib
+    if dtype == "bfloat16":
+        return hk.custom_getter(_bfloat16_head_getter)
+    return contextlib.nullcontext()
 
 
 def _make_head(head_name: str, num_organisms: int) -> custom_heads_module.HeadLike:
@@ -229,11 +243,9 @@ def _build_head_predictions(
     using the batch-supplied ``splice_site_positions`` (annotated mode, or
     unused via **kwargs for non-splice heads).
 
-    Head-level dtype (bfloat16 vs float32) is controlled upstream, by whether
-    the params dict this runs against has head leaves already cast to
-    bfloat16 -- see _cast_head_params_to_bfloat16 and its docstring for why
-    that approach is used instead of Haiku's per-class mixed-precision
-    policy (which cannot correctly target these heads).
+    Head-level compute dtype is controlled upstream by the caller wrapping
+    this in ``_head_compute_dtype_ctx`` (a Haiku custom getter that reads
+    fp32 head params as bfloat16); see ``_bfloat16_head_getter``.
     """
     from alphagenome_ft.finetune.splice_positions import top_k_splice_positions
     from alphagenome_research.model import heads as research_heads_module
@@ -274,7 +286,8 @@ def _build_head_predictions(
                 f"wasn't found among this model's heads: {list(predictions)}."
             )
         predicted_positions = top_k_splice_positions(
-            predictions[cls_head_name]['logits'], info['top_k']
+            predictions[cls_head_name]['logits'], info['top_k'],
+            threshold=info.get('splice_site_threshold', 0.1),
         )
         head = _make_head(head_name, num_organisms)
         predictions[head_name] = _fix_usage_predict_dtype(head, head(
@@ -372,6 +385,43 @@ def _partitioned_binary_crossentropy_usage_loss(
                 y_pred=logits_chunk,
                 y_true=targets_chunk,
                 mask=jnp.ones_like(logits_chunk, dtype=bool),
+            )
+        )
+    return jnp.sum(jnp.stack(chunk_losses))
+
+
+def _partitioned_classification_loss(
+    logits: jnp.ndarray,
+    splice_sites: jnp.ndarray,
+    num_segments: int,
+) -> jnp.ndarray:
+    """Sequence-partitioned splice_site classification loss.
+
+    JAX port of alphagenome-pytorch's ``_partitioned_loss`` applied to
+    ``_ce_loss_with_smoothing`` (``_compute_splice_loss``'s
+    SpliceSitesClassificationHead ``num_segments > 1`` branch): the sequence
+    is split into ``num_segments`` contiguous chunks (last chunk absorbs the
+    remainder), each chunk gets alphagenome_research's own classification
+    loss (label smoothing 1e-7, mask = any(target), masked mean), and the
+    per-chunk losses are SUMMED. Chunks with no labelled position contribute
+    0, as PyTorch skips them.
+    """
+    from alphagenome_research.model import losses as research_losses
+
+    num_classes = logits.shape[-1]
+    seq_len = logits.shape[1]
+    chunk_size = seq_len // num_segments
+    chunk_losses = []
+    for i in range(num_segments):
+        start = i * chunk_size
+        end = start + chunk_size if i < num_segments - 1 else seq_len
+        targets_chunk = splice_sites[:, start:end, :]
+        chunk_losses.append(
+            research_losses.cross_entropy_loss_from_logits(
+                y_pred_logits=logits[:, start:end, :],
+                y_true=(1.0 - 1e-7) * targets_chunk.astype(jnp.float32) + 1e-7 / num_classes,
+                mask=jnp.any(targets_chunk, axis=-1, keepdims=True),
+                axis=-1,
             )
         )
     return jnp.sum(jnp.stack(chunk_losses))
@@ -755,12 +805,21 @@ class CustomAlphaGenomeModel:
         splice-site regions relative to a flat global mean, exactly matching
         the PyTorch reference's reduction.
 
-        Defaults to 1 (no partitioning -- the original behavior) for any head
-        this is never called for. PyTorch's own default is `num_segments=8`;
-        pass that here for parity with a PyTorch run that has
-        `min_alpha_juncs=0` (which disables PyTorch's alternative
-        alpha-confidence-masking branch and falls through to this same
-        partitioned path -- see extensions/finetuning/training.py:570-596).
+        Defaults to 1 (no partitioning -- alphagenome_research's own loss),
+        which is also alphagenome-pytorch's `--splice-num-segments` default.
+        With PyTorch's default `--min-alpha-juncs 0`, a PyTorch run using
+        `--splice-num-segments N` matches this partitioned path with
+        `num_segments=N`. (This port has no alpha-confidence mask, so it never
+        matches a PyTorch run with `--min-alpha-juncs > 0`.)
+        """
+        self._usage_num_segments[head_name] = num_segments
+
+    def set_splice_num_segments(self, head_name: str, num_segments: int) -> None:
+        """Sequence-partition a splice_site classification or usage head's loss.
+
+        Mirrors alphagenome-pytorch's ``--splice-num-segments``, which applies
+        the same partitioning to both heads (see ``set_usage_num_segments``
+        and ``_partitioned_classification_loss``).
         """
         self._usage_num_segments[head_name] = num_segments
 
@@ -933,6 +992,15 @@ class CustomAlphaGenomeModel:
                 targets_clipped = jnp.clip(batch.splice_site_usage, 1e-7, 1.0 - 1e-7)
                 loss = _partitioned_binary_crossentropy_usage_loss(
                     logits, targets_clipped, num_segments,
+                )
+                loss_dict = {'loss': loss}
+            elif (
+                entry.source == 'predefined'
+                and head_type == research_heads_module.HeadType.SPLICE_SITES_CLASSIFICATION
+                and num_segments > 1
+            ):
+                loss = _partitioned_classification_loss(
+                    predictions['logits'], batch.splice_sites, num_segments,
                 )
                 loss_dict = {'loss': loss}
             else:
@@ -2755,7 +2823,7 @@ def create_model_with_heads(
             # Run heads (outside alphagenome scope)
             num_organisms = len(metadata)
             with hk.name_scope('head'):
-                with hk.custom_creator(head_parameter_creator):
+                with hk.custom_creator(head_parameter_creator), _head_compute_dtype_ctx(dtype):
                     predictions = _build_head_predictions(
                         normalized_heads, embeddings, organism_index,
                         splice_site_positions, num_organisms,
@@ -2809,7 +2877,7 @@ def create_model_with_heads(
             # Get number of organisms from metadata (should be 2: human and mouse)
             num_organisms = len(metadata)
             with hk.name_scope('head'):
-                with hk.custom_creator(head_parameter_creator):
+                with hk.custom_creator(head_parameter_creator), _head_compute_dtype_ctx(dtype):
                     predictions = _build_head_predictions(
                         normalized_heads, embeddings, organism_index,
                         splice_site_positions, num_organisms,
@@ -2858,8 +2926,9 @@ def create_model_with_heads(
     merged_params = merge_params(base_model._params, new_params)
     merged_state = merge_params(base_model._state, new_state)
 
-    if dtype == "bfloat16":
-        merged_params = _cast_head_params_to_bfloat16(merged_params)
+    # Head params stay float32 (master weights); bfloat16 head compute is
+    # applied at read time by _head_compute_dtype_ctx in the forward pass.
+    merged_params = _cast_head_params_to_float32(merged_params)
 
     print("✓ Parameters merged")
 
@@ -3593,7 +3662,7 @@ def load_checkpoint(
                     # Run custom heads outside the alphagenome scope.
                     predictions = {}
                     num_organisms = len(metadata)
-                    with hk.name_scope('head'):
+                    with hk.name_scope('head'), _head_compute_dtype_ctx(dtype):
                         for head_name in custom_heads:
                             head = custom_heads_module.create_custom_head(
                                 head_name, metadata=None, num_organisms=num_organisms
@@ -3749,13 +3818,10 @@ def load_checkpoint(
             if loaded_state:
                 model._state = merge_minimal_params(model._state, loaded_state)
 
-            if dtype == "bfloat16":
-                # loaded_params come from the checkpoint file, which may have
-                # been saved under the old (effectively-always-float32) head
-                # behavior -- re-cast so a checkpoint trained before this fix
-                # still gets bfloat16 head compute when requested at eval
-                # time. See _cast_head_params_to_bfloat16's docstring.
-                model._params = _cast_head_params_to_bfloat16(model._params)
+            # Checkpoints may store bfloat16 head params (older behavior);
+            # restore fp32 master weights. Compute dtype is applied by the
+            # forward pass's head getter.
+            model._params = _cast_head_params_to_float32(model._params)
 
             # Ensure parameters and state are on the correct device
             device = model._device_context._device
@@ -3811,11 +3877,8 @@ def load_checkpoint(
             merged_params = merge_minimal_params(base_model._params, loaded_params)
             merged_state = merge_minimal_params(base_model._state, loaded_state) if loaded_state else base_model._state
 
-            if dtype == "bfloat16":
-                # See the earlier merge_minimal_params branch above / the
-                # cast helper's docstring: re-cast loaded head params in case
-                # the checkpoint predates this fix.
-                merged_params = _cast_head_params_to_bfloat16(merged_params)
+            # See above: restore fp32 master head params.
+            merged_params = _cast_head_params_to_float32(merged_params)
 
             # Create custom model with merged parameters (no custom forward - uses base model's forward)
             custom_model = CustomAlphaGenomeModel(
@@ -3855,10 +3918,8 @@ def load_checkpoint(
         custom_model._params = merge_head_params(custom_model._params, loaded_params)
         custom_model._state = merge_head_params(custom_model._state, loaded_state)
 
-        if dtype == "bfloat16":
-            # See the cast helper's docstring: re-cast loaded head params in
-            # case the checkpoint predates this fix.
-            custom_model._params = _cast_head_params_to_bfloat16(custom_model._params)
+        # See above: restore fp32 master head params.
+        custom_model._params = _cast_head_params_to_float32(custom_model._params)
 
         # Re-put on device
         device = custom_model._device_context._device

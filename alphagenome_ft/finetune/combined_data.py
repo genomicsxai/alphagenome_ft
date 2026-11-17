@@ -15,7 +15,25 @@ from pathlib import Path
 import numpy as np
 
 
-def load_interval_list(bed_path: Path, window_size: int):
+def read_chrom_sizes(fasta_path: Path) -> dict[str, int]:
+    """Chromosome lengths from a FASTA's ``.fai`` index (built via pyfaidx if missing)."""
+    fai = Path(f"{fasta_path}.fai")
+    if not fai.exists():
+        import pyfaidx
+
+        pyfaidx.Fasta(str(fasta_path)).close()  # writes the .fai
+    sizes: dict[str, int] = {}
+    with open(fai) as handle:
+        for line in handle:
+            fields = line.split("\t")
+            if len(fields) >= 2:
+                sizes[fields[0]] = int(fields[1])
+    return sizes
+
+
+def load_interval_list(
+    bed_path: Path, window_size: int, chrom_sizes: dict[str, int] | None = None,
+):
     """Load a plain 3-column (chrom, start, end) BED into genome.Interval list.
 
     Unlike ``alphagenome_ft.finetune.data.load_intervals_from_bed`` (which
@@ -23,10 +41,17 @@ def load_interval_list(bed_path: Path, window_size: int):
     BEDs already split into one file per split (no split column) would
     silently drop every row (len(parts) < 4) if pointed at that loader
     directly.
+
+    Each interval is re-centred to ``window_size``. With ``chrom_sizes``,
+    windows that would run off a chromosome (or sit on a chromosome missing
+    from the FASTA) are skipped rather than shifted, matching
+    alphagenome-pytorch's ``GenomicDataset``/``SplicingDataset``.
     """
-    from alphagenome_ft.finetune.data import build_interval
+    from alphagenome.data import genome
 
     intervals = []
+    n_skipped = 0
+    half = window_size // 2
     opened = gzip.open if str(bed_path).endswith(".gz") else open
     with opened(bed_path, "rt") as handle:
         for raw in handle:
@@ -34,12 +59,25 @@ def load_interval_list(bed_path: Path, window_size: int):
             if not line or line.startswith("#"):
                 continue
             chrom, start_str, end_str = line.split()[:3]
-            intervals.append(build_interval(
-                chromosome=chrom,
-                start=int(float(start_str)),
-                end=int(float(end_str)),
-                window_size=window_size,
-            ))
+            start, end = int(float(start_str)), int(float(end_str))
+            if start >= end:
+                raise ValueError(f"Invalid interval ({chrom}, {start}, {end}).")
+            center = (start + end) // 2
+            start, end = center - half, center - half + window_size
+            if chrom_sizes is not None and (
+                chrom not in chrom_sizes or start < 0 or end > chrom_sizes[chrom]
+            ):
+                n_skipped += 1
+                continue
+            if start < 0:
+                # No chrom_sizes given: legacy behaviour (shift inside chromosome start).
+                start, end = 0, window_size
+            intervals.append(genome.Interval(chromosome=chrom, start=start, end=end))
+    if n_skipped:
+        print(
+            f"{bed_path}: skipped {n_skipped} interval(s) that would exceed chromosome "
+            f"boundaries at window_size={window_size}."
+        )
     if not intervals:
         raise ValueError(f"No intervals parsed from {bed_path}.")
     return intervals

@@ -72,26 +72,57 @@ class TrainingLogger:
         if self.wandb is not None:
             self.wandb.log(metrics, step=metrics.get("step"))
 
-    def log_epoch(self, epoch: int, metrics: dict) -> None:
-        """Append one row of per-epoch metrics (train/val loss, per head)."""
+    def log_epoch(
+        self,
+        epoch: int,
+        metrics: dict,
+        per_sample: list[dict] | None = None,
+        histograms: dict[str, list[float]] | None = None,
+        learning_rate: float | None = None,
+        is_best: bool | None = None,
+    ) -> None:
+        """Append per-epoch rows, laid out like alphagenome-pytorch's
+        ``TrainingLogger.log_epoch``: an aggregate row (``sample`` = NaN)
+        followed by one row per biological sample (``--metrics-per-sample``).
+        ``histograms`` go to W&B only, as in PyTorch."""
         if not self._is_main_process:
             return
 
-        metrics = {"epoch": epoch, **metrics, "timestamp": datetime.now().isoformat()}
+        # Same leading columns as PyTorch: epoch, train_loss, val_loss,
+        # learning_rate, is_best, timestamp, then the remaining metrics.
+        rest = dict(metrics)
+        agg = {"sample": float("nan"), "epoch": epoch}
+        for key in ("train_loss", "val_loss"):
+            if key in rest:
+                agg[key] = rest.pop(key)
+        if learning_rate is not None:
+            agg["learning_rate"] = learning_rate
+        if is_best is not None:
+            agg["is_best"] = is_best
+        agg["timestamp"] = datetime.now().isoformat()
+        agg.update(rest)
+        rows = [agg] + [{"sample": s, **row} for s, row in enumerate(per_sample or [])]
 
         if self._epoch_csv_path is not None:
             if self._epoch_fieldnames is None:
-                self._epoch_fieldnames = list(metrics.keys())
-            else:
-                for key in metrics:
+                self._epoch_fieldnames = []
+            for row in rows:
+                for key in row:
                     if key not in self._epoch_fieldnames:
                         self._epoch_fieldnames.append(key)
-            self._write_row(
-                self._epoch_csv_path, self._epoch_fieldnames, metrics, tolerant=True
-            )
+            for row in rows:
+                self._write_row(
+                    self._epoch_csv_path, self._epoch_fieldnames, row, tolerant=True
+                )
 
         if self.wandb is not None:
-            self.wandb.log({f"epoch/{k}": v for k, v in metrics.items()})
+            payload = {f"epoch/{k}": v for k, v in metrics.items()}
+            if learning_rate is not None:
+                payload["epoch/learning_rate"] = learning_rate
+            payload["epoch"] = epoch
+            for k, values in (histograms or {}).items():
+                payload[f"epoch/{k}"] = self.wandb.Histogram(values)
+            self.wandb.log(payload)
 
     def _write_row(
         self, path: Path, fieldnames: list[str], row: dict, tolerant: bool = False

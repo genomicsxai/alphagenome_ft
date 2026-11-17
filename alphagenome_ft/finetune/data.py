@@ -706,6 +706,11 @@ class BigWigDataModule:
         if self._shuffle and split == "train":
             rng = np.random.default_rng(seed)
             rng.shuffle(order)
+        if split != "train" and self._drop_last:
+            # Evaluation never drops windows: pad the final partial batch by
+            # wrapping around to the start, as torch's DistributedSampler does
+            # for alphagenome-pytorch's validation loader.
+            order = _pad_order_to_batch_multiple(order, self._batch_size)
         if skip_batches:
             # See SpliceDataModule.iter_batches's matching comment: slicing
             # the deterministic shuffle order skips already-consumed batches
@@ -938,3 +943,11 @@ def prepare_batch(
         prepared['junction_is_pos_strand'] = jnp.asarray(batch['junction_is_pos_strand'])
         prepared['junction_counts'] = jnp.asarray(batch['junction_counts'], dtype=jnp.float32)
     return prepared
+
+
+def _pad_order_to_batch_multiple(order: np.ndarray, batch_size: int) -> np.ndarray:
+    """Wrap-pad ``order`` to a multiple of ``batch_size`` (DistributedSampler-style)."""
+    remainder = len(order) % batch_size
+    if remainder == 0:
+        return order
+    return np.concatenate([order, np.resize(order, batch_size - remainder)])

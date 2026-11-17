@@ -4,11 +4,12 @@ Kept dependency-light at module scope (only ``argparse``/``pathlib``) so
 ``--help`` works without a full JAX install, mirroring
 ``alphagenome_pytorch.extensions.finetuning.args``.
 
-Every default here is chosen to match ``alphagenome-pytorch``'s
-``extensions/finetuning/args.py`` defaults for the equivalent flag, so a JAX
-run and a PyTorch run started with no overrides are paper-equivalent. See
-``workarounds.py`` and ``runner.py`` docstrings for the specific bugs/defaults
-this was ported to fix.
+Defaults match ``alphagenome-pytorch``'s ``extensions/finetuning/args.py``
+for every flag both drivers share (``--batch-size`` is per device in both),
+so a JAX run and a PyTorch run started with the same overrides and device
+count train the same objective on the same window order. Flags that exist
+only here are JAX-specific plumbing (``--checkpoint-path``, ``--num-devices``,
+``--max-train-steps``, ``--rope-init-std``).
 
 Note: there is intentionally no ``--junction-loss`` flag here, unlike
 PyTorch's original/normalized/sparse switch. The real
@@ -61,10 +62,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                               "junction head. Matches alphagenome-pytorch's "
                               "--junction-position-source default (annotated).")
     parser.add_argument("--rope-init", choices=["none", "truncated_normal", "zeros"],
-                         default="none",
+                         default="truncated_normal",
                          help="How to initialize SpliceSitesJunctionHead's RoPE "
-                              "scale/offset ('embeddings') parameter. 'none' "
-                              "(default) skips any manual reinit and trusts "
+                              "scale/offset ('embeddings') parameter. Default "
+                              "'truncated_normal' matches alphagenome-pytorch's "
+                              "--rope-init default. 'none' skips any manual reinit and trusts "
                               "the fresh Haiku init a real model construction "
                               "already gives this parameter -- confirmed "
                               "empirically (alphagenome_research 0.3.0+) to "
@@ -74,47 +76,60 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                               "originally worked around (alphagenome_research "
                               "0.1.0) was fixed upstream and no longer exists "
                               "with the currently required package version. "
-                              "'truncated_normal' manually reinits to a fresh "
-                              "TruncatedNormal(std) sample -- statistically "
-                              "indistinguishable from 'none' at "
-                              "--rope-init-std 0.1, kept only for explicit "
-                              "ablation. 'zeros' reproduces the old buggy "
+                              "'truncated_normal' reinits to a fresh "
+                              "TruncatedNormal(std) sample (bounds +/-2 std, "
+                              "like torch trunc_normal_(std, -2std, 2std)) -- "
+                              "statistically the same as 'none' at "
+                              "--rope-init-std 0.1. 'zeros' reproduces the old buggy "
                               "init for ablation only -- do not use otherwise.")
     parser.add_argument("--rope-init-std", type=float, default=0.1,
                          help="Stddev for --rope-init truncated_normal (ignored "
-                              "when --rope-init is 'none', the default). 0.1 "
+                              "when --rope-init is 'none'). 0.1 "
                               "matches alphagenome_research's own real "
                               "TruncatedNormal(0.1) init for this parameter "
                               "(heads.py) and alphagenome-pytorch's hardcoded "
                               "std=0.1 ('matches the JAX reference init and "
                               "the pretrained weight distribution').")
-    parser.add_argument("--sequence-length", type=int, default=1048576)
+    parser.add_argument("--sequence-length", type=int, default=131072,
+                         help="Window length in bp. Default 131072 matches "
+                              "alphagenome-pytorch's --sequence-length.")
     parser.add_argument("--max-splice-sites", type=int, default=256,
-                         help="Max splice sites per role (donor/acceptor x "
-                              "strand) fed to the junction head. Matches "
-                              "alphagenome-pytorch's hardcoded default of the "
-                              "same name in datasets.py (not exposed as a "
-                              "PyTorch CLI flag, but the same value, 256).")
+                         help="Annotated mode: max STAR-derived splice sites per "
+                              "role (donor/acceptor x strand) fed to the junction "
+                              "head. Matches alphagenome-pytorch's "
+                              "--max-splice-sites (256).")
+    parser.add_argument("--junction-top-k", type=int, default=512,
+                         help="Predicted mode only: number of splice sites per role "
+                              "selected from the classification head's probabilities. "
+                              "Default 512 = alphagenome_research's "
+                              "DEFAULT_NUM_SPLICE_SITES; matches alphagenome-pytorch's "
+                              "--junction-top-k.")
+    parser.add_argument("--splice-site-threshold", type=float, default=0.1,
+                         help="Predicted mode only: drop selected sites whose "
+                              "classification probability is below this value. "
+                              "Default 0.1 = alphagenome_research's "
+                              "DEFAULT_SPLICE_SITE_THRESHOLD; matches "
+                              "alphagenome-pytorch's --splice-site-threshold. 0 disables.")
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--weight-decay", type=float, default=0.1,
+                         help="AdamW weight decay. Default 0.1 matches alphagenome-pytorch.")
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=4,
-                         help="Global batch size, sharded across --num-devices. "
-                              "Combined with --gradient-accumulation-steps, the "
-                              "effective batch size per optimizer step is "
-                              "batch_size * gradient_accumulation_steps, matching "
-                              "the PyTorch run's batch=1 x num_gpus x grad_accum "
-                              "scheme.")
+    parser.add_argument("--batch-size", type=int, default=1,
+                         help="Per-device batch size, as alphagenome-pytorch's "
+                              "per-GPU --batch-size (default 1). The global batch is "
+                              "batch_size * num_devices; the effective batch per "
+                              "optimizer step is batch_size * num_devices * "
+                              "gradient_accumulation_steps.")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1,
                          help="Number of --batch-size batches to average grads "
                               "over per optimizer step. Use this (rather than a "
                               "larger --batch-size) to match a PyTorch DDP run's "
                               "effective batch size without risking OOM at 1Mb "
                               "sequence length on a single device: e.g. "
-                              "--batch-size 1 --gradient-accumulation-steps 64 "
-                              "on one GPU reproduces the same 64-example "
-                              "gradient average as a PyTorch run's batch=1 x "
-                              "4 GPUs x grad_accum=16.")
+                              "--batch-size 1 --num-devices 1 "
+                              "--gradient-accumulation-steps 64 reproduces the "
+                              "same 64-example gradient average as a PyTorch "
+                              "run's batch=1 x 4 GPUs x grad_accum=16.")
     parser.add_argument("--num-devices", type=int, default=4)
     parser.add_argument("--gradient-checkpointing", action="store_true",
                          help="Mirrors alphagenome-pytorch's --gradient-checkpointing: "
@@ -128,8 +143,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                               "up unused. For --mode lora it is even more directly "
                               "needed: the backbone is NOT detached there (gradients "
                               "must reach the LoRA adapters through it).")
-    parser.add_argument("--mode", choices=["linear-probe", "lora"], default="linear-probe",
-                         help="'linear-probe' (default): freeze + detach the backbone, "
+    parser.add_argument("--mode", choices=["linear-probe", "lora"], default="lora",
+                         help="Default 'lora', as alphagenome-pytorch. "
+                              "'linear-probe': freeze + detach the backbone, "
                               "train only the heads. 'lora': freeze the backbone but do "
                               "NOT detach it; instead build the trunk with "
                               "alphagenome_ft.backbone_lora so the --lora-targets q/v "
@@ -140,7 +156,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lora-rank", type=int, default=8,
                          help="LoRA rank for --mode lora. Matches alphagenome-pytorch's "
                               "--lora-rank default (8).")
-    parser.add_argument("--lora-alpha", type=float, default=16.0,
+    parser.add_argument("--lora-alpha", type=int, default=16,
                          help="LoRA alpha scaling for --mode lora; effective adapter "
                               "scale is alpha/rank. Matches alphagenome-pytorch's "
                               "--lora-alpha default (16).")
@@ -167,14 +183,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                          help="Compute dtype for the trunk AND heads (params stay "
                               "fp32). Matches alphagenome-pytorch's --dtype "
                               "(same default, bfloat16).")
-    parser.add_argument("--usage-num-segments", type=int, default=8,
+    parser.add_argument("--splice-num-segments", "--usage-num-segments",
+                         dest="splice_num_segments", type=int, default=1,
                          help="Split the sequence into this many equal chunks for the "
-                              "splice_site_usage BCE loss, summing per-chunk masked means "
-                              "instead of one global mean (upweights sparse splice-site "
-                              "regions) -- see CustomAlphaGenomeModel.set_usage_num_segments "
-                              "in custom_model.py. Matches alphagenome-pytorch's "
-                              "--num-segments default (8). Pass 1 to disable (single "
-                              "global mean).")
+                              "splice_site classification and splice_usage losses, summing "
+                              "per-chunk masked means instead of one global mean -- see "
+                              "CustomAlphaGenomeModel.set_splice_num_segments. Default 1 "
+                              "(alphagenome_research's own losses), as alphagenome-pytorch's "
+                              "--splice-num-segments. --usage-num-segments is a deprecated alias.")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--organism", default="HOMO_SAPIENS")
     parser.add_argument("--output-dir", required=True, type=Path)
@@ -198,9 +214,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--wandb", action="store_true",
                          help="Enable Weights & Biases logging, mirroring "
                               "alphagenome-pytorch's --wandb.")
-    parser.add_argument("--wandb-project", default="alphagenome-ft")
+    parser.add_argument("--wandb-project", default="alphagenome-finetune")
     parser.add_argument("--wandb-entity", default=None)
-    parser.add_argument("--pretrained-head-samples", type=str, default="splice_site:0",
+    parser.add_argument("--pretrained-head-samples", type=str, default=None,
                          help="Per-head control over pretrained-vs-random weight init, "
                               "mirroring alphagenome-pytorch's --pretrained-head-samples. "
                               "Format: 'modality[@resolution]:idx,...' where modality is "
@@ -220,8 +236,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                               "tissues specifically (its main linear projects trunk "
                               "embeddings into a shared representation, not a per-tissue "
                               "one, so that part is always copied whole, organism-only). "
-                              "Default 'splice_site:0' reproduces this repo's prior "
-                              "hardcoded behavior.")
+                              "Default: unset (all heads random), as alphagenome-pytorch; "
+                              "'splice_site:0' reproduces this repo's earlier behavior.")
     parser.add_argument("--modality-weights", type=str, default=None,
                          help="Optional per-head loss weights, mirroring "
                               "alphagenome-pytorch's --modality-weights. Format: "
@@ -230,15 +246,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                               "head's loss is scaled by its weight before being summed "
                               "into the total optimized loss; per-head CSV/W&B logging "
                               "stays unweighted. Modalities not listed default to 1.0.")
-    parser.add_argument("--warmup-steps", type=int, default=0,
+    parser.add_argument("--warmup-steps", type=int, default=500,
                          help="Linear LR warmup over this many optimizer steps before "
-                              "--lr-schedule takes over, mirroring alphagenome-pytorch's "
-                              "--warmup-steps. Default 0 (no warmup) matches this repo's "
-                              "prior constant-LR-only behavior.")
-    parser.add_argument("--lr-schedule", choices=["constant", "cosine"], default="constant",
-                         help="LR schedule after warmup, mirroring alphagenome-pytorch's "
-                              "--lr-schedule. 'constant' (default, matches prior behavior) "
-                              "or 'cosine' (decays to 0 by the end of training).")
+                              "--lr-schedule takes over. Default 500 matches "
+                              "alphagenome-pytorch's --warmup-steps.")
+    parser.add_argument("--lr-schedule", choices=["constant", "cosine"], default="cosine",
+                         help="LR schedule after warmup. Default 'cosine' (decays to 0 "
+                              "by the end of training) matches alphagenome-pytorch.")
     parser.add_argument("--no-val-pearson", action="store_true",
                          help="Disable per-head validation Pearson correlation "
                               "(rna_seq/splice_usage/splice_junctions; not splice_site, "

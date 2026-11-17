@@ -92,8 +92,8 @@ class SpliceSourceSpec:
     max_splice_sites: int = 256
     # junction ("splice_sites_junction") kind only:
     junction_position_source: str = "annotated"  # "annotated" | "predicted"
-    junction_top_k: int = 512
-    max_junctions_per_window: int = 1024
+    junction_top_k: int = 512  # alphagenome_research DEFAULT_NUM_SPLICE_SITES
+    splice_site_threshold: float = 0.1  # alphagenome_research DEFAULT_SPLICE_SITE_THRESHOLD
     classification_head_id: str | None = None  # required when junction_position_source="predicted"
 
 
@@ -434,7 +434,7 @@ def _parse_splice_source(entry: Mapping[str, Any], head_id: str) -> "SpliceSourc
         max_splice_sites=int(entry.get("max_splice_sites", 256)),
         junction_position_source=junction_position_source,
         junction_top_k=int(entry.get("junction_top_k", 512)),
-        max_junctions_per_window=int(entry.get("max_junctions_per_window", 1024)),
+        splice_site_threshold=float(entry.get("splice_site_threshold", 0.1)),
         classification_head_id=(
             str(classification_head_id) if classification_head_id is not None else None
         ),

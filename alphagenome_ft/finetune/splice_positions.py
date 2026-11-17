@@ -19,35 +19,51 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 
 
+# alphagenome_research.model.model.DEFAULT_NUM_SPLICE_SITES / DEFAULT_SPLICE_SITE_THRESHOLD
+DEFAULT_JUNCTION_TOP_K = 512
+DEFAULT_SPLICE_SITE_THRESHOLD = 0.1
+
+
 def top_k_splice_positions(
-    logits: Float[Array, "B S 5"], top_k: int
+    logits: Float[Array, "B S 5"],
+    top_k: int,
+    threshold: float = DEFAULT_SPLICE_SITE_THRESHOLD,
 ) -> Int[Array, "B 4 {top_k}"]:
     """Derive junction-head splice-site positions from classification logits.
 
-    JAX port of ``alphagenome_pytorch``'s ``_top_k_positions_from_logits``:
-    for each of the 4 role channels (0=Donor+, 1=Acceptor+, 2=Donor-,
-    3=Acceptor-; channel 4 is the background class and is unused here),
-    take the ``top_k`` highest-scoring positions, then sort them ascending
-    so RoPE positional deltas in the junction head stay well-ordered.
+    Mirrors ``alphagenome_research.model.splicing._top_k_splice_sites`` (and
+    ``alphagenome_pytorch``'s ``_top_k_positions_from_logits``): for each of
+    the 4 role channels (0=Donor+, 1=Acceptor+, 2=Donor-, 3=Acceptor-;
+    channel 4 is background), take the ``top_k`` highest softmax
+    *probabilities*, drop sites below ``threshold``, and sort the rest
+    ascending with ``-1`` padding at the end.
+
+    Uses exact ``jax.lax.top_k`` (alphagenome_research uses
+    ``approx_max_k``, which is exact off-TPU).
 
     Args:
         logits: Classification head logits, ``(B, S, 5)``, NLC layout.
         top_k: Number of positions to keep per role. If ``top_k > S`` the
-            remaining columns are padded with -1 (mirrors annotated-mode
-            padding semantics).
+            remaining columns are padded with -1.
+        threshold: Minimum class probability for a selected site; 0 disables.
 
     Returns:
-        Int32 array ``(B, 4, top_k)`` of 0-based positions, -1 padded.
-        Wrapped in ``stop_gradient`` — top-k indices carry no gradient
-        information anyway, this just makes the intent explicit.
+        Int32 array ``(B, 4, top_k)`` of 0-based positions, -1 padded,
+        wrapped in ``stop_gradient``.
     """
     batch_size, seq_len, _ = logits.shape
     k = min(top_k, seq_len)
+    probs = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
 
     def _per_role(channel_idx: int) -> Int[Array, "B {k}"]:
-        scores = logits[:, :, channel_idx]
-        _, idx = jax.lax.top_k(scores, k)
-        return jnp.sort(idx, axis=-1)
+        values, idx = jax.lax.top_k(probs[:, :, channel_idx], k)
+        if threshold > 0:
+            # Push below-threshold sites past every valid index so they sort last.
+            idx = jnp.where(values < threshold, seq_len, idx)
+        idx = jnp.sort(idx, axis=-1)
+        if threshold > 0:
+            idx = jnp.where(idx == seq_len, -1, idx)
+        return idx
 
     positions = jnp.stack([_per_role(c) for c in range(4)], axis=1)
     if k < top_k:
