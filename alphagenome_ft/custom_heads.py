@@ -545,7 +545,6 @@ def _with_pytorch_target_scaling(head):
     """
     if not isinstance(head, predefined_heads.GenomeTracksHead):
         return head
-    import jax.numpy as jnp
 
     def scale(x, organism_index, resolution):
         track_means = predefined_heads._get_param_for_index(head._track_means, organism_index)

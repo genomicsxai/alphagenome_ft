@@ -103,30 +103,6 @@ def register_predefined_heads(head_specs: Sequence[HeadSpec]) -> None:
 ## import is what actually runs.
 
 
-def _splice_head_track_names(spec: HeadSpec) -> list[str]:
-    """Per-track sample-derived name labels for a splice_usage/splice_junctions
-    ``HeadSpec``, used only for ``--metrics-per-sample`` CSV column naming.
-
-    Deliberately duplicates (rather than imports/reuses) the exact naming
-    logic from ``finetune.config._build_splice_metadata``, since that
-    function only returns an ``AlphaGenomeOutputMetadata`` mapping (no
-    ``HeadSpec.tracks`` -- splice ``HeadSpec``s always have ``tracks=()``,
-    see ``config.prepare_head_specs``), not something this module could
-    otherwise reuse directly. Must stay in sync with that function's ordering
-    if it ever changes.
-    """
-    ss = spec.splice_source
-    if ss is None:
-        raise ValueError(f"HeadSpec {spec.head_id!r} has no splice_source.")
-    if spec.kind == "splice_sites_usage":
-        samples = ss.ssu if ss.ssu is not None else ss.star_junctions
-        sample_names = [Path(p).stem for p in samples]
-        return [n for name in sample_names for n in (f"{name}_pos", f"{name}_neg")]
-    if spec.kind == "splice_sites_junction":
-        return [Path(p).stem for p in ss.star_junctions]
-    raise ValueError(f"No per-track names for head kind {spec.kind!r}.")
-
-
 # --- Validation metrics, aligned with alphagenome-pytorch -------------------
 #
 # Every definition below mirrors alphagenome-pytorch's

@@ -45,7 +45,6 @@ from alphagenome_ft.finetune.star_junctions import (
     ssu_to_arrays_by_strand,
 )
 
-N_CLASSIFICATION_CLASSES = 5
 
 
 class SpliceDataModule:
@@ -190,11 +189,6 @@ class SpliceDataModule:
                 ]
             if windows:
                 self._intervals[split] = windows
-
-    def n_usage_tracks(self) -> int:
-        """Number of usage channels (2 per sample: positive and negative strand)."""
-        n = len(self.ssu_files) if self.ssu_files is not None else len(self.star_junction_files)
-        return 2 * n
 
     def iter_batches(
         self, split: str, *, seed: int | None = None, skip_batches: int = 0
