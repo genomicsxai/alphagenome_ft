@@ -22,12 +22,31 @@ def parameter_path_to_str(path_tuple: tuple) -> str:
     return parameter_utils._keypath_to_str(path_tuple)
 
 
-def is_trainable_head_path(path_str: str, trainable_heads: set[str]) -> bool:
-    """Return True if ``path_str`` belongs to one of the named heads."""
+def is_trainable_head_path(
+    path_str: str,
+    trainable_heads: set[str],
+    top_level_heads: frozenset[str] | set[str] = frozenset(),
+) -> bool:
+    """Return True if ``path_str`` belongs to one of the named heads.
+
+    A head may live at top level (``head/<name>/...``, custom heads) or inside
+    the model scope (``.../head/<name>/...``). For names in ``top_level_heads``
+    only the top-level copy matches, so a pretrained standard head with the same
+    name (e.g. ``alphagenome/head/rna_seq``, unused once a custom ``rna_seq``
+    head exists) stays frozen.
+    """
     for head_name in trainable_heads:
-        if f"/head/{head_name}/" in path_str or path_str.startswith(f"head/{head_name}/"):
+        if path_str.startswith(f"head/{head_name}/"):
+            return True
+        if head_name not in top_level_heads and f"/head/{head_name}/" in path_str:
             return True
     return False
+
+
+def _top_level_head_names(path_strs, trainable_heads: set[str]) -> frozenset[str]:
+    return frozenset(
+        n for n in trainable_heads if any(p.startswith(f"head/{n}/") for p in path_strs)
+    )
 
 
 def is_lora_parameter_path(path_str: str) -> bool:
@@ -43,10 +62,12 @@ def label_params_for_trainable_heads(
 ) -> PyTree:
     """Label trainable heads/adapters versus frozen parameter leaves."""
     head_set = {str(n) for n in trainable_head_names}
+    all_paths = [parameter_path_to_str(p) for p, _ in jax.tree_util.tree_flatten_with_path(params)[0]]
+    top_level = _top_level_head_names(all_paths, head_set)
 
     def label_fn(path, _value):
         ps = parameter_path_to_str(path)
-        trainable = is_trainable_head_path(ps, head_set) or (
+        trainable = is_trainable_head_path(ps, head_set, top_level) or (
             include_lora and is_lora_parameter_path(ps)
         )
         return "head" if trainable else "frozen"
@@ -58,7 +79,8 @@ def assert_trainable_head_params_exist(params: PyTree, trainable_head_names: Seq
     """Raise if no head parameters match ``trainable_head_names``."""
     head_set = {str(n) for n in trainable_head_names}
     head_paths = parameter_utils.get_head_parameter_paths(params)
-    matched = [p for p in head_paths if is_trainable_head_path(p, head_set)]
+    top_level = _top_level_head_names(head_paths, head_set)
+    matched = [p for p in head_paths if is_trainable_head_path(p, head_set, top_level)]
     if not matched:
         sample = ", ".join(head_paths[:5]) if head_paths else "<none>"
         raise ValueError(

@@ -2869,7 +2869,13 @@ def create_model_with_heads(
                 # see finegrained_remat.py for why that granularity matters (an
                 # outer whole-trunk remat alone still OOM'd at ~53GB once the
                 # backbone isn't detached, e.g. --mode lora).
-                embeddings = alphagenome.forward_trunk(dna_sequence, organism_index)
+                if hasattr(alphagenome, "forward_trunk"):
+                    embeddings = alphagenome.forward_trunk(dna_sequence, organism_index)
+                else:
+                    # alphagenome_research without the trunk/heads split: the full
+                    # __call__ also runs the standard heads (unused here) but has
+                    # the same parameter paths.
+                    _, embeddings = alphagenome(dna_sequence, organism_index)
             if detach_backbone:
                 embeddings = _stop_gradient_embeddings(embeddings)
 

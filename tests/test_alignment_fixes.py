@@ -147,3 +147,44 @@ def test_epoch_log_has_pytorch_leading_columns(tmp_path):
         header = next(csv.reader(f))
     assert header[:7] == ["sample", "epoch", "train_loss", "val_loss",
                           "learning_rate", "is_best", "timestamp"]
+
+
+def test_cls_auprc_subsamples_background():
+    from alphagenome_ft.finetune.train import _cls_active_and_background
+
+    target = np.zeros((100, 5), np.float32)
+    target[:, 4] = 1.0
+    target[[3, 50], 4] = 0.0
+    target[3, 0] = target[50, 2] = 1.0
+    logits = np.random.default_rng(0).normal(size=(100, 5)).astype(np.float32)
+    lg, tg = _cls_active_and_background(logits, target, np.random.default_rng(1))
+    assert tg.shape[0] == 4                      # 2 sites + 2 background, not all 100
+    assert tg[:2, :4].any(axis=-1).all() and not tg[2:, :4].any()
+
+
+def test_custom_head_shadows_pretrained_same_name():
+    from alphagenome_ft.optimizer_utils import label_params_for_trainable_heads
+
+    params = {
+        "head/rna_seq/resolution_1/multi_organism_linear": {"w": jnp.ones((2, 2))},
+        "alphagenome/head/rna_seq/resolution_1/multi_organism_linear": {"w": jnp.ones((2, 2))},
+        "alphagenome/head/my_task": {"w": jnp.ones((2, 2))},
+    }
+    labels = label_params_for_trainable_heads(params, ["rna_seq", "my_task"])
+    assert labels["head/rna_seq/resolution_1/multi_organism_linear"]["w"] == "head"
+    assert labels["alphagenome/head/rna_seq/resolution_1/multi_organism_linear"]["w"] == "frozen"
+    assert labels["alphagenome/head/my_task"]["w"] == "head"     # no top-level copy: still trainable
+
+
+def test_epoch_log_widens_header_without_shifting(tmp_path):
+    import csv
+
+    from alphagenome_ft.finetune import logging_utils
+
+    logging_utils.TrainingLogger(tmp_path).log_epoch(1, {"train_loss": 1.0, "a": 1.0})
+    resumed = logging_utils.TrainingLogger(tmp_path)          # new process after a resume
+    resumed.log_epoch(2, {"train_loss": 2.0, "b": 2.0})
+    with open(next(tmp_path.rglob("epoch_log.csv"))) as f:
+        rows = list(csv.DictReader(f))
+    assert rows[0]["a"] == "1.0" and rows[0]["b"] == ""
+    assert rows[1]["a"] == "" and rows[1]["b"] == "2.0" and rows[1]["train_loss"] == "2.0"

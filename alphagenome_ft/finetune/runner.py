@@ -49,6 +49,12 @@ def main(args=None) -> None:
     from alphagenome_ft.finetune.splice_data import SpliceDataModule
     from alphagenome_ft.finetune.train import register_predefined_heads, train as run_train
 
+    if args.num_devices is None:
+        import jax
+
+        args.num_devices = jax.local_device_count()
+        print(f"Using all {args.num_devices} visible device(s) (--num-devices not set).")
+
     organism_index = research_dna_model.convert_to_organism_index(
         getattr(ag_dna_model.Organism, args.organism)
     )

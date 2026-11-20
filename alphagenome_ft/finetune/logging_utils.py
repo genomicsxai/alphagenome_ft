@@ -104,12 +104,19 @@ class TrainingLogger:
         rows = [agg] + [{"sample": s, **row} for s, row in enumerate(per_sample or [])]
 
         if self._epoch_csv_path is not None:
+            path = self._epoch_csv_path
             if self._epoch_fieldnames is None:
-                self._epoch_fieldnames = []
-            for row in rows:
-                for key in row:
-                    if key not in self._epoch_fieldnames:
-                        self._epoch_fieldnames.append(key)
+                # Resumed run: continue the existing file's columns.
+                self._epoch_fieldnames = _read_csv_header(path)
+            new_keys = [
+                key for row in rows for key in row if key not in self._epoch_fieldnames
+            ]
+            new_keys = list(dict.fromkeys(new_keys))
+            if new_keys:
+                self._epoch_fieldnames.extend(new_keys)
+                if path.exists() and path.stat().st_size > 0:
+                    # Widen the header in place so earlier rows stay aligned.
+                    _rewrite_csv_with_fieldnames(path, self._epoch_fieldnames)
             for row in rows:
                 self._write_row(
                     self._epoch_csv_path, self._epoch_fieldnames, row, tolerant=True
@@ -143,6 +150,24 @@ class TrainingLogger:
     def finish(self) -> None:
         if self.wandb is not None:
             self.wandb.finish()
+
+
+def _read_csv_header(path: Path) -> list[str]:
+    if not path.exists() or path.stat().st_size == 0:
+        return []
+    with path.open(newline="") as f:
+        return next(csv.reader(f), [])
+
+
+def _rewrite_csv_with_fieldnames(path: Path, fieldnames: list[str]) -> None:
+    with path.open(newline="") as f:
+        existing = list(csv.DictReader(f))
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, restval="", extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(existing)
+    tmp.replace(path)
 
 
 __all__ = ["TrainingLogger"]

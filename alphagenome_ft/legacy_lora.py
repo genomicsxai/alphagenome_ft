@@ -86,6 +86,11 @@ def restore_into_model(model: Any, checkpoint_dir: str | Path) -> dict[str, int]
         loaded_params, loaded_state = restored, {}
 
     loaded_params = remap_legacy_lora_params(loaded_params)
+    # Older checkpoints stored head params as bfloat16; keep fp32 master copies
+    # (bf16 head compute is applied at read time, see custom_model).
+    from alphagenome_ft.custom_model import _cast_head_params_to_float32
+
+    loaded_params = _cast_head_params_to_float32(loaded_params)
     n_lora = 0
     for module_key, leaves in loaded_params.items():
         target = model._params.get(module_key)

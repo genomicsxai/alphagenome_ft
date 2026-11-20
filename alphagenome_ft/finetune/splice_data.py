@@ -32,7 +32,9 @@ from alphagenome.io import fasta as fasta_lib
 from alphagenome_research.model import one_hot_encoder
 
 from alphagenome_ft.finetune.star_junctions import (
+    donor_acceptor_positions,
     gtf_splice_sites_to_junctions,
+    junctions_to_site_table,
     junctions_to_classification_array,
     junctions_to_junction_matrix,
     junctions_to_ssu_approx_arrays_by_strand,
@@ -163,17 +165,7 @@ class SpliceDataModule:
         if gtf_file is not None:
             gtf_juncs = gtf_splice_sites_to_junctions(gtf_file)
             self._gtf_juncs = gtf_juncs
-            donors = gtf_juncs[["chrom", "strand"]].copy()
-            donors["position"] = gtf_juncs["exon_start"].values
-            donors["role"] = "donor"
-            acceptors = gtf_juncs[["chrom", "strand"]].copy()
-            acceptors["position"] = gtf_juncs["exon_end"].values
-            acceptors["role"] = "acceptor"
-            self._gtf_sites = pd.concat(
-                [donors, acceptors], ignore_index=True
-            ).drop_duplicates(subset=["chrom", "position", "strand", "role"]).reset_index(
-                drop=True
-            )
+            self._gtf_sites = junctions_to_site_table(gtf_juncs)
 
         if self._all_juncs:
             union_juncs = pd.concat(
@@ -192,8 +184,8 @@ class SpliceDataModule:
                     for w in windows
                     if not union_juncs.loc[
                         (union_juncs["chrom"] == w.chromosome)
-                        & (union_juncs["exon_start"] >= w.start)
-                        & (union_juncs["exon_end"] < w.end)
+                        & (union_juncs["exon_start"] > w.start)
+                        & (union_juncs["exon_end"] <= w.end)
                     ].empty
                 ]
             if windows:
@@ -285,8 +277,9 @@ class SpliceDataModule:
                 & junc_df["strand"].isin(("+", "-"))
             )
             local = junc_df.loc[mask]
-            d_rel.extend((local["exon_start"].to_numpy(dtype=np.int64) - 1 - start).tolist())
-            a_rel.extend((local["exon_end"].to_numpy(dtype=np.int64) - 1 - start).tolist())
+            donor, acceptor = donor_acceptor_positions(local)
+            d_rel.extend((donor - 1 - start).tolist())
+            a_rel.extend((acceptor - 1 - start).tolist())
             is_pos_strand.extend((local["strand"] == "+").tolist())
             sample_rows.extend([sample_idx] * len(local))
             sample_counts.extend(local["count"].astype(float).tolist())

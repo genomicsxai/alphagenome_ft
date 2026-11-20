@@ -332,17 +332,19 @@ def test_cli_defaults_aligned():
         "--output-dir", "out", "--run-name", "r",
     ])
     assert args.splice_num_segments == 1
-    # alphagenome-pytorch defaults
-    assert args.weight_decay == 0.1
-    assert args.warmup_steps == 500
-    assert args.lr_schedule == "cosine"
-    assert args.mode == "lora"
-    assert args.sequence_length == 131072
-    assert args.pretrained_head_samples is None
+    # shared defaults (same values in alphagenome-pytorch)
+    assert args.weight_decay == 0.0
+    assert args.warmup_steps == 0
+    assert args.lr_schedule == "constant"
+    assert args.mode == "linear-probe"
+    assert args.sequence_length == 1048576
+    assert args.pretrained_head_samples == "splice_site:0"
     assert args.rope_init == "truncated_normal"
     assert args.batch_size == 1
     assert args.lora_alpha == 16 and isinstance(args.lora_alpha, int)
     assert args.seed == 1234
+    assert args.num_devices is None      # resolved to all visible devices at startup
+    assert args.resume == "auto"
     assert args.max_splice_sites == 256
     assert args.junction_top_k == 512
     assert args.splice_site_threshold == 0.1
@@ -379,8 +381,9 @@ class TestBuildJunctionMatrix:
         set_class(299, 0)
         set_class(199, 1)
         set_class(399, 1)
-        set_class(299, 2)
-        set_class(4499, 3)
+        # Minus strand: donor is the right site, acceptor the left (AlphaGenome convention).
+        set_class(4499, 2)
+        set_class(299, 3)
 
         max_splice_sites = 8
         positions_np, matrix_np = sj.junctions_to_junction_matrix(
@@ -394,9 +397,9 @@ class TestBuildJunctionMatrix:
             for _, r in df.iterrows():
                 counts = [0.0] * n_samples
                 counts[sample_idx] = float(r["count"])
-                rows.append(
-                    (int(r["exon_start"]) - 1, int(r["exon_end"]) - 1, r["strand"] == "+", counts)
-                )
+                left, right = int(r["exon_start"]) - 1, int(r["exon_end"]) - 1
+                donor, acceptor = (left, right) if r["strand"] == "+" else (right, left)
+                rows.append((donor, acceptor, r["strand"] == "+", counts))
         max_junctions = 8
         d_rel = np.full((1, max_junctions), -1, dtype=np.int32)
         a_rel = np.full((1, max_junctions), -1, dtype=np.int32)

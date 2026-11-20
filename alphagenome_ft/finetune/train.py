@@ -300,7 +300,7 @@ def _cls_active_and_background(logits, target, rng):
     (any target > 0) position plus an equal-sized random background subsample."""
     logits = np.asarray(logits, dtype=np.float32).reshape(-1, 5)
     target = np.asarray(target, dtype=np.float32).reshape(-1, 5)
-    active = target.any(axis=-1)
+    active = target[:, :4].any(axis=-1)  # splice classes only; column 4 is the "no site" class
     n_active = int(active.sum())
     if n_active == 0:
         return None
@@ -1109,6 +1109,11 @@ def train(
         strand_reindexing_replicated = _replicate_tree(strand_reindexing, devices)
         stop_training = False
         for epoch in range(start_epoch, num_epochs + 1):
+            if global_step >= total_train_steps:
+                # Resumed a run that already reached its step budget: no extra
+                # step, no re-validation, no checkpoint overwrite.
+                print(f"  Already at requested training steps: {global_step}/{total_train_steps}")
+                break
             if verbose:
                 print(f"\n{'=' * 60}")
                 print(f"Epoch {epoch}/{num_epochs}")
@@ -1217,6 +1222,13 @@ def train(
                 if global_step >= total_train_steps:
                     stop_training = True
                     break
+
+            # Where a resume continues from: the next epoch, unless the step budget
+            # stopped this one part-way (then the rest of it is still to run).
+            if stop_training and epoch_step < steps_per_epoch:
+                resume_epoch_after, resume_step_after = epoch, epoch_step
+            else:
+                resume_epoch_after, resume_step_after = epoch + 1, 0
 
             train_loss_avg = float(np.mean(train_losses)) if train_losses else None
             train_head_loss_avgs = {
@@ -1358,7 +1370,10 @@ def train(
                             " -- saving best checkpoint"
                         )
                         model.save_checkpoint(checkpoint_dir / "best", save_full_model=False)
-                        _write_train_state(checkpoint_dir / "best", resume_epoch=epoch + 1, resume_epoch_step=0)
+                        _write_train_state(
+                            checkpoint_dir / "best",
+                            resume_epoch=resume_epoch_after, resume_epoch_step=resume_step_after,
+                        )
                         _save_opt_state(checkpoint_dir / "best")
                 else:
                     epochs_since_improvement += 1
@@ -1369,7 +1384,10 @@ def train(
                 model._params = _unreplicate_tree(replicated_params)
                 model._state = _unreplicate_tree(replicated_state)
                 model.save_checkpoint(checkpoint_dir / "last", save_full_model=False)
-                _write_train_state(checkpoint_dir / "last", resume_epoch=epoch + 1, resume_epoch_step=0)
+                _write_train_state(
+                    checkpoint_dir / "last",
+                    resume_epoch=resume_epoch_after, resume_epoch_step=resume_step_after,
+                )
                 _save_opt_state(checkpoint_dir / "last")
 
             if (
