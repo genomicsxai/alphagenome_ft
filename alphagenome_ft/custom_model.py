@@ -3232,9 +3232,7 @@ def load_checkpoint(
         backbone_lora_config: Fallback ``BackboneLoRAConfig`` for checkpoints
             whose ``config.json`` records none. A recorded config always wins,
             so a resumed LoRA run rebuilds the LoRA-shaped target tree the
-            checkpoint was saved with. Checkpoints written by the pre-merge fork
-            (``q_lora``/``v_lora`` keys) are loaded with
-            ``alphagenome_ft.legacy_lora.restore_into_model`` instead.
+            checkpoint was saved with.
 
     Returns:
         CustomAlphaGenomeModel with loaded parameters.

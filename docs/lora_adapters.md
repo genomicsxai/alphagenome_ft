@@ -159,22 +159,3 @@ but it does not adapt AlphaGenome's attention projections.
 For leakage-sensitive evaluation, use a fold-specific base model and match the
 training, validation, and test intervals to that fold. The `all_folds` model is
 convenient for applications but is not appropriate for held-out fold claims.
-
-## Checkpoints from the pre-merge splice fork (`q_lora`/`v_lora` layout)
-
-Before this fork adopted `alphagenome_ft.backbone_lora`, adapters were injected by
-monkeypatching `MHABlock.__call__` and stored in sibling scopes
-(`mha_block*/q_lora/{lora_a,lora_b}`). The maths is identical (same A bounds, B = 0,
-`alpha / rank` scale); only the key names differ. `alphagenome_ft.legacy_lora` is the
-single place that knows about the old layout:
-
-```python
-from alphagenome_ft import legacy_lora
-
-model = create_model_with_heads(..., backbone_lora_config=BackboneLoRAConfig(rank=8, alpha=16))
-legacy_lora.restore_into_model(model, "path/to/old/last")   # renames keys, overlays heads + adapters
-```
-
-`restore_into_model` also accepts checkpoints already in the current layout. Checkpoints
-written by the pre-merge fork with `save_full_model=False` contain **no adapters at all**
-(its delta slice only kept `head/*`); those cannot be restored.
