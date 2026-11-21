@@ -91,7 +91,7 @@ train(
 ```
 
 `max_grad_norm=1.0` matches the PyTorch pipeline. Set it to `None` or `0` to
-recover the older JAX behavior without clipping.
+disable gradient clipping.
 
 Matching these settings does not imply bitwise equality between training runs.
 Framework RNGs and mixed-precision kernels differ. PyTorch gradient clipping
@@ -149,12 +149,12 @@ Full-model LoRA checkpoints are also supported and restore the LoRA-aware
 forward function. Minimal encoder-only checkpoints are intentionally rejected
 for backbone LoRA because they omit the transformer where the adapters live.
 
-## Legacy head-level LoRA
+## Head-level LoRA
 
-`LoRAConfig` and `LoRALinear` remain available for custom heads that contain
-their own low-rank projections. That is distinct from the PyTorch-aligned
-backbone mode above. A head-level adapter can be useful for experimentation,
-but it does not adapt AlphaGenome's attention projections.
+`LoRAConfig` and `LoRALinear` (`alphagenome_ft.lora`) add low-rank projections
+inside custom heads. This is separate from the PyTorch-aligned backbone mode
+above: a head-level adapter trains only within the head and does not adapt
+AlphaGenome's attention projections.
 
 For leakage-sensitive evaluation, use a fold-specific base model and match the
 training, validation, and test intervals to that fold. The `all_folds` model is

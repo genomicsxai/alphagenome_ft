@@ -23,7 +23,8 @@ from alphagenome.data import genome
 from alphagenome_ft import custom_heads as custom_heads_module
 from alphagenome_ft.finetune import config as ft_config
 from alphagenome_ft.finetune import star_junctions as sj
-from alphagenome_ft.finetune.splice_data import SpliceDataModule
+from alphagenome_ft.finetune.data import FinetuneDataModule
+from alphagenome_ft.finetune.splice_data import SpliceTargets, build_splice_targets
 from alphagenome_ft.finetune.splice_positions import build_junction_matrix, top_k_splice_positions
 
 from tests.conftest import require_kaggle_credentials
@@ -68,6 +69,28 @@ def mock_fasta(tmp_path: Path) -> str:
     path.write_text("\n".join(lines) + "\n")
     pyfaidx.Faidx(str(path))  # builds mock_genome.fa.fai, as FastaExtractor requires
     return str(path)
+
+
+def _splice_head_cfg(star_junction_files, kinds_to_ids, **extra):
+    """Config entries for splice heads sharing one source (no junction filter)."""
+    heads = []
+    for kind, head_id in kinds_to_ids.items():
+        entry = {
+            "id": head_id, "source": "predefined", "kind": kind,
+            "star_junctions": star_junction_files, "filter_to_junctions": False,
+            "max_splice_sites": 16,
+        }
+        if kind == "splice_sites_junction":
+            entry.update(extra)
+        heads.append(entry)
+    return {"heads": heads}
+
+
+ALL_SPLICE_IDS = {
+    "splice_sites_classification": "cls_head",
+    "splice_sites_usage": "usage_head",
+    "splice_sites_junction": "junction_head",
+}
 
 
 # Splice heads need real 1bp decoder embeddings, which use_encoder_output=True
@@ -130,22 +153,17 @@ class TestStarJunctionsParser:
         assert matrix.sum() > 0
 
 
-class TestSpliceDataModule:
+class TestFinetuneDataModuleSplice:
     def test_batches_have_expected_shapes(self, star_junction_files, mock_fasta):
+        specs = ft_config.prepare_head_specs(
+            _splice_head_cfg(star_junction_files, ALL_SPLICE_IDS), organism="HOMO_SAPIENS")
         windows = [genome.Interval(chromosome="chr1", start=0, end=5000)]
-        module = SpliceDataModule(
+        module = FinetuneDataModule(
             intervals={"train": windows},
             fasta_path=mock_fasta,
-            star_junction_files=star_junction_files,
-            head_kinds={
-                "splice_sites": "cls_head",
-                "splice_site_usage": "usage_head",
-                "splice_junctions": "junction_head",
-            },
+            head_specs=specs,
             batch_size=1,
             shuffle=False,
-            filter_to_junctions=False,
-            max_splice_sites=16,
         )
         batches = list(module.iter_batches("train"))
         assert len(batches) == 1
@@ -158,17 +176,58 @@ class TestSpliceDataModule:
         assert batch["targets_junction_head"].shape == (1, 16, 16, 4)
         assert batch["splice_site_positions"].shape == (1, 4, 16)
         assert batch["splice_site_positions"].dtype == np.int32
+        assert "junction_d_rel" not in batch          # annotated mode: no raw events
 
-    def test_rejects_unknown_kind(self, star_junction_files, mock_fasta):
-        with pytest.raises(ValueError, match="Unknown splice kind"):
-            SpliceDataModule(
-                intervals={"train": []},
-                fasta_path=mock_fasta,
-                star_junction_files=star_junction_files,
-                head_kinds={"not_a_kind": "head"},
-                batch_size=1,
-                shuffle=False,
-            )
+    def test_heads_sharing_a_source_share_one_loader(self, star_junction_files):
+        specs = ft_config.prepare_head_specs(
+            _splice_head_cfg(star_junction_files, ALL_SPLICE_IDS), organism="HOMO_SAPIENS")
+        targets = build_splice_targets(specs)
+        assert len(targets) == 1
+        assert targets[0].head_ids == dict(ALL_SPLICE_IDS)
+
+    def test_predicted_junction_head_emits_raw_events(self, star_junction_files, mock_fasta):
+        cfg = _splice_head_cfg(
+            star_junction_files,
+            {"splice_sites_classification": "cls_head", "splice_sites_junction": "junction_head"},
+            junction_position_source="predicted", junction_top_k=16,
+            classification_head_id="cls_head",
+        )
+        specs = ft_config.prepare_head_specs(cfg, organism="HOMO_SAPIENS")
+        module = FinetuneDataModule(
+            intervals={"train": [genome.Interval(chromosome="chr1", start=0, end=5000)]},
+            fasta_path=mock_fasta, head_specs=specs, batch_size=1, shuffle=False,
+            junction_event_pad_size=32,
+        )
+        batch = next(module.iter_batches("train"))
+        assert batch["junction_d_rel"].shape == (1, 32)
+        assert batch["junction_counts"].shape == (1, 32, 2)
+
+    def test_filter_to_junctions_drops_windows_without_junctions(self, star_junction_files, mock_fasta):
+        cfg = _splice_head_cfg(star_junction_files, {"splice_sites_classification": "cls_head"})
+        cfg["heads"][0]["filter_to_junctions"] = True
+        specs = ft_config.prepare_head_specs(cfg, organism="HOMO_SAPIENS")
+        module = FinetuneDataModule(
+            intervals={"train": [genome.Interval(chromosome="chr1", start=0, end=5000),
+                                 genome.Interval(chromosome="chr1", start=6000, end=8000)]},
+            fasta_path=mock_fasta, head_specs=specs, batch_size=1, shuffle=False,
+        )
+        assert [(w.start, w.end) for w in module._intervals["train"]] == [(0, 5000)]
+
+    def test_rejects_splice_source_on_non_splice_kind(self, star_junction_files):
+        import dataclasses
+
+        spec = ft_config.prepare_head_specs(
+            _splice_head_cfg(star_junction_files, {"splice_sites_classification": "cls_head"}),
+            organism="HOMO_SAPIENS")[0]
+        with pytest.raises(ValueError, match="has a splice_source but kind"):
+            build_splice_targets([dataclasses.replace(spec, kind="rna_seq")])
+
+    def test_rejects_two_junction_heads(self, star_junction_files):
+        cfg = _splice_head_cfg(star_junction_files, {"splice_sites_junction": "junc_a"})
+        cfg["heads"].append({**cfg["heads"][0], "id": "junc_b", "min_unique_reads": 2})
+        specs = ft_config.prepare_head_specs(cfg, organism="HOMO_SAPIENS")
+        with pytest.raises(ValueError, match="At most one splice_sites_junction head"):
+            build_splice_targets(specs)
 
 
 class TestSpliceHeadSpecs:
@@ -263,6 +322,7 @@ class TestPredictedJunctionPositionConfig:
                     "source": "predefined",
                     "kind": "splice_sites_classification",
                     "star_junctions": star_junction_files,
+                    "filter_to_junctions": False,
                 },
                 self._junction_entry(star_junction_files, classification_head_id="cls_head"),
             ]
@@ -314,12 +374,12 @@ class TestTopKSplicePositions:
 
 class TestRawJunctionEventsNoCap:
     def test_rows_grow_instead_of_truncating(self):
-        dm = SpliceDataModule.__new__(SpliceDataModule)
-        dm._junction_event_pad_size = 4
-        assert dm._junction_event_rows(0) == 4
-        assert dm._junction_event_rows(4) == 4
-        assert dm._junction_event_rows(5) == 8
-        assert dm._junction_event_rows(33) == 64
+        t = SpliceTargets.__new__(SpliceTargets)
+        t._junction_event_pad_size = 4
+        assert t.junction_event_rows(0) == 4
+        assert t.junction_event_rows(4) == 4
+        assert t.junction_event_rows(5) == 8
+        assert t.junction_event_rows(33) == 64
 
 
 def test_cli_defaults_aligned():
@@ -338,7 +398,8 @@ def test_cli_defaults_aligned():
     assert args.lr_schedule == "constant"
     assert args.mode == "linear-probe"
     assert args.sequence_length == 1048576
-    assert args.pretrained_head_samples == "splice_site:0"
+    assert args.pretrained_head_samples is None   # runner applies splice_site:0 if that head exists
+    assert args.targets_config is None
     assert args.rope_init == "truncated_normal"
     assert args.batch_size == 1
     assert args.lora_alpha == 16 and isinstance(args.lora_alpha, int)
@@ -431,11 +492,6 @@ class TestSpliceTrainingSmoke:
         from alphagenome_ft.finetune.train import register_predefined_heads, train as run_train
         from alphagenome.data import genome as genome_lib
 
-        head_kinds = {
-            "splice_sites": "cls_head",
-            "splice_site_usage": "usage_head",
-            "splice_junctions": "junction_head",
-        }
         cfg = {
             "heads": [
                 {
@@ -443,18 +499,21 @@ class TestSpliceTrainingSmoke:
                     "source": "predefined",
                     "kind": "splice_sites_classification",
                     "star_junctions": star_junction_files,
+                    "filter_to_junctions": False,
                 },
                 {
                     "id": "usage_head",
                     "source": "predefined",
                     "kind": "splice_sites_usage",
                     "star_junctions": star_junction_files,
+                    "filter_to_junctions": False,
                 },
                 {
                     "id": "junction_head",
                     "source": "predefined",
                     "kind": "splice_sites_junction",
                     "star_junctions": star_junction_files,
+                    "filter_to_junctions": False,
                     "max_splice_sites": 16,
                 },
             ]
@@ -473,15 +532,12 @@ class TestSpliceTrainingSmoke:
         windows = [
             genome_lib.Interval(chromosome="chr1", start=0, end=FULL_MODEL_SEQUENCE_LENGTH)
         ]
-        data_module = SpliceDataModule(
+        data_module = FinetuneDataModule(
             intervals={"train": windows, "valid": windows},
             fasta_path=mock_fasta_full,
-            star_junction_files=star_junction_files,
-            head_kinds=head_kinds,
+            head_specs=specs,
             batch_size=1,
             shuffle=False,
-            filter_to_junctions=False,
-            max_splice_sites=16,
         )
 
         run_train(
@@ -508,10 +564,6 @@ class TestSpliceTrainingSmoke:
         from alphagenome_ft.finetune.train import register_predefined_heads, train as run_train
         from alphagenome.data import genome as genome_lib
 
-        head_kinds = {
-            "splice_sites": "cls_head",
-            "splice_junctions": "junction_head",
-        }
         cfg = {
             "heads": [
                 {
@@ -519,12 +571,14 @@ class TestSpliceTrainingSmoke:
                     "source": "predefined",
                     "kind": "splice_sites_classification",
                     "star_junctions": star_junction_files,
+                    "filter_to_junctions": False,
                 },
                 {
                     "id": "junction_head",
                     "source": "predefined",
                     "kind": "splice_sites_junction",
                     "star_junctions": star_junction_files,
+                    "filter_to_junctions": False,
                     "max_splice_sites": 16,
                     "junction_position_source": "predicted",
                     "junction_top_k": 16,
@@ -546,16 +600,12 @@ class TestSpliceTrainingSmoke:
         windows = [
             genome_lib.Interval(chromosome="chr1", start=0, end=FULL_MODEL_SEQUENCE_LENGTH)
         ]
-        data_module = SpliceDataModule(
+        data_module = FinetuneDataModule(
             intervals={"train": windows, "valid": windows},
             fasta_path=mock_fasta_full,
-            star_junction_files=star_junction_files,
-            head_kinds=head_kinds,
+            head_specs=specs,
             batch_size=1,
             shuffle=False,
-            filter_to_junctions=False,
-            max_splice_sites=16,
-            emit_raw_junction_events=True,
             junction_event_pad_size=32,
         )
 

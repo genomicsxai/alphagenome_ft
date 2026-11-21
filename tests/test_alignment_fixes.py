@@ -11,7 +11,7 @@ from alphagenome_ft.custom_model import (
     _cast_head_params_to_float32,
     _head_compute_dtype_ctx,
 )
-from alphagenome_ft.finetune.combined_data import load_interval_list
+from alphagenome_ft.finetune.data import load_split_intervals
 
 
 def _forward(x):
@@ -47,10 +47,10 @@ def test_intervals_off_chromosome_are_skipped(tmp_path):
     bed = tmp_path / "a.bed"
     bed.write_text("chr1\t10\t20\nchr1\t500\t510\nchr1\t990\t1000\nchrX\t500\t510\n")
     sizes = {"chr1": 1000}
-    kept = load_interval_list(bed, window_size=100, chrom_sizes=sizes)
+    kept = load_split_intervals({"train": bed}, 100, chrom_sizes=sizes)["train"]
     assert [(i.chromosome, i.start, i.end) for i in kept] == [("chr1", 455, 555)]
-    # Without sizes: legacy clamp-to-0 behaviour.
-    legacy = load_interval_list(bed, window_size=100)
+    # Without sizes: build_interval behaviour (start clamped at 0, nothing skipped).
+    legacy = load_split_intervals({"train": bed}, 100)["train"]
     assert (legacy[0].start, legacy[0].end) == (0, 100)
     np.testing.assert_equal(len(legacy), 4)
 
@@ -84,7 +84,7 @@ def test_partitioned_classification_loss_matches_pytorch():
 
 
 def test_validation_order_is_wrap_padded_not_dropped():
-    from alphagenome_ft.finetune.splice_data import _pad_order_to_batch_multiple
+    from alphagenome_ft.finetune.data import _pad_order_to_batch_multiple
 
     np.testing.assert_array_equal(_pad_order_to_batch_multiple(np.arange(6), 4), [0, 1, 2, 3, 4, 5, 0, 1])
     np.testing.assert_array_equal(_pad_order_to_batch_multiple(np.arange(8), 4), np.arange(8))

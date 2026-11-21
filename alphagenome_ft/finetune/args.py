@@ -1,4 +1,9 @@
-"""CLI flags for the splice-modality probing/LoRA finetuning driver.
+"""CLI flags for the finetuning driver (``python -m alphagenome_ft.finetune``).
+
+Heads and their targets come from ``--targets-config`` (the YAML/JSON format
+read by ``finetune.config.load_targets_config``), or, as a shorthand, from
+``--bigwig``/``--star-junctions`` (+ ``--ssu``/``--gtf``), which build one
+``rna_seq`` head plus the three splice heads.
 
 Kept dependency-light at module scope (only ``argparse``/``pathlib``) so
 ``--help`` works without a full JAX install, mirroring
@@ -34,10 +39,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--genome", required=True, type=Path, help="Reference FASTA.")
     parser.add_argument("--train-bed", required=True, type=Path)
     parser.add_argument("--val-bed", required=True, type=Path)
-    parser.add_argument("--bigwig", required=True, nargs="+",
-                         help="Bigwig files driving a single rna_seq head's "
-                              "targets (one track per file). Matches "
-                              "alphagenome-pytorch's --modality rna_seq --bigwig.")
+    parser.add_argument("--targets-config", type=Path, default=None,
+                         help="YAML/JSON head config (see data/targets_splice_demo.yaml). "
+                              "Relative paths resolve against the config's directory. "
+                              "Alternative to the --bigwig/--star-junctions shorthand.")
+    parser.add_argument("--bigwig", nargs="+", default=None,
+                         help="Shorthand: BigWig files for one rna_seq head (one track "
+                              "per file). Matches alphagenome-pytorch's --modality "
+                              "rna_seq --bigwig.")
     parser.add_argument("--track-means-samples", type=int, default=None,
                          help="Number of --train-bed windows to sample when "
                               "computing each rna_seq bigwig track's "
@@ -48,13 +57,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                               "predictions/targets by this on every forward "
                               "pass when present; omit only to fall back to "
                               "no scaling (all-ones).")
-    parser.add_argument("--star-junctions", required=True, nargs="+",
-                         help="STAR SJ.out.tab files, one per sample.")
+    parser.add_argument("--star-junctions", nargs="+", default=None,
+                         help="Shorthand: STAR SJ.out.tab files, one per sample, for "
+                              "the splice_site/splice_usage/splice_junctions heads.")
     parser.add_argument("--ssu", nargs="+", default=None,
-                         help="Optional per-sample SSU parquet files, same "
+                         help="Shorthand: optional per-sample SSU parquet files, same "
                               "order as --star-junctions.")
     parser.add_argument("--gtf", default=None,
-                         help="Optional canonical splice-site GTF/parquet "
+                         help="Shorthand: optional canonical splice-site GTF/parquet "
                               "(annotation-only sites, zero usage).")
     parser.add_argument("--junction-position-source", choices=["annotated", "predicted"],
                          default="annotated",
@@ -219,7 +229,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                               "alphagenome-pytorch's --wandb.")
     parser.add_argument("--wandb-project", default="alphagenome-finetune")
     parser.add_argument("--wandb-entity", default=None)
-    parser.add_argument("--pretrained-head-samples", type=str, default="splice_site:0",
+    parser.add_argument("--pretrained-head-samples", type=str, default=None,
                          help="Per-head control over pretrained-vs-random weight init, "
                               "mirroring alphagenome-pytorch's --pretrained-head-samples. "
                               "Format: 'modality[@resolution]:idx,...' where modality is "
@@ -239,9 +249,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                               "tissues specifically (its main linear projects trunk "
                               "embeddings into a shared representation, not a per-tissue "
                               "one, so that part is always copied whole, organism-only). "
-                              "Default 'splice_site:0' (splice_site starts from the pretrained "
-                              "head), as alphagenome-pytorch when splice_site is trained; pass "
-                              "'splice_site:NA' to keep it random.")
+                              "Default: 'splice_site:0' when a splice_site head is configured "
+                              "(it starts from the pretrained head), otherwise none, as "
+                              "alphagenome-pytorch; pass 'splice_site:NA' to keep it random.")
     parser.add_argument("--modality-weights", type=str, default=None,
                          help="Optional per-head loss weights, mirroring "
                               "alphagenome-pytorch's --modality-weights. Format: "
@@ -267,16 +277,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                               "splice_usage/splice_junctions specifically, mirroring "
                               "alphagenome-pytorch's --metrics-per-sample. Off by default. "
                               "No effect if --no-val-pearson is also set.")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    shorthand = [f for f in ("bigwig", "star_junctions", "ssu", "gtf") if getattr(args, f) is not None]
+    if args.targets_config is not None and shorthand:
+        parser.error(
+            "--targets-config cannot be combined with the shorthand data flags "
+            f"({', '.join('--' + f.replace('_', '-') for f in shorthand)}); put those "
+            "heads in the config instead."
+        )
+    if args.targets_config is None and (args.bigwig is None or args.star_junctions is None):
+        parser.error("provide --targets-config, or both --bigwig and --star-junctions.")
+    return args
 
 
 def parse_modality_weights(raw: str | None) -> dict[str, float]:
     """Parse a ``--modality-weights`` string into ``{modality: weight}``.
 
-    Pure string parsing with no head-param coupling (unlike
-    ``workarounds.parse_pretrained_head_samples``), so it lives here rather than in
-    ``workarounds.py``. Modalities not present in the result should be treated by the
-    caller as weight ``1.0``.
+    Pure string parsing; the runner maps modality names to configured head ids
+    (``head_init.modality_head_ids``). Modalities not present in the result should
+    be treated by the caller as weight ``1.0``.
     """
     if not raw:
         return {}

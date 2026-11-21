@@ -326,6 +326,20 @@ opt_state = optimizer.init(model._params)
 **When to use:** Adapt the backbone (e.g. after heads-only or for a different distribution).
 **Tutorial:** [Full-model finetuning (unfreezing the backbone)](docs/finetune_full_model.md). Start heads-only with `train(..., heads_only=True)` or [`create_optimizer(..., heads_only=True)`](docs/heads_only_optimizer.md); then unfreeze via `unfreeze_parameters(unfreeze_prefixes=[...])` or `freeze_backbone(freeze_prefixes=[...])`; save with `save_checkpoint(..., save_full_model=True)`.
 
+### Command-line finetuning (RNA-seq and splicing heads)
+
+`python -m alphagenome_ft.finetune` trains the heads declared in a targets config, including the splice heads (`splice_sites_classification`, `splice_sites_usage`, `splice_sites_junction`, fed by STAR `SJ.out.tab` files and optional SSU parquets). Defaults match alphagenome-pytorch's `agt finetune`.
+
+```bash
+python -m alphagenome_ft.finetune \
+  --checkpoint-path /path/to/alphagenome/fold_0/1 --genome hg38.fa \
+  --train-bed train.bed --val-bed val.bed \
+  --targets-config data/targets_splice_demo.yaml \
+  --output-dir runs --run-name splice_probe
+```
+
+`--bigwig ... --star-junctions ... [--ssu ...]` is a shorthand for the same four heads without a config file. See `python -m alphagenome_ft.finetune --help` for all options.
+
 ---
 
 ### After training: Attribution analysis

@@ -1,10 +1,16 @@
-"""Paper-parity model-construction workarounds for the splice heads.
+"""Head initialization for a freshly built finetuning model.
 
-These operate on the model object returned by ``create_model_with_heads``
-and exist purely to match alphagenome-pytorch's finetuning behavior; they are
-not part of the core model/head implementation (that lives in
-``custom_model.py``, alongside ``set_usage_num_segments``, which the same
-callers also use).
+Operates on the model returned by ``create_model_with_heads``:
+
+* ``apply_pretrained_head_samples`` copies pretrained AlphaGenome head weights
+  (whole, or selected tracks/tissues) into new heads, as alphagenome-pytorch's
+  ``--pretrained-head-samples``.
+* ``reinit_junction_rope_embeddings`` re-draws the junction head's RoPE
+  scale/offset parameters, as alphagenome-pytorch's ``--rope-init``.
+
+Heads are addressed by user-facing modality name (``rna_seq``,
+``splice_site``, ``splice_usage``, ``splice_junctions``); see
+:func:`modality_head_ids` for mapping configured heads to those names.
 """
 
 from __future__ import annotations
@@ -135,15 +141,40 @@ _TRACK_KIND = "track"
 _ORGANISM_ONLY_KIND = "organism_only"
 _GENOME_TRACK_KIND = "genome_track"
 
-# (head_id, pretrained_kind, kind) for each user-facing modality name. Head
-# IDs are fixed by this repo's runner.py (not user-configurable), so this
-# mapping needs no plumbing from the caller.
-_MODALITY_INFO: dict[str, tuple[str, str, str]] = {
-    "rna_seq": ("rna_seq", "rna_seq", _GENOME_TRACK_KIND),
-    "splice_site": ("splice_site", "splice_sites_classification", _ORGANISM_ONLY_KIND),
-    "splice_usage": ("splice_usage", "splice_sites_usage", _TRACK_KIND),
-    "splice_junctions": ("splice_junctions", "splice_sites_junction", _JUNCTION_ROPE_KIND),
+# User-facing modality name -> predefined head kind (alphagenome-pytorch names).
+MODALITY_KINDS: dict[str, str] = {
+    "rna_seq": "rna_seq",
+    "splice_site": "splice_sites_classification",
+    "splice_usage": "splice_sites_usage",
+    "splice_junctions": "splice_sites_junction",
 }
+
+# Modality -> (pretrained head kind, how its weights are copied).
+_MODALITY_INFO: dict[str, tuple[str, str]] = {
+    "rna_seq": ("rna_seq", _GENOME_TRACK_KIND),
+    "splice_site": ("splice_sites_classification", _ORGANISM_ONLY_KIND),
+    "splice_usage": ("splice_sites_usage", _TRACK_KIND),
+    "splice_junctions": ("splice_sites_junction", _JUNCTION_ROPE_KIND),
+}
+
+
+def modality_head_ids(head_specs) -> dict[str, str]:
+    """Map each modality name to the configured head of that kind.
+
+    Modalities with no configured head are omitted. Two heads of the same
+    kind are ambiguous for modality-level options and raise.
+    """
+    out: dict[str, str] = {}
+    for modality, kind in MODALITY_KINDS.items():
+        matches = [spec.head_id for spec in head_specs if spec.kind == kind]
+        if len(matches) > 1:
+            raise ValueError(
+                f"Several {kind!r} heads ({matches}); modality-level options for "
+                f"{modality!r} cannot tell them apart."
+            )
+        if matches:
+            out[modality] = matches[0]
+    return out
 
 
 def parse_pretrained_head_samples(raw: str) -> dict[str, int | list[int | None] | None]:
@@ -306,13 +337,7 @@ def _copy_junction_rope(
 
 
 def _rna_seq_resolutions(model, head_id: str) -> list[int]:
-    """Resolutions the custom rna_seq head was actually built with.
-
-    Discovered dynamically from ``model._params`` rather than hardcoded,
-    since this repo's runner.py overrides rna_seq to ``resolutions: [1]``
-    (dropping the pretrained checkpoint's default ``[1, 128]``) — a run that
-    ever changes that override should not require a code change here too.
-    """
+    """Resolutions the rna_seq head was actually built with (read from params)."""
     prefix = f"head/{head_id}/resolution_"
     suffix = "/multi_organism_linear"
     resolutions = sorted(
@@ -325,11 +350,14 @@ def _rna_seq_resolutions(model, head_id: str) -> list[int]:
     return resolutions
 
 
-def apply_pretrained_head_samples(model, raw_spec: str, organism_index: int) -> None:
+def apply_pretrained_head_samples(
+    model, raw_spec: str, organism_index: int, head_ids: dict[str, str],
+) -> None:
     """Apply a ``--pretrained-head-samples`` spec to a freshly-built model.
 
-    See ``parse_pretrained_head_samples`` for the string format. Modalities
-    not mentioned in ``raw_spec`` stay fully randomly initialized.
+    See ``parse_pretrained_head_samples`` for the string format. ``head_ids``
+    maps modality names to configured head ids (``modality_head_ids``).
+    Modalities not mentioned in ``raw_spec`` stay fully randomly initialized.
     """
     spec = parse_pretrained_head_samples(raw_spec)
     for modality_key, indices in spec.items():
@@ -344,7 +372,13 @@ def apply_pretrained_head_samples(model, raw_spec: str, organism_index: int) -> 
                 f"Unrecognized --pretrained-head-samples modality '{modality}'; "
                 f"expected one of {sorted(_MODALITY_INFO)}."
             )
-        head_id, pretrained_kind, kind = _MODALITY_INFO[modality]
+        if modality not in head_ids:
+            raise ValueError(
+                f"--pretrained-head-samples names {modality!r}, but no head of kind "
+                f"{MODALITY_KINDS[modality]!r} is configured."
+            )
+        head_id = head_ids[modality]
+        pretrained_kind, kind = _MODALITY_INFO[modality]
 
         if requested_resolution is not None and kind != _GENOME_TRACK_KIND:
             raise ValueError(

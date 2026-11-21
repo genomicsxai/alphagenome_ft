@@ -21,9 +21,8 @@ from alphagenome_research.model import dna_model as research_dna_model
 
 from alphagenome_ft.custom_model import CustomAlphaGenomeModel
 from alphagenome_ft.finetune.config import HeadSpec
-from alphagenome_ft.finetune.data import BigWigDataModule, prepare_batch
+from alphagenome_ft.finetune.data import FinetuneDataModule, prepare_batch
 from alphagenome_ft.finetune.logging_utils import TrainingLogger
-from alphagenome_ft.finetune.splice_data import SpliceDataModule
 from alphagenome_ft.optimizer_utils import (
     build_lr_schedule,
     create_optimizer,
@@ -502,7 +501,7 @@ def _shard_batch(batch: Mapping[str, jax.Array], num_devices: int):
 
 def train(
     model: CustomAlphaGenomeModel,
-    data_module: BigWigDataModule | SpliceDataModule,
+    data_module: FinetuneDataModule,
     head_specs: Sequence[HeadSpec],
     *,
     learning_rate: float,
@@ -1224,13 +1223,8 @@ def train(
             if "valid" in data_module._intervals and len(data_module._intervals["valid"]) > 0:
                 losses = {head: [] for head in head_names}
                 val_metrics_acc = _ValidationMetrics(per_sample=metrics_per_sample, seed=seed)
-                # Explicit seed, not the default (None): CombinedDataModule
-                # passes this same seed to both its underlying modules, so an
-                # explicit shared value is what keeps their independent
-                # shuffles in lock-step (see the "train" call above). Passing
-                # none here would let each module draw its own OS-entropy
-                # seed via np.random.default_rng(None), desynchronizing them
-                # even though both received the same "None" argument.
+                # Validation is not shuffled; the seed is passed for symmetry
+                # with the train split.
                 for batch_np in _prefetch(data_module.iter_batches("valid", seed=seed)):
                     batch = prepare_batch(batch_np, organism_index_value, head_names)
                     batch = _shard_batch(batch, num_devices)

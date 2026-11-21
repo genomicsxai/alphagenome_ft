@@ -919,8 +919,9 @@ class CustomAlphaGenomeModel:
                         if missing:
                             raise ValueError(
                                 f"Batch for predicted-mode junction head '{head_name}' is "
-                                f"missing raw junction event fields {missing} — build the "
-                                "SpliceDataModule with emit_raw_junction_events=True."
+                                f"missing raw junction event fields {missing}; FinetuneDataModule "
+                                "emits them when the junction head's splice source sets "
+                                "junction_position_source='predicted'."
                             )
                         targets = build_junction_matrix(
                             positions,

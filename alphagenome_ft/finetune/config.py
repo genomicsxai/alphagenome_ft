@@ -107,7 +107,7 @@ class HeadSpec:
     tracks: Sequence[TrackInfo]  # Target tracks used as supervision for this head.
     config: Any | None = None  # Runtime predefined-head config object when applicable.
     metadata: Mapping[dna_client.Organism, AlphaGenomeOutputMetadata] | None = None  # Optional per-organism track metadata.
-    splice_source: SpliceSourceSpec | None = None  # Set only for splice kinds; drives SpliceDataModule.
+    splice_source: SpliceSourceSpec | None = None  # Set only for splice kinds; drives the splice targets.
 
 
 def _resolve_target_path(path_value: str, base_dir: Path | None) -> str:
@@ -148,6 +148,12 @@ def _normalize_targets_config_paths(
             raise ValueError(f'Each head entry must be a mapping: {head!r}')
 
         head_dict = dict(head)
+        # Splice data files resolve like BigWig target paths.
+        for key in ('star_junctions', 'ssu'):
+            if head_dict.get(key) is not None:
+                head_dict[key] = [_resolve_target_path(str(p), base_dir) for p in head_dict[key]]
+        if head_dict.get('gtf') is not None:
+            head_dict['gtf'] = _resolve_target_path(str(head_dict['gtf']), base_dir)
         targets = head_dict.get('targets')
         if targets is None:
             normalized_heads.append(head_dict)
@@ -449,7 +455,7 @@ def _build_splice_metadata(
 ) -> tuple[Mapping[dna_client.Organism, AlphaGenomeOutputMetadata], int]:
     """Build splice head metadata + implied ``num_tracks`` from a splice source.
 
-    Track counts follow the shapes produced by ``SpliceDataModule``:
+    Track counts follow the shapes produced by ``splice_data.SpliceTargets``:
       * classification: fixed 5 classes (Donor+/Acceptor+/Donor-/Acceptor-/None).
       * usage: 2 channels (pos/neg strand) per sample (SSU file if given, else
         STAR junction file).
