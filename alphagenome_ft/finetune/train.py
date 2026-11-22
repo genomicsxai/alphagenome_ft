@@ -804,8 +804,7 @@ def train(
     # instead: frozen leaves get zero gradient AND skip the real backward
     # computation for that leaf (mirrors PyTorch's requires_grad=False, which
     # has the same compute-skipping effect, not just a training-update
-    # mask). Confirmed necessary empirically: --mode lora still OOM'd after
-    # switching to per-layer remat alone.
+    # mask).
     _trainable_labels = None
     if heads_only:
         _trainable_labels = label_params_for_trainable_heads(

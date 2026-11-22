@@ -40,7 +40,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--train-bed", required=True, type=Path)
     parser.add_argument("--val-bed", required=True, type=Path)
     parser.add_argument("--targets-config", type=Path, default=None,
-                         help="YAML/JSON head config (see data/targets_splice_demo.yaml). "
+                         help="YAML/JSON head config (format of data/targets_rna_demo.yaml; "
+                              "splice heads take star_junctions/ssu/gtf instead of targets). "
                               "Relative paths resolve against the config's directory. "
                               "Alternative to the --bigwig/--star-junctions shorthand.")
     parser.add_argument("--bigwig", nargs="+", default=None,
@@ -145,17 +146,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                               "(set CUDA_VISIBLE_DEVICES to restrict), like launching "
                               "alphagenome-pytorch with one process per visible GPU.")
     parser.add_argument("--gradient-checkpointing", action="store_true",
-                         help="Mirrors alphagenome-pytorch's --gradient-checkpointing: "
-                              "wrap the backbone forward pass in hk.remat so its "
-                              "activations are recomputed on the backward pass instead "
-                              "of retained, trading compute for memory. For "
-                              "--mode linear-probe this still matters even though the "
-                              "backbone is detached (stop_gradient'd) — JAX/XLA does "
-                              "not elide saving the backbone's forward activations "
-                              "just because a downstream stop_gradient means they end "
-                              "up unused. For --mode lora it is even more directly "
-                              "needed: the backbone is NOT detached there (gradients "
-                              "must reach the LoRA adapters through it).")
+                         help="--mode lora only: recompute the LoRA trunk's transformer "
+                              "and decoder activations on the backward pass instead of "
+                              "storing them, trading compute for memory (alphagenome-"
+                              "pytorch's --gradient-checkpointing). No effect in "
+                              "--mode linear-probe, where the backbone is detached.")
     parser.add_argument("--mode", choices=["linear-probe", "lora"], default="linear-probe",
                          help="Default 'linear-probe', as alphagenome-pytorch. "
                               "'linear-probe': freeze + detach the backbone, "

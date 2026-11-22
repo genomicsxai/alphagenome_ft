@@ -2592,21 +2592,14 @@ def create_model_with_heads(
             before transformer. This enables heads to access raw CNN features.
         detach_backbone: If True, stop gradients at the backbone embeddings so
             heads-only training avoids backprop through the backbone.
-        gradient_checkpointing: If True, wrap the backbone forward pass
-            (encoder+transformer+decoder) in ``jax.checkpoint`` so its
-            activations are recomputed during the backward pass instead of
-            all being retained, trading compute for memory. JAX/Haiku analogue
-            of alphagenome-pytorch's ``--gradient-checkpointing``
-            (``torch.utils.checkpoint`` wrapping the encoder/tower/decoder).
-            Only matters when the backward pass actually reaches the backbone
-            (i.e. ``detach_backbone=False``, as needed for e.g. real backbone
-            LoRA) - with ``detach_backbone=True`` (heads-only probing) no
-            backward pass ever touches the backbone, so this is a no-op
-            exactly as it is for alphagenome-pytorch's own frozen-backbone
-            path (torch.no_grad() there means torch.utils.checkpoint has
-            nothing to recompute either). With ``backbone_lora_config`` this
-            sets ``BackboneLoRAConfig.gradient_checkpointing`` (per-block
-            ``hk.remat`` of encoder, transformer tower and decoder).
+        gradient_checkpointing: With ``backbone_lora_config``, sets
+            ``BackboneLoRAConfig.gradient_checkpointing``: the LoRA trunk
+            recomputes transformer-tower and decoder activations block by
+            block (and the encoder's, where alphagenome_research's encoder
+            accepts ``remat``), trading compute for memory, as
+            alphagenome-pytorch's ``--gradient-checkpointing``. Without
+            backbone LoRA it has no effect: no backward pass reaches the
+            backbone, as on alphagenome-pytorch's frozen-backbone path.
         backbone_lora_config: Optional ``BackboneLoRAConfig``. When set, replace
             transformer ``q_layer``/``v_layer`` projections with same-path LoRA
             projections while retaining their pretrained base weights.
@@ -2698,26 +2691,12 @@ def create_model_with_heads(
                 f"Available heads: {custom_heads_module.list_registered_heads()}"
             )
 
-    if gradient_checkpointing and backbone_lora_config is not None:
-        # The LoRA trunk does its own per-block remat for the transformer tower and
-        # decoder, and asks the native encoder to remat via a ``remat`` keyword that
-        # alphagenome_research <= 0.3.0 does not have (the call then silently falls back
-        # to an un-checkpointed encoder: a 36 GB OOM at 1 Mbp on an 80 GB GPU). In that
-        # case install our per-block remat for the encoder; it is a no-op for the LoRA
-        # tower/decoder, which are not the patched classes.
-        import inspect as _inspect
-        if "remat" not in _inspect.signature(model_lib.SequenceEncoder.__call__).parameters:
-            from alphagenome_ft.finegrained_remat import install_fine_grained_remat
-            install_fine_grained_remat()
     if gradient_checkpointing and backbone_lora_config is None:
-        # Unlike install_backbone_patches (LoRA), always safe to install
-        # eagerly, including before dna_model.create()'s own internal
-        # checkpoint restore below: hk.remat only wraps how a computation
-        # graph is executed, it never adds/renames/reshapes a parameter, so
-        # it can't make the restore target's structure mismatch the saved
-        # checkpoint the way adding new LoRA parameters does.
-        from alphagenome_ft.finegrained_remat import install_fine_grained_remat
-        install_fine_grained_remat()
+        # Without backbone LoRA nothing backpropagates through the backbone
+        # (detached, or a custom loop's frozen weights), so there is nothing
+        # to recompute: a 1 Mbp linear-probe step compiles to the same peak
+        # memory with and without remat.
+        print("gradient_checkpointing has no effect without backbone LoRA; ignoring.")
 
     # Load pretrained model
     print("Loading pretrained AlphaGenome model...")
@@ -2802,10 +2781,6 @@ def create_model_with_heads(
                         num_organisms = len(metadata)
 
                         # Step 1: Run encoder ONLY
-                        # Step 1: Run encoder ONLY (per-block hk.remat, installed
-                        # when gradient_checkpointing is on, already wraps
-                        # SequenceEncoder.__call__ at finer granularity; see
-                        # finegrained_remat.py).
                         trunk, intermediates = call_with_is_training(
                             model_lib.SequenceEncoder(), dna_sequence, is_training=False
                         )
@@ -2859,17 +2834,9 @@ def create_model_with_heads(
 
                 # Call forward_trunk directly (not __call__) - we only need
                 # embeddings, never the standard pretrained heads' predictions,
-                # so this also skips computing (and, when gradient_checkpointing
-                # is on, needlessly recomputing) those on every step.
+                # so this also skips computing those on every step.
                 # forward_trunk is @hk.name_like('__call__'), so parameter paths
                 # still match a checkpoint saved via the real __call__.
-                # Per-block hk.remat (installed below, once, when
-                # gradient_checkpointing is on) already wraps the encoder/
-                # transformer-tower/decoder internally at finer granularity than
-                # an outer hk.remat around the whole forward_trunk call would --
-                # see finegrained_remat.py for why that granularity matters (an
-                # outer whole-trunk remat alone still OOM'd at ~53GB once the
-                # backbone isn't detached, e.g. --mode lora).
                 if hasattr(alphagenome, "forward_trunk"):
                     embeddings = alphagenome.forward_trunk(dna_sequence, organism_index)
                 else:
