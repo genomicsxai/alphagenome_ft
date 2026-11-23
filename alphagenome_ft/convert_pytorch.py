@@ -152,6 +152,13 @@ def _organism_slot(array: np.ndarray, slot: int, name: str) -> np.ndarray:
     return array[slot : slot + 1]
 
 
+def _row_organism_index(value: Any) -> int:
+    """A track_metadata row's organism, recorded as an index or as "human"/"mouse"."""
+    if isinstance(value, str) and not value.strip().isdigit():
+        return _ORGANISM_INDEX[_resolve_organism(value, {})]
+    return int(value)
+
+
 def _track_rows(
     head_id: str,
     num_rows: int,
@@ -164,7 +171,7 @@ def _track_rows(
     rows = [
         row for row in metadata.get("track_metadata") or []
         if str(row.get("output_name") or row.get("output_type") or "").lower() == head_id
-        and int(row.get("organism", organism_index)) == organism_index
+        and _row_organism_index(row.get("organism", organism_index)) == organism_index
     ]
     if rows:
         rows = sorted(rows, key=lambda row: int(row.get("track_index", 0)))

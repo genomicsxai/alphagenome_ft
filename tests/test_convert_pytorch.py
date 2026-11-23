@@ -408,3 +408,9 @@ def test_converted_checkpoint_loads_and_saves_head_metadata(tmp_path, device):
     assert resaved == original
     params, _ = _restore(tmp_path / "resaved")
     assert params.keys() == expected.keys()
+
+
+def test_track_metadata_organism_may_be_index_or_name():
+    from alphagenome_ft.convert_pytorch import _row_organism_index
+
+    assert [_row_organism_index(v) for v in (0, "1", "human", "Mouse")] == [0, 1, 0, 1]
