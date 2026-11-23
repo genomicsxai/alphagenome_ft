@@ -188,7 +188,7 @@ def test_splice_site_classification_auprc():
 def test_epoch_log_rows_match_pytorch_layout(tmp_path):
     import csv
 
-    from alphagenome_ft.finetune.logging_utils import TrainingLogger
+    from alphagenome_ft.logging_utils import TrainingLogger
 
     logger = TrainingLogger(tmp_path)
     logger.log_epoch(1, {"train_loss": 1.0, "splice_junctions_pearson_r": 0.5},

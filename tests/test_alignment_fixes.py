@@ -130,7 +130,7 @@ def test_epoch_log_has_pytorch_leading_columns(tmp_path):
     import csv
     import inspect
 
-    from alphagenome_ft.finetune import logging_utils
+    from alphagenome_ft import logging_utils
 
     sig = inspect.signature(logging_utils.TrainingLogger.__init__)
     kwargs = {}
@@ -179,7 +179,7 @@ def test_custom_head_shadows_pretrained_same_name():
 def test_epoch_log_widens_header_without_shifting(tmp_path):
     import csv
 
-    from alphagenome_ft.finetune import logging_utils
+    from alphagenome_ft import logging_utils
 
     logging_utils.TrainingLogger(tmp_path).log_epoch(1, {"train_loss": 1.0, "a": 1.0})
     resumed = logging_utils.TrainingLogger(tmp_path)          # new process after a resume

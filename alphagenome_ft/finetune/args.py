@@ -288,7 +288,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def parse_modality_weights(raw: str | None) -> dict[str, float]:
     """Parse a ``--modality-weights`` string into ``{modality: weight}``.
 
-    Pure string parsing; the runner maps modality names to configured head ids
+    Pure string parsing; ``__main__`` maps modality names to configured head ids
     (``head_init.modality_head_ids``). Modalities not present in the result should
     be treated by the caller as weight ``1.0``.
     """

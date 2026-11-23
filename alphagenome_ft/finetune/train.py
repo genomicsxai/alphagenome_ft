@@ -22,7 +22,7 @@ from alphagenome_research.model import dna_model as research_dna_model
 from alphagenome_ft.custom_model import CustomAlphaGenomeModel
 from alphagenome_ft.finetune.config import HeadSpec
 from alphagenome_ft.finetune.data import FinetuneDataModule, prepare_batch
-from alphagenome_ft.finetune.logging_utils import TrainingLogger
+from alphagenome_ft.logging_utils import TrainingLogger
 from alphagenome_ft.optimizer_utils import (
     build_lr_schedule,
     create_optimizer,

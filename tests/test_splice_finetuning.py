@@ -398,7 +398,7 @@ def test_cli_defaults_aligned():
     assert args.lr_schedule == "constant"
     assert args.mode == "linear-probe"
     assert args.sequence_length == 1048576
-    assert args.pretrained_head_samples is None   # runner applies splice_site:0 if that head exists
+    assert args.pretrained_head_samples is None   # __main__ applies splice_site:0 if that head exists
     assert args.targets_config is None
     assert args.rope_init == "truncated_normal"
     assert args.batch_size == 1

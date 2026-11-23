@@ -89,7 +89,7 @@ def test_modality_head_ids(bigwig, sj_file):
 
 
 def test_shorthand_config_matches_previous_preset(tmp_path):
-    from alphagenome_ft.finetune.runner import shorthand_targets_config
+    from alphagenome_ft.finetune.__main__ import shorthand_targets_config
 
     args = SimpleNamespace(
         star_junctions=["a.tab"], ssu=None, gtf=None, bigwig=["f.bw", "r.bw"],
