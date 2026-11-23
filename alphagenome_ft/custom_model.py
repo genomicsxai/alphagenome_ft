@@ -39,7 +39,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import haiku as hk
 import jax
@@ -96,6 +96,27 @@ from alphagenome_ft import custom_heads as custom_heads_module
 from alphagenome_ft.compat import call_with_is_training
 
 
+def _dummy_splice_site_positions(head_names: Sequence[str]):
+    """Dummy ``splice_site_positions`` for param init, if any head needs it.
+
+    ``SpliceSitesJunctionHead.predict`` requires a real ``(B, 4, P)`` int
+    array to trace during Haiku ``init`` (it indexes into it), unlike other
+    heads which only receive it as an unused ``**kwargs`` entry. Returns
+    ``None`` when no registered head is a junction head.
+    """
+    from alphagenome_research.model import heads as research_heads_module
+
+    needs_positions = False
+    for head_name in head_names:
+        config = custom_heads_module.get_registered_head_config(head_name)
+        if getattr(config, 'type', None) == research_heads_module.HeadType.SPLICE_SITES_JUNCTION:
+            needs_positions = True
+            break
+    if not needs_positions:
+        return None
+    return jnp.full((1, 4, 1), -1, dtype=jnp.int32)
+
+
 def _resolve_user_metadata(
     *,
     head_name: str,
@@ -133,6 +154,147 @@ def _resolve_user_metadata(
             f"expected {num_tracks}."
         )
     return {organism: metadata for organism in dna_client.Organism}
+
+
+def _cast_head_params(params: dict, dtype) -> dict:
+    """Cast every head-owned floating leaf (module path containing "head/")
+    to ``dtype``, leaving backbone ("alphagenome/..." trunk) leaves untouched."""
+    import jax.numpy as jnp
+    return {
+        module_path: (
+            {name: (arr.astype(dtype) if jnp.issubdtype(arr.dtype, jnp.floating) else arr)
+             for name, arr in leaf.items()}
+            if "head/" in module_path else leaf
+        )
+        for module_path, leaf in params.items()
+    }
+
+
+def _cast_head_params_to_float32(params: dict) -> dict:
+    """Upcast head params to float32 master copies.
+
+    Checkpoints saved before head params were kept in float32 store them as
+    bfloat16; upcasting on load restores fp32 master weights so optimizer
+    updates are not rounded away. Compute dtype is applied separately at
+    parameter-read time by ``_bfloat16_head_getter``.
+    """
+    import jax.numpy as jnp
+    return _cast_head_params(params, jnp.float32)
+
+
+def _bfloat16_head_getter(next_getter, value, context):
+    """Haiku custom getter: read head params as bfloat16 for compute.
+
+    Head params are stored as float32 master weights (like the trunk under
+    its jmp ``params=float32,compute=bfloat16`` policy, and like
+    alphagenome-pytorch under autocast); this casts each floating param to
+    bfloat16 when a head reads it, so head compute is bfloat16 while
+    gradients flow back to (and optimizer updates apply to) the fp32 copy.
+
+    Why not hk.mixed_precision.set_policy(type(head), ...): predefined heads'
+    __call__ does hk.to_module(self.predict)(self._name)(...), which creates
+    a new anonymous module class per call, so a per-class policy never fires.
+    A custom getter applies to every hk.get_parameter in its scope
+    regardless of module class.
+    """
+    del context
+    import jax.numpy as jnp
+    if jnp.issubdtype(value.dtype, jnp.floating):
+        value = value.astype(jnp.bfloat16)
+    return next_getter(value)
+
+
+def _head_compute_dtype_ctx(dtype: str):
+    import contextlib
+    if dtype == "bfloat16":
+        return hk.custom_getter(_bfloat16_head_getter)
+    return contextlib.nullcontext()
+
+
+def _make_head(head_name: str, num_organisms: int) -> custom_heads_module.HeadLike:
+    """Construct a registered head instance (custom or predefined) by name."""
+    head_config = custom_heads_module.get_registered_head_config(head_name)
+    if custom_heads_module.is_custom_config(head_config):
+        return custom_heads_module.create_registered_head(
+            head_name, metadata=None, num_organisms=num_organisms,
+        )
+    head_metadata = _resolve_user_metadata(
+        head_name=head_name, head_config=head_config,
+    ) or {}
+    return custom_heads_module.create_predefined_head_from_config(
+        head_config, metadata=head_metadata,
+    )
+
+
+def _build_head_predictions(
+    head_names: Sequence[str],
+    embeddings: Any,
+    organism_index: Any,
+    splice_site_positions: Any,
+    num_organisms: int,
+) -> dict[str, Any]:
+    """Construct + call each head, running predicted-mode junction heads last.
+
+    A junction head registered with ``junction_position_source="predicted"``
+    (see ``custom_heads_module.register_junction_position_source``) needs its
+    classification head's logits to derive positions
+    (``splice_positions.top_k_splice_positions``), so it must run *after*
+    that classification head. Every other head runs in the caller's order,
+    using the batch-supplied ``splice_site_positions`` (annotated mode, or
+    unused via **kwargs for non-splice heads).
+
+    Head-level compute dtype is controlled upstream by the caller wrapping
+    this in ``_head_compute_dtype_ctx`` (a Haiku custom getter that reads
+    fp32 head params as bfloat16); see ``_bfloat16_head_getter``.
+    """
+    from alphagenome_ft.finetune.splice_positions import top_k_splice_positions
+    from alphagenome_research.model import heads as research_heads_module
+    import jax.numpy as jnp
+
+    def _fix_usage_predict_dtype(head, output):
+        # The real SpliceSitesUsageHead.predict() (alphagenome_research/model/
+        # heads.py) downcasts its returned 'predictions' (post-sigmoid probs)
+        # to float16 -- PyTorch's equivalent head stays fp32 throughout, so
+        # this silently corrupts every JAX splice-usage eval metric computed
+        # from these values. logits/other keys are untouched (fp32 already
+        # and not affected by this downcast).
+        if isinstance(head, research_heads_module.SpliceSitesUsageHead) and 'predictions' in output:
+            output = dict(output)
+            output['predictions'] = output['predictions'].astype(jnp.float32)
+        return output
+
+    predicted_junction_heads = [
+        name for name in head_names
+        if custom_heads_module.get_junction_position_source(name) is not None
+    ]
+    regular_heads = [name for name in head_names if name not in predicted_junction_heads]
+
+    predictions: dict[str, Any] = {}
+    for head_name in regular_heads:
+        head = _make_head(head_name, num_organisms)
+        predictions[head_name] = _fix_usage_predict_dtype(head, head(
+            embeddings, organism_index, splice_site_positions=splice_site_positions,
+        ))
+
+    for head_name in predicted_junction_heads:
+        info = custom_heads_module.get_junction_position_source(head_name)
+        cls_head_name = info['classification_head_id']
+        if cls_head_name not in predictions:
+            raise ValueError(
+                f"Junction head '{head_name}' needs classification head "
+                f"'{cls_head_name}' predictions to derive positions, but it "
+                f"wasn't found among this model's heads: {list(predictions)}."
+            )
+        predicted_positions = top_k_splice_positions(
+            predictions[cls_head_name]['logits'], info['top_k'],
+            threshold=info.get('splice_site_threshold', 0.1),
+        )
+        head = _make_head(head_name, num_organisms)
+        predictions[head_name] = _fix_usage_predict_dtype(head, head(
+            embeddings, organism_index, splice_site_positions=predicted_positions,
+        ))
+
+    return predictions
 
 
 class _PredictionsDict:
@@ -182,6 +344,87 @@ class _PredictionsDict:
 class _HeadConfigEntry:
     source: str  # Literally 'custom' or 'predefined'
     config: Any
+
+
+def _partitioned_binary_crossentropy_usage_loss(
+    logits: jnp.ndarray,
+    targets: jnp.ndarray,
+    num_segments: int,
+) -> jnp.ndarray:
+    """JAX port of alphagenome-pytorch's `_partitioned_loss`, specialized to
+    the splice_site_usage BCE loss.
+
+    See alphagenome-pytorch/src/alphagenome_pytorch/extensions/finetuning/
+    training.py: `_partitioned_loss` (chunking/reduction) and
+    `_compute_splice_loss`'s `SpliceSitesUsageHead` `elif num_segments > 1`
+    branch (per-chunk loss_fn/mask_fn). Mirrored exactly, including the
+    PyTorch reference's own quirk of NOT applying the head's organism/track
+    padding mask in this branch (`mask=torch.ones_like(p, dtype=torch.bool)`)
+    -- only the sequence is partitioned, tracks are never masked here.
+
+    Splits `logits`/`targets` (both `(B, S, C)`) into `num_segments` equal
+    contiguous chunks along the sequence axis (axis=1; the last chunk absorbs
+    any remainder when `S` doesn't divide evenly), computes the elementwise
+    sigmoid BCE (alphagenome_research.model.losses.binary_crossentropy_from_
+    logits's exact formula) with a plain (unmasked) mean within each chunk,
+    then SUMS the per-chunk means -- not a single global mean -- which
+    upweights sparse splice-site regions relative to a flat reduction.
+    """
+    from alphagenome_research.model import losses as research_losses
+
+    seq_len = logits.shape[1]
+    chunk_size = seq_len // num_segments
+    chunk_losses = []
+    for i in range(num_segments):
+        start = i * chunk_size
+        end = start + chunk_size if i < num_segments - 1 else seq_len
+        logits_chunk = logits[:, start:end, :]
+        targets_chunk = targets[:, start:end, :]
+        chunk_losses.append(
+            research_losses.binary_crossentropy_from_logits(
+                y_pred=logits_chunk,
+                y_true=targets_chunk,
+                mask=jnp.ones_like(logits_chunk, dtype=bool),
+            )
+        )
+    return jnp.sum(jnp.stack(chunk_losses))
+
+
+def _partitioned_classification_loss(
+    logits: jnp.ndarray,
+    splice_sites: jnp.ndarray,
+    num_segments: int,
+) -> jnp.ndarray:
+    """Sequence-partitioned splice_site classification loss.
+
+    JAX port of alphagenome-pytorch's ``_partitioned_loss`` applied to
+    ``_ce_loss_with_smoothing`` (``_compute_splice_loss``'s
+    SpliceSitesClassificationHead ``num_segments > 1`` branch): the sequence
+    is split into ``num_segments`` contiguous chunks (last chunk absorbs the
+    remainder), each chunk gets alphagenome_research's own classification
+    loss (label smoothing 1e-7, mask = any(target), masked mean), and the
+    per-chunk losses are SUMMED. Chunks with no labelled position contribute
+    0, as PyTorch skips them.
+    """
+    from alphagenome_research.model import losses as research_losses
+
+    num_classes = logits.shape[-1]
+    seq_len = logits.shape[1]
+    chunk_size = seq_len // num_segments
+    chunk_losses = []
+    for i in range(num_segments):
+        start = i * chunk_size
+        end = start + chunk_size if i < num_segments - 1 else seq_len
+        targets_chunk = splice_sites[:, start:end, :]
+        chunk_losses.append(
+            research_losses.cross_entropy_loss_from_logits(
+                y_pred_logits=logits[:, start:end, :],
+                y_true=(1.0 - 1e-7) * targets_chunk.astype(jnp.float32) + 1e-7 / num_classes,
+                mask=jnp.any(targets_chunk, axis=-1, keepdims=True),
+                axis=-1,
+            )
+        )
+    return jnp.sum(jnp.stack(chunk_losses))
 
 
 class CustomAlphaGenomeModel:
@@ -243,6 +486,11 @@ class CustomAlphaGenomeModel:
         self._output_metadata_by_organism = base_model._output_metadata_by_organism
         self._variant_scorers = base_model._variant_scorers
         self._head_configs = {}
+        # Per-head sequence-partition count for the splice_site_usage loss --
+        # see set_usage_num_segments() and create_loss_fn_for_head() below.
+        # Defaults to 1 (no partitioning, i.e. the predefined head's own
+        # single global masked mean) for any head never configured here.
+        self._usage_num_segments: dict[str, int] = {}
         if head_configs:
             for name, entry in head_configs.items():
                 if isinstance(entry, _HeadConfigEntry):
@@ -276,15 +524,19 @@ class CustomAlphaGenomeModel:
                 sequences,
                 organism_indices,
                 *,
-                requested_outputs,
+                requested_outputs=None,
                 negative_strand_mask,
                 strand_reindexing,
                 rng=None,
+                splice_site_positions=None,
             ):
                 # Haiku apply(params, state, rng, ...). Pass a PRNGKey for training (enables head
                 # dropout when configured). Pass None for val/test so heads that wrap dropout in
                 # try/except skip it without raising.
-                result = custom_forward_fn(params, state, rng, sequences, organism_indices)
+                result = custom_forward_fn(
+                    params, state, rng, sequences, organism_indices,
+                    splice_site_positions=splice_site_positions,
+                )
 
                 # Custom forward function may return (predictions_dict, embeddings) tuple or just predictions
                 if isinstance(result, tuple):
@@ -539,6 +791,38 @@ class CustomAlphaGenomeModel:
         entry = self._head_configs[head_name]
         return entry.config
 
+    def set_usage_num_segments(self, head_name: str, num_segments: int) -> None:
+        """Configure sequence-partitioned loss for a splice_site_usage head.
+
+        Ports alphagenome-pytorch's `_partitioned_loss` (see
+        extensions/finetuning/training.py, `_compute_splice_loss`'s
+        SpliceSitesUsageHead branch) for training parity: instead of the
+        predefined head's single global masked-mean BCE
+        (alphagenome_research.model.heads.SpliceSitesUsageHead.loss), the
+        sequence is split into `num_segments` equal contiguous chunks, BCE is
+        computed independently (masked mean) within each chunk, and the
+        per-chunk losses are SUMMED (not averaged) -- upweighting sparse
+        splice-site regions relative to a flat global mean, exactly matching
+        the PyTorch reference's reduction.
+
+        Defaults to 1 (no partitioning -- alphagenome_research's own loss),
+        which is also alphagenome-pytorch's `--splice-num-segments` default.
+        With PyTorch's default `--min-alpha-juncs 0`, a PyTorch run using
+        `--splice-num-segments N` matches this partitioned path with
+        `num_segments=N`. (This port has no alpha-confidence mask, so it never
+        matches a PyTorch run with `--min-alpha-juncs > 0`.)
+        """
+        self._usage_num_segments[head_name] = num_segments
+
+    def set_splice_num_segments(self, head_name: str, num_segments: int) -> None:
+        """Sequence-partition a splice_site classification or usage head's loss.
+
+        Mirrors alphagenome-pytorch's ``--splice-num-segments``, which applies
+        the same partitioning to both heads (see ``set_usage_num_segments``
+        and ``_partitioned_classification_loss``).
+        """
+        self._usage_num_segments[head_name] = num_segments
+
     def create_loss_fn_for_head(self, head_name: str):
         """Create a loss function for a head.
 
@@ -559,8 +843,20 @@ class CustomAlphaGenomeModel:
             """Compute loss within transform."""
             predictions, batch = predictions_and_batch
             entry = self._head_configs[head_name]
+            # Native alphagenome_research heads (e.g. SpliceSitesJunctionHead)
+            # deliberately return an *unweighted* internal loss — their
+            # HeadConfig.loss_weight (e.g. 0.2 for splice junctions, see
+            # alphagenome_research.model.heads.get_head_config) is meant to
+            # be applied by the training loop when summing across heads.
+            # Without this, splice_junctions trains 5x over-weighted relative
+            # to every other head (1.0 * 0.2 -> 0.2, 0.2 * 0.2 -> 0.04 for
+            # its CE/Poisson terms — exactly matching alphagenome-pytorch's
+            # hardcoded 0.2/0.04 in _compute_junction_strand_loss, which
+            # pre-multiplies this same constant into its own loss function).
+            head_loss_weight = 1.0
             if entry.source == 'predefined':
                 head_config = entry.config
+                head_loss_weight = getattr(head_config, 'loss_weight', 1.0)
                 head_metadata = _resolve_user_metadata(
                     head_name=head_name,
                     head_config=head_config,
@@ -573,8 +869,9 @@ class CustomAlphaGenomeModel:
                     raise TypeError(
                         f"Expected batch mapping for head '{head_name}', got {type(batch)!r}."
                     )
-                # Build a minimal DataBatch for GenomeTracksHead loss.
+                # Build a minimal DataBatch for the head's loss().
                 from alphagenome_research.model import schemas
+                from alphagenome_research.model import heads as research_heads_module
                 from alphagenome_research.io import bundles as bundles_lib
                 import jax.numpy as jnp
 
@@ -585,44 +882,133 @@ class CustomAlphaGenomeModel:
                     )
                 targets = batch['targets']
                 organism_index = batch['organism_index']
-                if not hasattr(head_config, 'bundle') or head_config.bundle is None:
-                    raise ValueError(
-                        f"Predefined head '{head_name}' is missing bundle info."
-                    )
-                bundle = head_config.bundle
-                mask = jnp.ones(
-                    (targets.shape[0], 1, targets.shape[-1]), dtype=bool
-                )
+                splice_site_positions = batch.get('splice_site_positions')
+                raw_junction_events = batch  # keep the original mapping for predicted mode
+                head_type = getattr(head_config, 'type', None)
 
-                data_kwargs: dict[str, Any] = {
-                    'organism_index': organism_index,
-                }
-                if bundle == bundles_lib.BundleName.ATAC:
-                    data_kwargs.update(atac=targets, atac_mask=mask)
-                elif bundle == bundles_lib.BundleName.RNA_SEQ:
-                    data_kwargs.update(rna_seq=targets, rna_seq_mask=mask)
-                elif bundle == bundles_lib.BundleName.DNASE:
-                    data_kwargs.update(dnase=targets, dnase_mask=mask)
-                elif bundle == bundles_lib.BundleName.PROCAP:
-                    data_kwargs.update(procap=targets, procap_mask=mask)
-                elif bundle == bundles_lib.BundleName.CAGE:
-                    data_kwargs.update(cage=targets, cage_mask=mask)
-                elif bundle == bundles_lib.BundleName.CHIP_TF:
-                    data_kwargs.update(chip_tf=targets, chip_tf_mask=mask)
-                elif bundle == bundles_lib.BundleName.CHIP_HISTONE:
-                    data_kwargs.update(chip_histone=targets, chip_histone_mask=mask)
-                else:
-                    raise ValueError(
-                        f"Unsupported bundle {bundle!r} for head '{head_name}'."
+                if head_type == research_heads_module.HeadType.SPLICE_SITES_CLASSIFICATION:
+                    batch = schemas.DataBatch(
+                        organism_index=organism_index, splice_sites=targets
                     )
-                batch = schemas.DataBatch(**data_kwargs)
+                elif head_type == research_heads_module.HeadType.SPLICE_SITES_USAGE:
+                    batch = schemas.DataBatch(
+                        organism_index=organism_index, splice_site_usage=targets
+                    )
+                elif head_type == research_heads_module.HeadType.SPLICE_SITES_JUNCTION:
+                    junction_position_info = custom_heads_module.get_junction_position_source(
+                        head_name
+                    )
+                    if junction_position_info is not None:
+                        # Predicted mode: positions came from the classification head's
+                        # top-k logits at forward time (see _build_head_predictions), so
+                        # the target matrix must be rebuilt against those positions —
+                        # the precomputed annotated-position `targets` doesn't apply.
+                        from alphagenome_ft.finetune.splice_positions import build_junction_matrix
+
+                        positions = predictions.get('splice_site_positions')
+                        if positions is None:
+                            raise ValueError(
+                                f"Predicted-mode junction head '{head_name}' predictions "
+                                "are missing 'splice_site_positions'."
+                            )
+                        required = (
+                            'junction_d_rel', 'junction_a_rel',
+                            'junction_is_pos_strand', 'junction_counts',
+                        )
+                        missing = [k for k in required if k not in raw_junction_events]
+                        if missing:
+                            raise ValueError(
+                                f"Batch for predicted-mode junction head '{head_name}' is "
+                                f"missing raw junction event fields {missing}; FinetuneDataModule "
+                                "emits them when the junction head's splice source sets "
+                                "junction_position_source='predicted'."
+                            )
+                        targets = build_junction_matrix(
+                            positions,
+                            raw_junction_events['junction_d_rel'],
+                            raw_junction_events['junction_a_rel'],
+                            raw_junction_events['junction_is_pos_strand'],
+                            raw_junction_events['junction_counts'],
+                            max_splice_sites=positions.shape[-1],
+                        )
+                    else:
+                        positions = splice_site_positions
+                        if positions is None:
+                            raise ValueError(
+                                f"Batch for junction head '{head_name}' must include "
+                                "'splice_site_positions'."
+                            )
+                    batch = schemas.DataBatch(
+                        organism_index=organism_index,
+                        splice_junctions=targets,
+                        splice_site_positions=positions,
+                    )
+                else:
+                    if not hasattr(head_config, 'bundle') or head_config.bundle is None:
+                        raise ValueError(
+                            f"Predefined head '{head_name}' is missing bundle info."
+                        )
+                    bundle = head_config.bundle
+                    mask = jnp.ones(
+                        (targets.shape[0], 1, targets.shape[-1]), dtype=bool
+                    )
+
+                    data_kwargs: dict[str, Any] = {
+                        'organism_index': organism_index,
+                    }
+                    if bundle == bundles_lib.BundleName.ATAC:
+                        data_kwargs.update(atac=targets, atac_mask=mask)
+                    elif bundle == bundles_lib.BundleName.RNA_SEQ:
+                        data_kwargs.update(rna_seq=targets, rna_seq_mask=mask)
+                    elif bundle == bundles_lib.BundleName.DNASE:
+                        data_kwargs.update(dnase=targets, dnase_mask=mask)
+                    elif bundle == bundles_lib.BundleName.PROCAP:
+                        data_kwargs.update(procap=targets, procap_mask=mask)
+                    elif bundle == bundles_lib.BundleName.CAGE:
+                        data_kwargs.update(cage=targets, cage_mask=mask)
+                    elif bundle == bundles_lib.BundleName.CHIP_TF:
+                        data_kwargs.update(chip_tf=targets, chip_tf_mask=mask)
+                    elif bundle == bundles_lib.BundleName.CHIP_HISTONE:
+                        data_kwargs.update(chip_histone=targets, chip_histone_mask=mask)
+                    else:
+                        raise ValueError(
+                            f"Unsupported bundle {bundle!r} for head '{head_name}'."
+                        )
+                    batch = schemas.DataBatch(**data_kwargs)
             else:
                 head = custom_heads_module.create_custom_head(
                     head_name,
                     metadata=None,  # Use head's config metadata, not organism metadata
                     num_organisms=len(self._metadata)
                 )
-            return head.loss(predictions, batch)
+            num_segments = self._usage_num_segments.get(head_name, 1)
+            if (
+                entry.source == 'predefined'
+                and head_type == research_heads_module.HeadType.SPLICE_SITES_USAGE
+                and num_segments > 1
+            ):
+                # Bypass the predefined head's own single-global-mean loss()
+                # -- see set_usage_num_segments() for why/what this mirrors.
+                logits = predictions['logits']
+                targets_clipped = jnp.clip(batch.splice_site_usage, 1e-7, 1.0 - 1e-7)
+                loss = _partitioned_binary_crossentropy_usage_loss(
+                    logits, targets_clipped, num_segments,
+                )
+                loss_dict = {'loss': loss}
+            elif (
+                entry.source == 'predefined'
+                and head_type == research_heads_module.HeadType.SPLICE_SITES_CLASSIFICATION
+                and num_segments > 1
+            ):
+                loss = _partitioned_classification_loss(
+                    predictions['logits'], batch.splice_sites, num_segments,
+                )
+                loss_dict = {'loss': loss}
+            else:
+                loss_dict = head.loss(predictions, batch)
+            if head_loss_weight != 1.0:
+                loss_dict = {**loss_dict, 'loss': loss_dict['loss'] * head_loss_weight}
+            return loss_dict
 
         # Transform without apply_rng since we don't need randomness
         transformed = hk.without_apply_rng(hk.transform(
@@ -2177,10 +2563,13 @@ def create_model_with_heads(
     checkpoint_path: str | os.PathLike[str] | None = None,
     use_encoder_output: bool = False,
     detach_backbone: bool = False,
+    gradient_checkpointing: bool = False,
     backbone_lora_config: Any | None = None,
     include_standard_heads: bool = False,
     init_seq_len: int = 2**14,
+    install_backbone_patches: Callable[[], None] | None = None,
     head_init_scheme: str = "jax",
+    dtype: str = "bfloat16",
 ) -> CustomAlphaGenomeModel:
     """Create an AlphaGenome model with specified heads replacing standard heads.
 
@@ -2203,6 +2592,14 @@ def create_model_with_heads(
             before transformer. This enables heads to access raw CNN features.
         detach_backbone: If True, stop gradients at the backbone embeddings so
             heads-only training avoids backprop through the backbone.
+        gradient_checkpointing: With ``backbone_lora_config``, sets
+            ``BackboneLoRAConfig.gradient_checkpointing``: the LoRA trunk
+            recomputes transformer-tower and decoder activations block by
+            block (and the encoder's, where alphagenome_research's encoder
+            accepts ``remat``), trading compute for memory, as
+            alphagenome-pytorch's ``--gradient-checkpointing``. Without
+            backbone LoRA it has no effect: no backward pass reaches the
+            backbone, as on alphagenome-pytorch's frozen-backbone path.
         backbone_lora_config: Optional ``BackboneLoRAConfig``. When set, replace
             transformer ``q_layer``/``v_layer`` projections with same-path LoRA
             projections while retaining their pretrained base weights.
@@ -2212,6 +2609,23 @@ def create_model_with_heads(
         include_standard_heads: If True, compute the standard pretrained heads
             in addition to the requested heads. If False, skip standard heads
             to save compute/memory.
+        install_backbone_patches: Optional zero-arg callback run right after
+            the base pretrained model is loaded/restored, but before this
+            function builds/initializes the custom-heads forward function.
+            Use this to monkeypatch backbone modules (backbone LoRA no longer
+            uses this: pass ``backbone_lora_config``) so the patch is
+            NOT yet active during ``dna_model.create``'s own internal orbax
+            restore (which requires its restore target to structurally match
+            the saved checkpoint exactly — an active patch that adds new
+            parameters, e.g. LoRA adapters, makes that restore raise
+            ``ValueError: Structure mismatch``), but IS active for the
+            init/param-merge below (so the new parameters actually end up in
+            the returned model).
+        dtype: "bfloat16" (default) or "float32". Matches alphagenome-pytorch's
+            --dtype: applies mixed precision (params fp32, compute/output
+            bf16) to the trunk AND every head, or leaves everything at plain
+            float32 compute. Previously this was hardcoded bf16 for the trunk
+            only, with heads always silently running float32 regardless.
 
     Returns:
         CustomAlphaGenomeModel with requested heads and pretrained backbone.
@@ -2259,6 +2673,15 @@ def create_model_with_heads(
         )
     if backbone_lora_config is not None and detach_backbone:
         raise ValueError("detach_backbone would block gradients to backbone LoRA adapters.")
+    if (
+        backbone_lora_config is not None
+        and gradient_checkpointing
+        and not backbone_lora_config.gradient_checkpointing
+    ):
+        # One switch for both paths: with backbone LoRA the per-block remat lives
+        # in the LoRA trunk itself (BackboneLoRAConfig.gradient_checkpointing).
+        import dataclasses as _dc
+        backbone_lora_config = _dc.replace(backbone_lora_config, gradient_checkpointing=True)
 
     # Validate all heads are registered
     for head_name in normalized_heads:
@@ -2267,6 +2690,13 @@ def create_model_with_heads(
                 f"Head '{head_name}' not found. "
                 f"Available heads: {custom_heads_module.list_registered_heads()}"
             )
+
+    if gradient_checkpointing and backbone_lora_config is None:
+        # Without backbone LoRA nothing backpropagates through the backbone
+        # (detached, or a custom loop's frozen weights), so there is nothing
+        # to recompute: a 1 Mbp linear-probe step compiles to the same peak
+        # memory with and without remat.
+        print("gradient_checkpointing has no effect without backbone LoRA; ignoring.")
 
     # Load pretrained model
     print("Loading pretrained AlphaGenome model...")
@@ -2284,6 +2714,9 @@ def create_model_with_heads(
             device=device,
         )
     print("✓ Pretrained model loaded")
+
+    if install_backbone_patches is not None:
+        install_backbone_patches()
 
     # Get metadata
     metadata = {}
@@ -2303,11 +2736,20 @@ def create_model_with_heads(
             return _pytorch_head_parameter_creator(next_creator, shape, dtype, init, context)
         return next_creator(shape, dtype, init)
 
-    # Set mixed precision policy
+    # Set mixed precision policy (trunk only here -- heads are registered
+    # per-instance in _build_head_predictions, see dtype docstring above).
+    import contextlib
     import jmp
-    policy = jmp.get_policy('params=float32,compute=bfloat16,output=bfloat16')
-    hk.mixed_precision.set_policy(model_lib.AlphaGenome, policy)
-    if backbone_lora_config is not None:
+    policy = (
+        jmp.get_policy('params=float32,compute=bfloat16,output=bfloat16')
+        if dtype == "bfloat16" else None
+    )
+    if policy is not None:
+        hk.mixed_precision.set_policy(model_lib.AlphaGenome, policy)
+
+    def _push_policy_ctx(cls):
+        return hk.mixed_precision.push_policy(cls, policy) if policy is not None else contextlib.nullcontext()
+    if policy is not None and backbone_lora_config is not None:
         from alphagenome_ft.backbone_lora import BackboneLoRAAlphaGenome
 
         # The LoRA trunk stands in for model_lib.AlphaGenome; its submodules,
@@ -2330,16 +2772,18 @@ def create_model_with_heads(
         from alphagenome_ft.embeddings_extended import ExtendedEmbeddings
 
         @hk.transform_with_state
-        def _forward_with_custom_heads(dna_sequence, organism_index):
+        def _forward_with_custom_heads(dna_sequence, organism_index, splice_site_positions=None):
             """Forward pass with encoder output only (no transformer/decoder)."""
             # Apply mixed precision policies to encoder
-            with hk.mixed_precision.push_policy(model_lib.AlphaGenome, policy):
-                with hk.mixed_precision.push_policy(model_lib.SequenceEncoder, policy):
+            with _push_policy_ctx(model_lib.AlphaGenome):
+                with _push_policy_ctx(model_lib.SequenceEncoder):
                     with hk.name_scope('alphagenome'):
                         num_organisms = len(metadata)
 
                         # Step 1: Run encoder ONLY
-                        trunk, intermediates = call_with_is_training(model_lib.SequenceEncoder(), dna_sequence, is_training=False)
+                        trunk, intermediates = call_with_is_training(
+                            model_lib.SequenceEncoder(), dna_sequence, is_training=False
+                        )
                         encoder_output = trunk  # Save encoder output
 
                         # Create extended embeddings with ONLY encoder output
@@ -2353,36 +2797,23 @@ def create_model_with_heads(
                             embeddings = _stop_gradient_embeddings(embeddings)
 
             # Run heads (outside alphagenome scope)
-            predictions = {}
             num_organisms = len(metadata)
             with hk.name_scope('head'):
-                for head_name in normalized_heads:
-                    head_config = custom_heads_module.get_registered_head_config(head_name)
-                    if custom_heads_module.is_custom_config(head_config):
-                        head = custom_heads_module.create_registered_head(
-                            head_name,
-                            metadata=None,
-                            num_organisms=num_organisms,
-                        )
-                    else:
-                        head_metadata = _resolve_user_metadata(
-                            head_name=head_name,
-                            head_config=head_config,
-                        ) or {}
-                        head = custom_heads_module.create_predefined_head_from_config(
-                            head_config,
-                            metadata=head_metadata,
-                        )
-                    with hk.custom_creator(head_parameter_creator):
-                        predictions[head_name] = head(embeddings, organism_index)
+                with hk.custom_creator(head_parameter_creator), _head_compute_dtype_ctx(dtype):
+                    predictions = _build_head_predictions(
+                        normalized_heads, embeddings, organism_index,
+                        splice_site_positions, num_organisms,
+                    )
 
             return predictions, embeddings
     else:
         # Standard forward pass (no encoder output)
         @hk.transform_with_state
-        def _forward_with_custom_heads(dna_sequence, organism_index):
+        def _forward_with_custom_heads(dna_sequence, organism_index, splice_site_positions=None):
             """Forward pass with requested heads only."""
             if backbone_lora_config is not None:
+                # Transformer q/v LoRA trunk (alphagenome_ft.backbone_lora): keeps
+                # AlphaGenome's parameter paths, adds lora_a/lora_b leaves.
                 from alphagenome_ft.backbone_lora import (
                     forward_embeddings_with_backbone_lora,
                 )
@@ -2395,48 +2826,49 @@ def create_model_with_heads(
                     is_training=False,
                 )
             else:
-                # Create AlphaGenome trunk (encoder, transformer, decoder).
+                # Create AlphaGenome trunk (encoder, transformer, decoder);
+                # uses pretrained params for the backbone. AlphaGenome always
+                # creates standard heads based on metadata, but only the
+                # embeddings are used here, not the standard head predictions.
                 alphagenome = model_lib.AlphaGenome(metadata)
-                _, embeddings = alphagenome(dna_sequence, organism_index)
+
+                # Call forward_trunk directly (not __call__) - we only need
+                # embeddings, never the standard pretrained heads' predictions,
+                # so this also skips computing those on every step.
+                # forward_trunk is @hk.name_like('__call__'), so parameter paths
+                # still match a checkpoint saved via the real __call__.
+                if hasattr(alphagenome, "forward_trunk"):
+                    embeddings = alphagenome.forward_trunk(dna_sequence, organism_index)
+                else:
+                    # alphagenome_research without the trunk/heads split: the full
+                    # __call__ also runs the standard heads (unused here) but has
+                    # the same parameter paths.
+                    _, embeddings = alphagenome(dna_sequence, organism_index)
             if detach_backbone:
                 embeddings = _stop_gradient_embeddings(embeddings)
-
-            # Create predictions dict (only requested heads)
-            predictions = {}
 
             # Run heads
             # Get number of organisms from metadata (should be 2: human and mouse)
             num_organisms = len(metadata)
             with hk.name_scope('head'):
-                for head_name in normalized_heads:
-                    head_config = custom_heads_module.get_registered_head_config(head_name)
-                    if custom_heads_module.is_custom_config(head_config):
-                        head = custom_heads_module.create_registered_head(
-                            head_name,
-                            metadata=None,
-                            num_organisms=num_organisms,
-                        )
-                    else:
-                        head_metadata = _resolve_user_metadata(
-                            head_name=head_name,
-                            head_config=head_config,
-                        ) or {}
-                        head = custom_heads_module.create_predefined_head_from_config(
-                            head_config,
-                            metadata=head_metadata,
-                        )
-                    with hk.custom_creator(head_parameter_creator):
-                        predictions[head_name] = head(embeddings, organism_index)
+                with hk.custom_creator(head_parameter_creator), _head_compute_dtype_ctx(dtype):
+                    predictions = _build_head_predictions(
+                        normalized_heads, embeddings, organism_index,
+                        splice_site_positions, num_organisms,
+                    )
 
             return predictions, embeddings
 
     # Initialize parameters with dummy data
     print(f"Initializing parameters... (seq_len={init_seq_len})")
     rng = jax.random.PRNGKey(42)
-    dummy_seq = jnp.zeros((1, init_seq_len, 4), dtype=jnp.bfloat16)
+    dummy_seq = jnp.zeros((1, init_seq_len, 4), dtype=jnp.bfloat16 if dtype == "bfloat16" else jnp.float32)
     dummy_org = jnp.array([0])
+    dummy_splice_site_positions = _dummy_splice_site_positions(normalized_heads)
 
-    new_params, new_state = _forward_with_custom_heads.init(rng, dummy_seq, dummy_org)
+    new_params, new_state = _forward_with_custom_heads.init(
+        rng, dummy_seq, dummy_org, dummy_splice_site_positions
+    )
     print("✓ Head parameters initialized")
 
     # Merge pretrained backbone params with new head params
@@ -2468,13 +2900,17 @@ def create_model_with_heads(
     merged_params = merge_params(base_model._params, new_params)
     merged_state = merge_params(base_model._state, new_state)
 
+    # Head params stay float32 (master weights); bfloat16 head compute is
+    # applied at read time by _head_compute_dtype_ctx in the forward pass.
+    merged_params = _cast_head_params_to_float32(merged_params)
+
     print("✓ Parameters merged")
 
     # Create custom forward function for the model (JIT-compiled for performance and numerical consistency)
     @jax.jit
-    def custom_forward(params, state, rng, dna_sequence, organism_index):
+    def custom_forward(params, state, rng, dna_sequence, organism_index, splice_site_positions=None):
         (predictions, _), _ = _forward_with_custom_heads.apply(
-            params, state, rng, dna_sequence, organism_index
+            params, state, rng, dna_sequence, organism_index, splice_site_positions
         )
         return predictions
 
@@ -2514,6 +2950,7 @@ def create_model_with_custom_heads(
     device: jax.Device | None = None,
     use_encoder_output: bool = False,
     detach_backbone: bool = False,
+    gradient_checkpointing: bool = False,
     include_standard_heads: bool = False,
     init_seq_len: int = 2**20,
     checkpoint_path: str | os.PathLike[str] | None = None,
@@ -2526,6 +2963,7 @@ def create_model_with_custom_heads(
         device=device,
         use_encoder_output=use_encoder_output,
         detach_backbone=detach_backbone,
+        gradient_checkpointing=gradient_checkpointing,
         include_standard_heads=include_standard_heads,
         init_seq_len=init_seq_len,
         checkpoint_path=checkpoint_path,
@@ -2611,7 +3049,7 @@ def add_heads_to_model(
     hk.mixed_precision.set_policy(model_lib.AlphaGenome, policy)
 
     @hk.transform_with_state
-    def _forward_with_added_heads(dna_sequence, organism_index):
+    def _forward_with_added_heads(dna_sequence, organism_index, splice_site_positions=None):
         """Forward pass with added heads appended to standard heads."""
         # Create AlphaGenome with standard heads (will use pretrained params)
         alphagenome = model_lib.AlphaGenome(metadata)
@@ -2623,26 +3061,13 @@ def add_heads_to_model(
         # Get number of organisms from metadata (should be 2: human and mouse)
         num_organisms = len(metadata)
         with hk.name_scope('head'):
-            for head_name in normalized_heads:
-                if head_name in predictions:
-                    continue
-                head_config = custom_heads_module.get_registered_head_config(head_name)
-                if custom_heads_module.is_custom_config(head_config):
-                    head = custom_heads_module.create_registered_head(
-                        head_name,
-                        metadata=None,
-                        num_organisms=num_organisms,
-                    )
-                else:
-                    head_metadata = _resolve_user_metadata(
-                        head_name=head_name,
-                        head_config=head_config,
-                    ) or {}
-                    head = custom_heads_module.create_predefined_head_from_config(
-                        head_config,
-                        metadata=head_metadata,
-                    )
-                predictions[head_name] = head(embeddings, organism_index)
+            added_head_names = [name for name in normalized_heads if name not in predictions]
+            predictions.update(
+                _build_head_predictions(
+                    added_head_names, embeddings, organism_index,
+                    splice_site_positions, num_organisms,
+                )
+            )
 
         return predictions, embeddings
 
@@ -2651,8 +3076,11 @@ def add_heads_to_model(
     rng = jax.random.PRNGKey(42)
     dummy_seq = jnp.zeros((1, 2**17, 4), dtype=jnp.bfloat16)
     dummy_org = jnp.array([0])
+    dummy_splice_site_positions = _dummy_splice_site_positions(normalized_heads)
 
-    new_params, new_state = _forward_with_added_heads.init(rng, dummy_seq, dummy_org)
+    new_params, new_state = _forward_with_added_heads.init(
+        rng, dummy_seq, dummy_org, dummy_splice_site_positions
+    )
     print("✓ Head parameters initialized")
 
     # Merge pretrained parameters with new head parameters
@@ -2688,9 +3116,9 @@ def add_heads_to_model(
 
     # Create custom forward function (JIT-compiled for performance and numerical consistency)
     @jax.jit
-    def custom_forward(params, state, rng, dna_sequence, organism_index):
+    def custom_forward(params, state, rng, dna_sequence, organism_index, splice_site_positions=None):
         (predictions, _), _ = _forward_with_added_heads.apply(
-            params, state, rng, dna_sequence, organism_index
+            params, state, rng, dna_sequence, organism_index, splice_site_positions
         )
         return predictions
 
@@ -2736,6 +3164,11 @@ def load_checkpoint(
     device: jax.Device | None = None,
     base_checkpoint_path: str | os.PathLike[str] | None = None,
     init_seq_len: int | None = None,
+    detach_backbone: bool = False,
+    gradient_checkpointing: bool = False,
+    install_backbone_patches: Callable[[], None] | None = None,
+    backbone_lora_config: Any | None = None,
+    dtype: str = "bfloat16",
 ) -> CustomAlphaGenomeModel:
     """Load a saved head checkpoint.
 
@@ -2746,6 +3179,14 @@ def load_checkpoint(
         checkpoint_dir: Directory containing the checkpoint files.
         base_model_version: Base model version to use (only needed for heads-only checkpoints).
         organism_settings: Optional organism settings.
+        detach_backbone: If True, stop gradients at the backbone embeddings in
+            the reconstructed model's forward pass, matching whatever value
+            was used for the original `create_model_with_heads` call this
+            checkpoint came from. This only affects the rebuilt template
+            model's forward function, not the restored parameter values
+            themselves, but MUST match the original training call or a
+            heads-only-frozen run resumed without it will silently backprop
+            through (and need memory for) the full backbone again.
         device: Optional JAX device.
 
         base_checkpoint_path: Optional local checkpoint directory for the base
@@ -2755,6 +3196,11 @@ def load_checkpoint(
         init_seq_len: Optional sequence length for model initialization. If None and
             use_encoder_output=True, will be inferred from checkpoint parameters.
             This is critical for encoder-only models with flatten pooling.
+        install_backbone_patches: See ``create_model_with_heads``.
+        backbone_lora_config: Fallback ``BackboneLoRAConfig`` for checkpoints
+            whose ``config.json`` records none. A recorded config always wins,
+            so a resumed LoRA run rebuilds the LoRA-shaped target tree the
+            checkpoint was saved with.
 
     Returns:
         CustomAlphaGenomeModel with loaded parameters.
@@ -2821,7 +3267,8 @@ def load_checkpoint(
     save_full_model = config['save_full_model']
     save_minimal_model = config.get('save_minimal_model', False)
     use_encoder_output = config.get('use_encoder_output', False)
-    backbone_lora_config = None
+    # An explicit ``backbone_lora_config`` argument is used when the checkpoint's
+    # config.json carries none (e.g. a checkpoint written before it was recorded).
     if config.get('backbone_lora') is not None:
         from alphagenome_ft.backbone_lora import BackboneLoRAConfig
 
@@ -2931,8 +3378,12 @@ def load_checkpoint(
         device=device,
         checkpoint_path=base_checkpoint_path,
         use_encoder_output=template_use_encoder,
+        detach_backbone=detach_backbone,
+        gradient_checkpointing=gradient_checkpointing,
         backbone_lora_config=backbone_lora_config,
         init_seq_len=init_for_template,
+        install_backbone_patches=install_backbone_patches,
+        dtype=dtype,
     )
     restore_target = template_model._checkpoint_slice_trees(
         save_full_model, save_minimal_model
@@ -3122,7 +3573,9 @@ def load_checkpoint(
                         with hk.mixed_precision.push_policy(model_lib.SequenceEncoder, policy):
                             with hk.name_scope('alphagenome'):
                                 # Run encoder ONLY (no transformer/decoder).
-                                trunk, intermediates = call_with_is_training(model_lib.SequenceEncoder(), dna_sequence, is_training=False)
+                                trunk, intermediates = call_with_is_training(
+                                    model_lib.SequenceEncoder(), dna_sequence, is_training=False
+                                )
                                 encoder_output = trunk  # Shape: (batch, num_positions, encoder_feature_size)
 
                                 # Pad or truncate encoder_output to match expected size (for flatten pooling)
@@ -3181,7 +3634,7 @@ def load_checkpoint(
                     # Run custom heads outside the alphagenome scope.
                     predictions = {}
                     num_organisms = len(metadata)
-                    with hk.name_scope('head'):
+                    with hk.name_scope('head'), _head_compute_dtype_ctx(dtype):
                         for head_name in custom_heads:
                             head = custom_heads_module.create_custom_head(
                                 head_name, metadata=None, num_organisms=num_organisms
@@ -3337,6 +3790,11 @@ def load_checkpoint(
             if loaded_state:
                 model._state = merge_minimal_params(model._state, loaded_state)
 
+            # Checkpoints may store bfloat16 head params (older behavior);
+            # restore fp32 master weights. Compute dtype is applied by the
+            # forward pass's head getter.
+            model._params = _cast_head_params_to_float32(model._params)
+
             # Ensure parameters and state are on the correct device
             device = model._device_context._device
             model._params = jax.device_put(model._params, device)
@@ -3391,6 +3849,9 @@ def load_checkpoint(
             merged_params = merge_minimal_params(base_model._params, loaded_params)
             merged_state = merge_minimal_params(base_model._state, loaded_state) if loaded_state else base_model._state
 
+            # See above: restore fp32 master head params.
+            merged_params = _cast_head_params_to_float32(merged_params)
+
             # Create custom model with merged parameters (no custom forward - uses base model's forward)
             custom_model = CustomAlphaGenomeModel(
                 base_model,
@@ -3428,6 +3889,9 @@ def load_checkpoint(
 
         custom_model._params = merge_head_params(custom_model._params, loaded_params)
         custom_model._state = merge_head_params(custom_model._state, loaded_state)
+
+        # See above: restore fp32 master head params.
+        custom_model._params = _cast_head_params_to_float32(custom_model._params)
 
         # Re-put on device
         device = custom_model._device_context._device

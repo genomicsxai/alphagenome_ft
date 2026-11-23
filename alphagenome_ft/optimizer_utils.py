@@ -22,12 +22,31 @@ def parameter_path_to_str(path_tuple: tuple) -> str:
     return parameter_utils._keypath_to_str(path_tuple)
 
 
-def is_trainable_head_path(path_str: str, trainable_heads: set[str]) -> bool:
-    """Return True if ``path_str`` belongs to one of the named heads."""
+def is_trainable_head_path(
+    path_str: str,
+    trainable_heads: set[str],
+    top_level_heads: frozenset[str] | set[str] = frozenset(),
+) -> bool:
+    """Return True if ``path_str`` belongs to one of the named heads.
+
+    A head may live at top level (``head/<name>/...``, custom heads) or inside
+    the model scope (``.../head/<name>/...``). For names in ``top_level_heads``
+    only the top-level copy matches, so a pretrained standard head with the same
+    name (e.g. ``alphagenome/head/rna_seq``, unused once a custom ``rna_seq``
+    head exists) stays frozen.
+    """
     for head_name in trainable_heads:
-        if f"/head/{head_name}/" in path_str or path_str.startswith(f"head/{head_name}/"):
+        if path_str.startswith(f"head/{head_name}/"):
+            return True
+        if head_name not in top_level_heads and f"/head/{head_name}/" in path_str:
             return True
     return False
+
+
+def _top_level_head_names(path_strs, trainable_heads: set[str]) -> frozenset[str]:
+    return frozenset(
+        n for n in trainable_heads if any(p.startswith(f"head/{n}/") for p in path_strs)
+    )
 
 
 def is_lora_parameter_path(path_str: str) -> bool:
@@ -43,10 +62,12 @@ def label_params_for_trainable_heads(
 ) -> PyTree:
     """Label trainable heads/adapters versus frozen parameter leaves."""
     head_set = {str(n) for n in trainable_head_names}
+    all_paths = [parameter_path_to_str(p) for p, _ in jax.tree_util.tree_flatten_with_path(params)[0]]
+    top_level = _top_level_head_names(all_paths, head_set)
 
     def label_fn(path, _value):
         ps = parameter_path_to_str(path)
-        trainable = is_trainable_head_path(ps, head_set) or (
+        trainable = is_trainable_head_path(ps, head_set, top_level) or (
             include_lora and is_lora_parameter_path(ps)
         )
         return "head" if trainable else "frozen"
@@ -58,7 +79,8 @@ def assert_trainable_head_params_exist(params: PyTree, trainable_head_names: Seq
     """Raise if no head parameters match ``trainable_head_names``."""
     head_set = {str(n) for n in trainable_head_names}
     head_paths = parameter_utils.get_head_parameter_paths(params)
-    matched = [p for p in head_paths if is_trainable_head_path(p, head_set)]
+    top_level = _top_level_head_names(head_paths, head_set)
+    matched = [p for p in head_paths if is_trainable_head_path(p, head_set, top_level)]
     if not matched:
         sample = ", ".join(head_paths[:5]) if head_paths else "<none>"
         raise ValueError(
@@ -158,3 +180,38 @@ def create_optimizer(
         return inner
 
     return with_clipping(inner)
+
+
+def build_lr_schedule(
+    base_lr: float, warmup_steps: int, total_steps: int, schedule: str,
+) -> float | Any:
+    """Build a learning-rate value/schedule for :func:`create_optimizer`.
+
+    Mirrors alphagenome-pytorch's ``create_lr_scheduler`` (a ``LambdaLR`` multiplicative
+    factor) formula exactly, rather than reaching for ``optax.warmup_cosine_decay_schedule``
+    (whose endpoint semantics aren't guaranteed to match PyTorch's bit-for-bit): linear
+    warmup from 0 to ``base_lr`` over ``warmup_steps``, then either held constant or cosine
+    decayed to 0 by ``total_steps``.
+
+    Returns the plain ``base_lr`` float unchanged when ``warmup_steps == 0`` and
+    ``schedule == "constant"`` (today's default), so existing callers that never pass these
+    flags see no behavior change and no schedule-tracing overhead.
+    """
+    if warmup_steps == 0 and schedule == "constant":
+        return base_lr
+    if schedule not in ("constant", "cosine"):
+        raise ValueError(f"schedule must be 'constant' or 'cosine', got {schedule!r}.")
+
+    def lr_fn(step):
+        warmup_factor = jax.numpy.minimum(step / max(warmup_steps, 1), 1.0)
+        if schedule == "constant":
+            decay_factor = 1.0
+        else:
+            progress = jax.numpy.clip(
+                (step - warmup_steps) / max(total_steps - warmup_steps, 1), 0.0, 1.0,
+            )
+            decay_factor = 0.5 * (1.0 + jax.numpy.cos(jax.numpy.pi * progress))
+        factor = jax.numpy.where(step < warmup_steps, warmup_factor, decay_factor)
+        return base_lr * factor
+
+    return lr_fn

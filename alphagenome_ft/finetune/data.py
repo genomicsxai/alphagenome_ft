@@ -485,6 +485,54 @@ def load_intervals_from_bed(
     )
 
 
+def load_split_intervals(
+    beds: Mapping[str, Path],
+    window_size: int,
+    *,
+    chrom_sizes: Mapping[str, int] | None = None,
+) -> dict[str, list[genome.Interval]]:
+    """Load one 3-column BED per split (``{"train": path, "valid": path, ...}``).
+
+    Each row is recentred to ``window_size`` (as ``build_interval``). With
+    ``chrom_sizes`` (e.g. from ``build_fasta_index``), windows that would run
+    off a chromosome, or sit on one missing from the FASTA, are skipped rather
+    than shifted, matching alphagenome-pytorch's datasets.
+    """
+    out: dict[str, list[genome.Interval]] = {}
+    half = window_size // 2
+    for split, bed_path in beds.items():
+        bed_path = Path(bed_path)
+        intervals: list[genome.Interval] = []
+        n_skipped = 0
+        opened = gzip.open if bed_path.suffix == ".gz" else open
+        with opened(bed_path, "rt") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if not line or line.startswith(("#", "track", "browser")):
+                    continue
+                chrom, start_str, end_str = line.split()[:3]
+                start, end = int(float(start_str)), int(float(end_str))
+                if start >= end:
+                    raise ValueError(f"Invalid interval ({chrom}, {start}, {end}) in {bed_path}.")
+                if chrom_sizes is None:
+                    intervals.append(build_interval(
+                        chromosome=chrom, start=start, end=end, window_size=window_size))
+                    continue
+                win_start = (start + end) // 2 - half
+                win_end = win_start + window_size
+                if chrom not in chrom_sizes or win_start < 0 or win_end > chrom_sizes[chrom]:
+                    n_skipped += 1
+                    continue
+                intervals.append(genome.Interval(chromosome=chrom, start=win_start, end=win_end))
+        if n_skipped:
+            print(f"{bed_path}: skipped {n_skipped} interval(s) that would exceed chromosome "
+                  f"boundaries at window_size={window_size}.")
+        if not intervals:
+            raise ValueError(f"No intervals parsed from {bed_path}.")
+        out[split] = intervals
+    return out
+
+
 def prepare_intervals_from_fold(
     fold: str | int,
     window_size: int | None = WINDOW_SIZE,
@@ -593,8 +641,13 @@ def prepare_intervals_from_split(
     )
 
 
-class BigWigDataModule:
-    """Creates training batches by streaming sequences + BigWig targets."""
+class FinetuneDataModule:
+    """Streams sequence windows with targets for every configured head.
+
+    Each head gets its targets from its spec: BigWig tracks (``tracks``) or
+    splice data (``splice_source``: STAR junctions, optional SSU/GTF). The
+    sequence of a window is read once per batch and shared by all heads.
+    """
 
     def __init__(
         self,
@@ -605,25 +658,46 @@ class BigWigDataModule:
         batch_size: int,
         shuffle: bool,
         drop_last: bool = False,
+        junction_event_pad_size: int = 1024,
     ) -> None:
-        """Initialize streaming sequence/BigWig batch generation.
+        """Initialize streaming batch generation.
 
         Args:
             intervals: Split-to-interval mapping (``train``/``valid``/``test``).
             fasta_path: Reference FASTA used to extract sequence windows.
-            head_specs: Head definitions including target BigWig track paths.
+            head_specs: Head definitions (BigWig ``tracks`` or a ``splice_source``).
             batch_size: Number of windows per yielded batch.
             shuffle: Whether to shuffle window order in ``iter_batches``.
             drop_last: If True, drop incomplete final batches.
+            junction_event_pad_size: Minimum padded row count for raw junction
+                events (predicted junction positions only).
 
         Raises:
             ValueError: If no shared chromosomes exist across configured BigWigs,
-                or no training intervals remain after chromosome filtering.
+                or no training intervals remain after filtering.
         """
-        filtered_intervals = self._filter_intervals_by_bigwig_chromosomes(intervals, head_specs)
+        from alphagenome_ft.finetune.splice_data import build_splice_targets
+
+        self._bigwig_specs = [spec for spec in head_specs if spec.splice_source is None]
+        self._splice_targets = build_splice_targets(
+            head_specs, junction_event_pad_size=junction_event_pad_size,
+        )
+        filtered_intervals = {split: list(ivs) for split, ivs in intervals.items()}
+        if self._bigwig_specs:
+            filtered_intervals = self._filter_intervals_by_bigwig_chromosomes(
+                filtered_intervals, self._bigwig_specs,
+            )
+        junction_filters = [t for t in self._splice_targets if t.filter_to_junctions]
+        if junction_filters:
+            filtered_intervals = {
+                split: kept
+                for split, ivs in filtered_intervals.items()
+                if (kept := [w for w in ivs if any(t.has_junction(w) for t in junction_filters)])
+            }
         if not filtered_intervals.get("train"):
             raise ValueError(
-                "No training intervals remain after filtering to chromosomes present in all BigWigs."
+                "No training intervals remain after filtering (BigWig chromosome "
+                "coverage / splice-junction presence)."
             )
         self._intervals = filtered_intervals
         self._fasta_path = fasta_path
@@ -696,7 +770,7 @@ class BigWigDataModule:
         return filtered
 
     def iter_batches(
-        self, split: str, *, seed: int | None = None
+        self, split: str, *, seed: int | None = None, skip_batches: int = 0
     ) -> Iterator[dict[str, np.ndarray]]:
         windows = list(self._intervals.get(split, ()))
         if not windows:
@@ -706,11 +780,21 @@ class BigWigDataModule:
         if self._shuffle and split == "train":
             rng = np.random.default_rng(seed)
             rng.shuffle(order)
+        if split != "train" and self._drop_last:
+            # Evaluation never drops windows: pad the final partial batch by
+            # wrapping around to the start, as torch's DistributedSampler does
+            # for alphagenome-pytorch's validation loader.
+            order = _pad_order_to_batch_multiple(order, self._batch_size)
+        if skip_batches:
+            # Resuming mid-epoch: the shuffle is a deterministic function of
+            # (len(windows), seed), so slicing the order skips the consumed
+            # batches without extracting any of their windows.
+            order = order[skip_batches * self._batch_size:]
 
         extractor = fasta_lib.FastaExtractor(str(self._fasta_path))
         with contextlib.ExitStack() as stack:
             head_handles: dict[str, list[pyBigWig.pyBigWig]] = {}
-            for spec in self._head_specs:
+            for spec in self._bigwig_specs:
                 handles = []
                 for track in spec.tracks:
                     handles.append(stack.enter_context(pyBigWig.open(str(track.path))))
@@ -734,7 +818,8 @@ class BigWigDataModule:
         head_handles: Mapping[str, Sequence[pyBigWig.pyBigWig]],
     ) -> dict[str, np.ndarray]:
         sequences = []
-        targets: dict[str, list[np.ndarray]] = {spec.head_id: [] for spec in self._head_specs}
+        targets: dict[str, list[np.ndarray]] = {spec.head_id: [] for spec in self._bigwig_specs}
+        splice_windows: list[list[dict]] = [[] for _ in self._splice_targets]
 
         for idx in batch_indices:
             window = windows[idx]
@@ -743,13 +828,15 @@ class BigWigDataModule:
             sequences.append(encoded)
 
             seq_len = encoded.shape[0]
-            for spec in self._head_specs:
+            for spec in self._bigwig_specs:
                 channel_arrays = []
                 for handle in head_handles[spec.head_id]:
                     values = handle.values(window.chromosome, window.start, window.end)
                     track = self._prepare_track(values, seq_len)
                     channel_arrays.append(track)
                 targets[spec.head_id].append(np.stack(channel_arrays, axis=-1))
+            for per_window, splice in zip(splice_windows, self._splice_targets):
+                per_window.append(splice.window_targets(window.chromosome, window.start, seq_len))
 
         batch = {
             'sequences': np.stack(sequences, axis=0).astype(np.float32),
@@ -757,6 +844,8 @@ class BigWigDataModule:
         }
         for head_name, arrays in targets.items():
             batch[f'targets_{head_name}'] = np.stack(arrays, axis=0).astype(np.float32)
+        for per_window, splice in zip(splice_windows, self._splice_targets):
+            splice.add_to_batch(batch, per_window)
         return batch
 
     @staticmethod
@@ -771,6 +860,10 @@ class BigWigDataModule:
         limit = min(target_len, arr.shape[0])
         padded[:limit] = arr[:limit]
         return padded
+
+
+# Backward-compatible name: the module also serves splice heads now.
+BigWigDataModule = FinetuneDataModule
 
 
 def compute_track_nonzero_means(
@@ -890,6 +983,15 @@ def build_fasta_index(fasta_path: Path) -> dict[str, int]:
     if not fai_path.exists():
         raise FileNotFoundError(f"Failed to create FASTA index: {fai_path}")
 
+    sizes: dict[str, int] = {}
+    with open(fai_path) as handle:
+        for line in handle:
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 2:
+                raise ValueError(f"Malformed FASTA index line in {fai_path}: {line!r}")
+            sizes[fields[0]] = int(fields[1])
+    return sizes
+
 
 def prepare_batch(
     batch: Mapping[str, np.ndarray],
@@ -920,4 +1022,23 @@ def prepare_batch(
     }
     for head_name in head_names:
         prepared[f'targets_{head_name}'] = jnp.asarray(batch[f'targets_{head_name}'])
+    if 'splice_site_positions' in batch:
+        prepared['splice_site_positions'] = jnp.asarray(
+            batch['splice_site_positions'], dtype=jnp.int32
+        )
+    # Raw per-window junction events, only present for a predicted-position
+    # junction head (junction_position_source="predicted").
+    if 'junction_d_rel' in batch:
+        prepared['junction_d_rel'] = jnp.asarray(batch['junction_d_rel'], dtype=jnp.int32)
+        prepared['junction_a_rel'] = jnp.asarray(batch['junction_a_rel'], dtype=jnp.int32)
+        prepared['junction_is_pos_strand'] = jnp.asarray(batch['junction_is_pos_strand'])
+        prepared['junction_counts'] = jnp.asarray(batch['junction_counts'], dtype=jnp.float32)
     return prepared
+
+
+def _pad_order_to_batch_multiple(order: np.ndarray, batch_size: int) -> np.ndarray:
+    """Wrap-pad ``order`` to a multiple of ``batch_size`` (DistributedSampler-style)."""
+    remainder = len(order) % batch_size
+    if remainder == 0:
+        return order
+    return np.concatenate([order, np.resize(order, batch_size - remainder)])

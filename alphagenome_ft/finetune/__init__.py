@@ -3,22 +3,26 @@
 from alphagenome_ft.finetune.config import (
     TrackInfo,
     HeadSpec,
+    SpliceSourceSpec,
     load_targets_config,
     prepare_head_specs,
     validate_head_specs,
 )
 from alphagenome_ft.finetune.data import (
     get_fold_split,
+    FinetuneDataModule,
     BigWigDataModule,
     build_interval,
     load_intervals_from_bed,
     load_intervals_from_dataframe,
     prepare_intervals_from_fold,
     prepare_intervals_from_split,
+    load_split_intervals,
     build_fasta_index,
     prepare_batch,
     compute_track_nonzero_means,
 )
+from alphagenome_ft.finetune.splice_data import SpliceTargets
 from alphagenome_ft.finetune.train import (
     register_predefined_heads,
     create_optimizer,
@@ -29,19 +33,23 @@ __all__ = [
     # config
     'TrackInfo',
     'HeadSpec',
+    'SpliceSourceSpec',
     'load_targets_config',
     'prepare_head_specs',
     'validate_head_specs',
     # data
     'get_fold_split',
+    'FinetuneDataModule',
     'BigWigDataModule',
     'build_interval',
     'load_intervals_from_bed',
     'load_intervals_from_dataframe',
     'prepare_intervals_from_fold',
     'prepare_intervals_from_split',
+    'load_split_intervals',
     'build_fasta_index',
     'prepare_batch',
+    'SpliceTargets',
     'compute_track_nonzero_means',
     # train
     'register_predefined_heads',

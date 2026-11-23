@@ -123,12 +123,12 @@ def test_prepare_head_specs_can_compute_missing_nonzero_means(
 
 def test_validation_keeps_bed_order_with_partial_batch(monkeypatch):
     """The final singleton affects a mean-of-batch-means validation loss."""
-    module = object.__new__(data_module.BigWigDataModule)
+    module = object.__new__(data_module.FinetuneDataModule)
     module._intervals = {"valid": list(range(5)), "train": list(range(5))}
     module._shuffle = True
     module._batch_size = 2
     module._drop_last = False
-    module._head_specs = []
+    module._bigwig_specs = []
     module._fasta_path = Path("unused.fa")
     monkeypatch.setattr(data_module.fasta_lib, "FastaExtractor", lambda _: None)
     module._make_batch = lambda indices, *_: list(indices)

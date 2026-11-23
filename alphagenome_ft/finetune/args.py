@@ -1,0 +1,315 @@
+"""CLI flags for the finetuning driver (``python -m alphagenome_ft.finetune``).
+
+Heads and their targets come from ``--targets-config`` (the YAML/JSON format
+read by ``finetune.config.load_targets_config``), or, as a shorthand, from
+``--bigwig``/``--star-junctions`` (+ ``--ssu``/``--gtf``), which build one
+``rna_seq`` head plus the three splice heads.
+
+Kept dependency-light at module scope (only ``argparse``/``pathlib``) so
+``--help`` works without a full JAX install, mirroring
+``alphagenome_pytorch.extensions.finetuning.args``.
+
+Defaults match ``alphagenome-pytorch``'s ``extensions/finetuning/args.py``
+for every flag both drivers share (``--batch-size`` is per device in both),
+so a JAX run and a PyTorch run started with the same overrides and device
+count train the same objective on the same window order. Flags that exist
+only here are JAX-specific plumbing (``--checkpoint-path``, ``--num-devices``,
+``--max-train-steps``, ``--rope-init-std``).
+
+Note: there is intentionally no ``--junction-loss`` flag here, unlike
+PyTorch's original/normalized/sparse switch. The real
+``SpliceSitesJunctionHead.loss`` in ``alphagenome_research`` has a single
+fixed formula that already matches PyTorch's "normalized" variant, so there
+is nothing to select between.
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--checkpoint-path", required=True, type=Path,
+                         help="Local AlphaGenome JAX checkpoint dir (e.g. from "
+                              "a Kaggle model-version download — do not point "
+                              "this at Kaggle directly from a "
+                              "network-isolated node).")
+    parser.add_argument("--genome", required=True, type=Path, help="Reference FASTA.")
+    parser.add_argument("--train-bed", required=True, type=Path)
+    parser.add_argument("--val-bed", required=True, type=Path)
+    parser.add_argument("--targets-config", type=Path, default=None,
+                         help="YAML/JSON head config (format of data/targets_rna_demo.yaml; "
+                              "splice heads take star_junctions/ssu/gtf instead of targets). "
+                              "Relative paths resolve against the config's directory. "
+                              "Alternative to the --bigwig/--star-junctions shorthand.")
+    parser.add_argument("--bigwig", nargs="+", default=None,
+                         help="Shorthand: BigWig files for one rna_seq head (one track "
+                              "per file). Matches alphagenome-pytorch's --modality "
+                              "rna_seq --bigwig.")
+    parser.add_argument("--track-means-samples", type=int, default=None,
+                         help="Number of --train-bed windows to sample when "
+                              "computing each rna_seq bigwig track's "
+                              "nonzero_mean (default: all). Matches "
+                              "alphagenome-pytorch's --track-means-samples — "
+                              "the real predefined rna_seq head "
+                              "(alphagenome_research.model.heads) rescales "
+                              "predictions/targets by this on every forward "
+                              "pass when present; omit only to fall back to "
+                              "no scaling (all-ones).")
+    parser.add_argument("--star-junctions", nargs="+", default=None,
+                         help="Shorthand: STAR SJ.out.tab files, one per sample, for "
+                              "the splice_site/splice_usage/splice_junctions heads.")
+    parser.add_argument("--ssu", nargs="+", default=None,
+                         help="Shorthand: optional per-sample SSU parquet files, same "
+                              "order as --star-junctions.")
+    parser.add_argument("--gtf", default=None,
+                         help="Shorthand: optional canonical splice-site GTF/parquet "
+                              "(annotation-only sites, zero usage).")
+    parser.add_argument("--junction-position-source", choices=["annotated", "predicted"],
+                         default="annotated",
+                         help="Source of splice-site positions passed to the "
+                              "junction head. Matches alphagenome-pytorch's "
+                              "--junction-position-source default (annotated).")
+    parser.add_argument("--rope-init", choices=["none", "truncated_normal", "zeros"],
+                         default="truncated_normal",
+                         help="How to initialize SpliceSitesJunctionHead's RoPE "
+                              "scale/offset ('embeddings') parameter. Default "
+                              "'truncated_normal' matches alphagenome-pytorch's "
+                              "--rope-init default. 'none' skips any manual reinit and trusts "
+                              "the fresh Haiku init a real model construction "
+                              "already gives this parameter -- confirmed "
+                              "empirically (alphagenome_research 0.3.0+) to "
+                              "already be TruncatedNormal(0.1)-distributed "
+                              "with normal nonzero gradients from the start; "
+                              "the zero-init dead-gradient bug this flag "
+                              "originally worked around (alphagenome_research "
+                              "0.1.0) was fixed upstream and no longer exists "
+                              "with the currently required package version. "
+                              "'truncated_normal' reinits to a fresh "
+                              "TruncatedNormal(std) sample (bounds +/-2 std, "
+                              "like torch trunc_normal_(std, -2std, 2std)) -- "
+                              "statistically the same as 'none' at "
+                              "--rope-init-std 0.1. 'zeros' reproduces the old buggy "
+                              "init for ablation only -- do not use otherwise.")
+    parser.add_argument("--rope-init-std", type=float, default=0.1,
+                         help="Stddev for --rope-init truncated_normal (ignored "
+                              "when --rope-init is 'none'). 0.1 "
+                              "matches alphagenome_research's own real "
+                              "TruncatedNormal(0.1) init for this parameter "
+                              "(heads.py) and alphagenome-pytorch's hardcoded "
+                              "std=0.1 ('matches the JAX reference init and "
+                              "the pretrained weight distribution').")
+    parser.add_argument("--sequence-length", type=int, default=1048576,
+                         help="Window length in bp. Default 1048576 matches "
+                              "alphagenome-pytorch's --sequence-length.")
+    parser.add_argument("--max-splice-sites", type=int, default=256,
+                         help="Annotated mode: max STAR-derived splice sites per "
+                              "role (donor/acceptor x strand) fed to the junction "
+                              "head. Matches alphagenome-pytorch's "
+                              "--max-splice-sites (256).")
+    parser.add_argument("--junction-top-k", type=int, default=512,
+                         help="Predicted mode only: number of splice sites per role "
+                              "selected from the classification head's probabilities. "
+                              "Default 512 = alphagenome_research's "
+                              "DEFAULT_NUM_SPLICE_SITES; matches alphagenome-pytorch's "
+                              "--junction-top-k.")
+    parser.add_argument("--splice-site-threshold", type=float, default=0.1,
+                         help="Predicted mode only: drop selected sites whose "
+                              "classification probability is below this value. "
+                              "Default 0.1 = alphagenome_research's "
+                              "DEFAULT_SPLICE_SITE_THRESHOLD; matches "
+                              "alphagenome-pytorch's --splice-site-threshold. 0 disables.")
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.0,
+                         help="AdamW weight decay. Default 0.0 matches alphagenome-pytorch.")
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=1,
+                         help="Per-device batch size, as alphagenome-pytorch's "
+                              "per-GPU --batch-size (default 1). The global batch is "
+                              "batch_size * num_devices; the effective batch per "
+                              "optimizer step is batch_size * num_devices * "
+                              "gradient_accumulation_steps.")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1,
+                         help="Number of --batch-size batches to average grads "
+                              "over per optimizer step. Use this (rather than a "
+                              "larger --batch-size) to match a PyTorch DDP run's "
+                              "effective batch size without risking OOM at 1Mb "
+                              "sequence length on a single device: e.g. "
+                              "--batch-size 1 --num-devices 1 "
+                              "--gradient-accumulation-steps 64 reproduces the "
+                              "same 64-example gradient average as a PyTorch "
+                              "run's batch=1 x 4 GPUs x grad_accum=16.")
+    parser.add_argument("--num-devices", type=int, default=None,
+                         help="Local devices to train on. Default: all visible devices "
+                              "(set CUDA_VISIBLE_DEVICES to restrict), like launching "
+                              "alphagenome-pytorch with one process per visible GPU.")
+    parser.add_argument("--gradient-checkpointing", action="store_true",
+                         help="--mode lora only: recompute the LoRA trunk's transformer "
+                              "and decoder activations on the backward pass instead of "
+                              "storing them, trading compute for memory (alphagenome-"
+                              "pytorch's --gradient-checkpointing). No effect in "
+                              "--mode linear-probe, where the backbone is detached.")
+    parser.add_argument("--mode", choices=["linear-probe", "lora"], default="linear-probe",
+                         help="Default 'linear-probe', as alphagenome-pytorch. "
+                              "'linear-probe': freeze + detach the backbone, "
+                              "train only the heads. 'lora': freeze the backbone but do "
+                              "NOT detach it; instead build the trunk with "
+                              "alphagenome_ft.backbone_lora so the --lora-targets q/v "
+                              "projections get a trainable low-rank adapter (same "
+                              "parameter paths as the pretrained model, plus "
+                              "lora_a/lora_b), and train those adapters + heads. Mirrors alphagenome-pytorch's "
+                              "--mode lora.")
+    parser.add_argument("--lora-rank", type=int, default=8,
+                         help="LoRA rank for --mode lora. Matches alphagenome-pytorch's "
+                              "--lora-rank default (8).")
+    parser.add_argument("--lora-alpha", type=int, default=16,
+                         help="LoRA alpha scaling for --mode lora; effective adapter "
+                              "scale is alpha/rank. Matches alphagenome-pytorch's "
+                              "--lora-alpha default (16).")
+    parser.add_argument("--lora-targets", default="q_proj,v_proj",
+                         help="Comma-separated backbone attention projections to adapt "
+                              "for --mode lora, using alphagenome-pytorch's naming "
+                              "(q_proj/v_proj — translated internally to this "
+                              "JAX model's q_layer/v_layer; k_proj is not supported). Matches "
+                              "alphagenome-pytorch's --lora-targets default.")
+    parser.add_argument("--max-train-steps", type=int, default=None,
+                         help="Optional global cap on optimizer updates, for "
+                              "quick smoke-test runs before a full finetune.")
+    parser.add_argument("--save-every-steps", type=int, default=None,
+                         help="Also save a 'last' checkpoint (+ opt_state, "
+                              "train_state.json) every this many optimizer "
+                              "steps, not just at epoch end. Mirrors "
+                              "alphagenome-pytorch's --save-every-steps.")
+    parser.add_argument("--max-grad-norm", type=float, default=1.0,
+                         help="Clip gradients to this global norm before the "
+                              "optimizer update. Matches alphagenome-pytorch's "
+                              "--max-grad-norm (also hardcoded to 1.0 there). "
+                              "Pass 0 or a negative value to disable clipping.")
+    parser.add_argument("--dtype", choices=["bfloat16", "float32"], default="bfloat16",
+                         help="Compute dtype for the trunk AND heads (params stay "
+                              "fp32). Matches alphagenome-pytorch's --dtype "
+                              "(same default, bfloat16).")
+    parser.add_argument("--splice-num-segments", "--usage-num-segments",
+                         dest="splice_num_segments", type=int, default=1,
+                         help="Split the sequence into this many equal chunks for the "
+                              "splice_site classification and splice_usage losses, summing "
+                              "per-chunk masked means instead of one global mean -- see "
+                              "CustomAlphaGenomeModel.set_splice_num_segments. Default 1 "
+                              "(alphagenome_research's own losses), as alphagenome-pytorch's "
+                              "--splice-num-segments. --usage-num-segments is a deprecated alias.")
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--organism", default="HOMO_SAPIENS")
+    parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--run-name", required=True)
+    parser.add_argument("--resume", choices=["auto", "none"], default="auto",
+                         help="'auto' (default): if <output-dir>/<run-name>/last "
+                              "already has a train_state.json (from a previous, "
+                              "possibly-preempted invocation with the same "
+                              "--output-dir/--run-name), resume model weights "
+                              "from it via alphagenome_ft.load_checkpoint and "
+                              "continue epoch/global_step bookkeeping from "
+                              "there instead of --rope-init reinit + fresh "
+                              "pretrained weights. 'none' always starts fresh. "
+                              "Also restores optimizer (Adam) state from an "
+                              "opt_state sidecar there, if present. Mirrors "
+                              "alphagenome-pytorch's --resume auto.")
+    parser.add_argument("--log-every", type=int, default=50,
+                         help="Log per-head training loss (to training_log.csv "
+                              "and W&B) every this many optimizer steps. Matches "
+                              "alphagenome-pytorch's --log-every default.")
+    parser.add_argument("--wandb", action="store_true",
+                         help="Enable Weights & Biases logging, mirroring "
+                              "alphagenome-pytorch's --wandb.")
+    parser.add_argument("--wandb-project", default="alphagenome-finetune")
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--pretrained-head-samples", type=str, default=None,
+                         help="Per-head control over pretrained-vs-random weight init, "
+                              "mirroring alphagenome-pytorch's --pretrained-head-samples. "
+                              "Format: 'modality[@resolution]:idx,...' where modality is "
+                              "one of rna_seq/splice_site/splice_usage/splice_junctions, "
+                              "and idx is either a single integer (broadcast that "
+                              "pretrained track to every output track of the head) or a "
+                              "'|'-separated list of integers/NA with one entry per output "
+                              "track (validated against the head's actual track count). "
+                              "Use 'NA' to keep random initialization for a modality or a "
+                              "specific output track. '@resolution' is only meaningful for "
+                              "rna_seq (this repo's custom head is built with resolutions=[1] "
+                              "by default; requesting an unbuilt resolution errors). "
+                              "Modalities not listed keep random initialization. The "
+                              "organism is taken from --organism. For splice_site the index "
+                              "is ignored (its 5-class output has no per-track structure); "
+                              "for splice_junctions the index selects pretrained RoPE "
+                              "tissues specifically (its main linear projects trunk "
+                              "embeddings into a shared representation, not a per-tissue "
+                              "one, so that part is always copied whole, organism-only). "
+                              "Default: 'splice_site:0' when a splice_site head is configured "
+                              "(it starts from the pretrained head), otherwise none, as "
+                              "alphagenome-pytorch; pass 'splice_site:NA' to keep it random.")
+    parser.add_argument("--modality-weights", type=str, default=None,
+                         help="Optional per-head loss weights, mirroring "
+                              "alphagenome-pytorch's --modality-weights. Format: "
+                              "'modality:weight,...' where modality is one of "
+                              "rna_seq/splice_site/splice_usage/splice_junctions. Each "
+                              "head's loss is scaled by its weight before being summed "
+                              "into the total optimized loss; per-head CSV/W&B logging "
+                              "stays unweighted. Modalities not listed default to 1.0.")
+    parser.add_argument("--warmup-steps", type=int, default=0,
+                         help="Linear LR warmup over this many optimizer steps before "
+                              "--lr-schedule takes over. Default 0 (no warmup) matches "
+                              "alphagenome-pytorch's --warmup-steps.")
+    parser.add_argument("--lr-schedule", choices=["constant", "cosine"], default="constant",
+                         help="LR schedule after warmup: 'constant' (default, matches "
+                              "alphagenome-pytorch) or 'cosine' (decays to 0 by the end of training).")
+    parser.add_argument("--no-val-pearson", action="store_true",
+                         help="Disable per-head validation Pearson correlation "
+                              "(rna_seq/splice_usage/splice_junctions; not splice_site, "
+                              "which is classification), mirroring alphagenome-pytorch's "
+                              "--no-val-pearson. On by default, matching PyTorch's default.")
+    parser.add_argument("--metrics-per-sample", action="store_true",
+                         help="Also log per-sample (per-track) Pearson correlation for "
+                              "splice_usage/splice_junctions specifically, mirroring "
+                              "alphagenome-pytorch's --metrics-per-sample. Off by default. "
+                              "No effect if --no-val-pearson is also set.")
+    args = parser.parse_args(argv)
+    shorthand = [f for f in ("bigwig", "star_junctions", "ssu", "gtf") if getattr(args, f) is not None]
+    if args.targets_config is not None and shorthand:
+        parser.error(
+            "--targets-config cannot be combined with the shorthand data flags "
+            f"({', '.join('--' + f.replace('_', '-') for f in shorthand)}); put those "
+            "heads in the config instead."
+        )
+    if args.targets_config is None and (args.bigwig is None or args.star_junctions is None):
+        parser.error("provide --targets-config, or both --bigwig and --star-junctions.")
+    return args
+
+
+def parse_modality_weights(raw: str | None) -> dict[str, float]:
+    """Parse a ``--modality-weights`` string into ``{modality: weight}``.
+
+    Pure string parsing; ``__main__`` maps modality names to configured head ids
+    (``head_init.modality_head_ids``). Modalities not present in the result should
+    be treated by the caller as weight ``1.0``.
+    """
+    if not raw:
+        return {}
+    valid_modalities = {"rna_seq", "splice_site", "splice_usage", "splice_junctions"}
+    result: dict[str, float] = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(
+                f"Malformed --modality-weights entry {item!r}: expected 'modality:weight'."
+            )
+        modality, weight_str = item.rsplit(":", 1)
+        modality = modality.strip()
+        if modality not in valid_modalities:
+            raise ValueError(
+                f"Unrecognized --modality-weights modality '{modality}'; "
+                f"expected one of {sorted(valid_modalities)}."
+            )
+        result[modality] = float(weight_str.strip())
+    return result
