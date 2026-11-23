@@ -486,7 +486,12 @@ model = load_checkpoint(
 predictions = model.predict(...)
 ```
 
-**Important:** Before loading, you must register the custom head classes:
+Predefined heads (genome tracks and splice heads, as trained by `python -m alphagenome_ft.finetune`)
+need no registration: `config.json` stores each head's track metadata under `head_metadata`
+(per head and organism, one row per track with `name`, `strand`, `nonzero_mean`, ...), and
+`load_checkpoint` registers any saved predefined head that is not already registered from it.
+
+**Custom heads:** Before loading, you must register the custom head classes:
 
 ```python
 # Import and register your custom head class
@@ -498,6 +503,31 @@ register_custom_head('my_head', MyCustomHead, config)
 # Now load checkpoint
 model = load_checkpoint('checkpoints/my_model')
 ```
+
+### Converting alphagenome-pytorch checkpoints
+
+`alphagenome_ft.convert_pytorch` converts an alphagenome-pytorch
+finetuned checkpoint (full `.pth`, delta `.delta.pth`, or exported `.safetensors`) into an
+alphagenome_ft heads-only checkpoint directory:
+
+```bash
+python -m alphagenome_ft.convert_pytorch best_model.delta.pth converted/ [--organism human|mouse]
+```
+
+```python
+from alphagenome_ft import load_checkpoint
+from alphagenome_ft.convert_pytorch import convert_pytorch_checkpoint
+
+convert_pytorch_checkpoint('best_model.delta.pth', 'converted')
+model = load_checkpoint('converted', base_checkpoint_path='/abs/path/to/alphagenome/fold_0/1')
+```
+
+Supported: linear-probe and `lora` finetunes (LoRA on `q_proj`/`v_proj`) with genome-track heads
+(rna_seq, atac, dnase, cage, procap, chip_tf, chip_histone) and the splice_site, splice_usage and
+splice_junctions heads. Track means become `nonzero_mean`; track names and strands come from the
+checkpoint's `track_metadata`/`track_names`. LoCon, IA3, Houlsby, other LoRA targets, trained norms,
+full and encoder-only checkpoints raise an error. Load the result with the same base fold the
+PyTorch model was finetuned from. Reading `.pth` files requires `torch`; `.safetensors` does not.
 
 ## Testing
 

@@ -15,7 +15,8 @@ Main functions:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+import dataclasses
 from dataclasses import dataclass, replace
 import enum
 from typing import Any, TypeAlias
@@ -23,6 +24,7 @@ from typing import Any, TypeAlias
 import haiku as hk
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Int, PyTree
+import numpy as np
 import pandas as pd
 
 from alphagenome.models import dna_output
@@ -476,7 +478,12 @@ def get_predefined_head_config(
 def deserialize_predefined_head_config(
     config_dict: Mapping[str, Any],
 ) -> PredefinedHeadConfig:
-    """Rebuild a predefined head config from a serialized dict."""
+    """Rebuild a predefined head config from a serialized dict.
+
+    Accepts the fields ``CustomAlphaGenomeModel.save_checkpoint`` writes to
+    ``config.json`` ``head_configs`` (enums by name); extra keys such as
+    ``source`` are ignored.
+    """
     from alphagenome_research.io import bundles
 
     def _coerce_enum(value: Any, enum_cls):
@@ -490,36 +497,67 @@ def deserialize_predefined_head_config(
         return enum_cls(value)
 
     head_type = _coerce_enum(config_dict["type"], predefined_heads.HeadType)
-    output_type = _coerce_enum(config_dict["output_type"], dna_output.OutputType)
-    name = config_dict["name"]
-    num_tracks = int(config_dict["num_tracks"])
-
-    if head_type == predefined_heads.HeadType.GENOME_TRACKS:
-        bundle = _coerce_enum(config_dict["bundle"], bundles.BundleName)
-        return predefined_heads.GenomeTracksHeadConfig(
-            type=head_type,
-            name=name,
-            output_type=output_type,
-            num_tracks=num_tracks,
-            resolutions=list(config_dict["resolutions"]),
-            apply_squashing=bool(config_dict["apply_squashing"]),
-            bundle=bundle,
-        )
-    if head_type == predefined_heads.HeadType.SPLICE_SITES_JUNCTION:
-        return predefined_heads.SpliceSitesJunctionHeadConfig(
-            type=head_type,
-            name=name,
-            output_type=output_type,
-            num_tracks=num_tracks,
-            embedding_channels=int(config_dict["embedding_channels"]),
-            num_tissues=int(config_dict["num_tissues"]),
-        )
-    return predefined_heads.HeadConfig(
-        type=head_type,
-        name=name,
-        output_type=output_type,
-        num_tracks=num_tracks,
+    config_cls = (
+        predefined_heads.GenomeTracksHeadConfig
+        if head_type == predefined_heads.HeadType.GENOME_TRACKS
+        else predefined_heads.HeadConfig
     )
+    coerce = {
+        "type": lambda v: head_type,
+        "output_type": lambda v: _coerce_enum(v, dna_output.OutputType),
+        "bundle": lambda v: _coerce_enum(v, bundles.BundleName),
+        "resolutions": list,
+    }
+    return config_cls(**{
+        field.name: coerce.get(field.name, lambda v: v)(config_dict[field.name])
+        for field in dataclasses.fields(config_cls)
+    })
+
+
+def _json_safe(value: Any) -> Any:
+    if pd.api.types.is_scalar(value) and pd.isna(value):
+        return None
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def serialize_head_metadata(
+    metadata: Mapping[Any, Any],
+    output_type: dna_output.OutputType,
+) -> dict[str, list[dict[str, Any]]]:
+    """Serialize predefined-head track metadata for ``config.json``.
+
+    Returns ``{organism enum name: [one JSON-safe dict per track, in track
+    order]}`` from the ``output_type`` table of each organism's
+    ``AlphaGenomeOutputMetadata`` (NaN becomes ``None``).
+    """
+    serialized = {}
+    for organism, organism_metadata in metadata.items():
+        table = organism_metadata.get(output_type) if organism_metadata is not None else None
+        if table is None:
+            continue
+        serialized[organism.name] = [
+            {str(key): _json_safe(value) for key, value in row.items()}
+            for row in table.to_dict(orient="records")
+        ]
+    return serialized
+
+
+def deserialize_head_metadata(
+    serialized: Mapping[str, Sequence[Mapping[str, Any]]],
+    output_type: dna_output.OutputType,
+) -> dict[Any, Any]:
+    """Inverse of :func:`serialize_head_metadata`."""
+    from alphagenome_research.model import dna_model
+    from alphagenome_research.model.metadata.metadata import AlphaGenomeOutputMetadata
+
+    return {
+        dna_model.Organism[organism]: AlphaGenomeOutputMetadata(
+            **{output_type.name.lower(): pd.DataFrame(list(rows))}
+        )
+        for organism, rows in serialized.items()
+    }
 
 
 def create_predefined_head_from_config(
