@@ -427,6 +427,94 @@ def _partitioned_classification_loss(
     return jnp.sum(jnp.stack(chunk_losses))
 
 
+def _serialize_config(config_obj) -> dict:
+    """Serialize a head or LoRA config dataclass to JSON-safe fields (enums by name)."""
+    import dataclasses
+
+    def _serialize_value(value):
+        if isinstance(value, enum.Enum):
+            return value.name
+        if isinstance(value, (list, tuple)):
+            return [_serialize_value(v) for v in value]
+        if isinstance(value, dict):
+            return {k: _serialize_value(v) for k, v in value.items()}
+        return value
+
+    if dataclasses.is_dataclass(config_obj):
+        return {
+            field.name: _serialize_value(getattr(config_obj, field.name))
+            for field in dataclasses.fields(config_obj)
+        }
+    if isinstance(config_obj, dict):
+        return _serialize_value(config_obj)
+    return {'value': _serialize_value(config_obj)}
+
+
+def _checkpoint_config(
+    *,
+    custom_heads: Sequence[str],
+    head_configs: Mapping[str, _HeadConfigEntry],
+    head_metadata: Mapping[str, Mapping[Any, Any]],
+    save_full_model: bool,
+    save_minimal_model: bool,
+    use_encoder_output: bool,
+    backbone_lora_config: Any | None,
+) -> dict:
+    """Build the ``config.json`` contents written next to a checkpoint.
+
+    ``head_metadata`` maps predefined head ids to their ``{Organism:
+    AlphaGenomeOutputMetadata}`` track metadata; it is stored per organism
+    name as one row dict per track so ``load_checkpoint`` can register the
+    heads without the original targets config.
+    """
+    return {
+        'custom_heads': list(custom_heads),
+        'head_configs': {
+            name: {'source': entry.source, **_serialize_config(entry.config)}
+            for name, entry in head_configs.items()
+        },
+        'head_metadata': {
+            name: custom_heads_module.serialize_head_metadata(
+                metadata, head_configs[name].config.output_type
+            )
+            for name, metadata in head_metadata.items()
+        },
+        'save_full_model': save_full_model,
+        'save_minimal_model': save_minimal_model,
+        'use_encoder_output': use_encoder_output,
+        'backbone_lora': (
+            _serialize_config(backbone_lora_config)
+            if backbone_lora_config is not None
+            else None
+        ),
+    }
+
+
+def _write_checkpoint(
+    checkpoint_dir: str | Path,
+    config: Mapping[str, Any],
+    params: PyTree,
+    state: PyTree,
+) -> Path:
+    """Write ``config.json`` and the Orbax ``checkpoint/`` holding ``(params, state)``."""
+    checkpoint_dir = Path(checkpoint_dir).expanduser().resolve()
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    with open(checkpoint_dir / 'config.json', 'w') as f:
+        json.dump(config, f, indent=2)
+
+    # Remove an existing checkpoint directory to allow overwriting.
+    checkpoint_path = checkpoint_dir / 'checkpoint'
+    if checkpoint_path.exists():
+        import shutil
+        shutil.rmtree(checkpoint_path)
+
+    checkpointer = ocp.StandardCheckpointer()
+    checkpointer.save(str(checkpoint_path), (params, state))
+    # Wait for async save to complete
+    checkpointer.wait_until_finished()
+    return checkpoint_dir
+
+
 class CustomAlphaGenomeModel:
     """Extended AlphaGenome model with custom/predefined head support and parameter freezing.
 
@@ -1250,71 +1338,30 @@ class CustomAlphaGenomeModel:
                 "save_minimal_model=True is not supported with backbone LoRA; "
                 "save heads + LoRA (the default) or the full model instead."
             )
-        checkpoint_dir = Path(checkpoint_dir).expanduser().resolve()
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        def _serialize_value(value):
-            if isinstance(value, enum.Enum):
-                return value.name
-            if isinstance(value, (list, tuple)):
-                return [_serialize_value(v) for v in value]
-            if isinstance(value, dict):
-                return {k: _serialize_value(v) for k, v in value.items()}
-            return value
-
-        def _serialize_head_config(config_obj):
-            import dataclasses
-
-            if dataclasses.is_dataclass(config_obj):
-                return {
-                    field.name: _serialize_value(getattr(config_obj, field.name))
-                    for field in dataclasses.fields(config_obj)
-                }
-            if isinstance(config_obj, dict):
-                return _serialize_value(config_obj)
-            return {'value': _serialize_value(config_obj)}
-        # Save metadata about the checkpoint
-        metadata = {
-            'custom_heads': self._custom_heads,
-            'head_configs': {
-                name: {
-                    'source': entry.source,
-                    **_serialize_head_config(entry.config),
-                }
-                for name, entry in self._head_configs.items()
-            },
-            'save_full_model': save_full_model,
-            'save_minimal_model': save_minimal_model,
-            'use_encoder_output': hasattr(self, '_custom_forward_fn') and self._custom_forward_fn is not None,
-            'backbone_lora': (
-                _serialize_head_config(self._backbone_lora_config)
-                if self._backbone_lora_config is not None
-                else None
+        head_metadata = {}
+        for name, entry in self._head_configs.items():
+            if entry.source != 'predefined':
+                continue
+            metadata = _resolve_user_metadata(head_name=name, head_config=entry.config)
+            if metadata:
+                head_metadata[name] = metadata
+        config = _checkpoint_config(
+            custom_heads=self._custom_heads,
+            head_configs=self._head_configs,
+            head_metadata=head_metadata,
+            save_full_model=save_full_model,
+            save_minimal_model=save_minimal_model,
+            use_encoder_output=(
+                hasattr(self, '_custom_forward_fn') and self._custom_forward_fn is not None
             ),
-        }
-
-        with open(checkpoint_dir / 'config.json', 'w') as f:
-            json.dump(metadata, f, indent=2)
-
+            backbone_lora_config=self._backbone_lora_config,
+        )
         # Subtree selection (encoder-only layouts, flat vs nested head keys): see
         # :meth:`_checkpoint_slice_trees`.
         params_to_save, state_to_save = self._checkpoint_slice_trees(
             save_full_model, save_minimal_model
         )
-
-        # Save parameters using orbax
-        # Remove existing checkpoint directory if it exists (to allow overwriting)
-        checkpoint_path = checkpoint_dir / 'checkpoint'
-        if checkpoint_path.exists():
-            import shutil
-            shutil.rmtree(checkpoint_path)
-
-        checkpointer = ocp.StandardCheckpointer()
-        checkpointer.save(
-            str(checkpoint_path),
-            (params_to_save, state_to_save)
-        )
-        # Wait for async save to complete
-        checkpointer.wait_until_finished()
+        checkpoint_dir = _write_checkpoint(checkpoint_dir, config, params_to_save, state_to_save)
 
         print(f"✓ Checkpoint saved to {checkpoint_dir}")
         if save_full_model:
@@ -3174,6 +3221,8 @@ def load_checkpoint(
 
     This function loads a checkpoint saved with `model.save_checkpoint()`.
     It handles both full model checkpoints and heads-only checkpoints.
+    Predefined heads that are not registered yet are registered from the
+    checkpoint's ``head_metadata``; custom heads must be registered first.
 
     Args:
         checkpoint_dir: Directory containing the checkpoint files.
@@ -3307,7 +3356,25 @@ def load_checkpoint(
         model_type = "Heads + backbone LoRA" if backbone_lora_config else "Heads only"
         print(f"  Model type: {model_type}")
 
+    saved_head_metadata = config.get('head_metadata') or {}
     for head_name, head_config_dict in config['head_configs'].items():
+        if (
+            not custom_heads_module.is_head_registered(head_name)
+            and head_config_dict.get('source') == 'predefined'
+            and head_name in saved_head_metadata
+        ):
+            # Self-describing checkpoint: rebuild the predefined head from its
+            # saved config and track metadata.
+            head_config = custom_heads_module.deserialize_predefined_head_config(head_config_dict)
+            custom_heads_module.register_predefined_head(
+                head_name,
+                head_config,
+                metadata=custom_heads_module.deserialize_head_metadata(
+                    saved_head_metadata[head_name], head_config.output_type
+                ),
+            )
+            print(f"  Head '{head_name}' registered from checkpoint head_metadata")
+            continue
         # Verify head is already registered (required before loading checkpoint)
         if not custom_heads_module.is_head_registered(head_name):
             raise RuntimeError(

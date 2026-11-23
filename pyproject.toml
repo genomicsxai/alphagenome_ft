@@ -50,7 +50,9 @@ test = [
     "pytest-cov>=4.0.0",
     "aiohttp>=3.0.0",
     "requests>=2.0.0",
-    "pybigwig>=0.3.0"
+    "pybigwig>=0.3.0",
+    # Reads .safetensors exports in tests/test_convert_pytorch.py (optional at runtime).
+    "safetensors>=0.4.0"
 ]
 
 [project.urls]

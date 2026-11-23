@@ -14,6 +14,7 @@ tests/
 ├── test_parameter_management.py     # Tests for parameter freezing
 ├── test_optimizer_masking.py      # Heads-only Optax masking (true backbone freeze)
 ├── test_checkpoint.py               # Tests for checkpoint save/load functionality
+├── test_convert_pytorch.py          # PyTorch checkpoint conversion and saved head metadata
 ├── kaggle_util.py                   # Detect Kaggle credentials for model download tests
 └── README.md                        # This file
 ```

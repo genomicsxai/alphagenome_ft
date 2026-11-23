@@ -220,6 +220,8 @@ model = load_checkpoint(
     base_model_version="all_folds",
 )
 
+# The heads are registered from the checkpoint's saved head_metadata, so the
+# targets config is not needed here.
 # Use for inference on new sequences
 preds = model.predict_batch_of_sequences(
     sequences=...,          # one-hot encoded DNA, shape (B, L, 4)
