@@ -80,7 +80,12 @@ def read_pytorch_checkpoint(path: str | Path) -> tuple[dict, dict[str, np.ndarra
     """
     path = Path(path)
     if path.suffix == ".safetensors":
-        from safetensors import safe_open
+        try:
+            from safetensors import safe_open
+        except ImportError as exc:
+            raise ImportError(
+                f"Reading {path.name} requires safetensors (pip install safetensors)."
+            ) from exc
 
         with safe_open(path, framework="np") as f:
             header = f.metadata() or {}
