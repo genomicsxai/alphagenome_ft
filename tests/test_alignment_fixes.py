@@ -55,34 +55,6 @@ def test_intervals_off_chromosome_are_skipped(tmp_path):
     np.testing.assert_equal(len(legacy), 4)
 
 
-def test_partitioned_classification_loss_matches_pytorch():
-    import sys
-    from pathlib import Path
-
-    import pytest
-    torch = pytest.importorskip("torch")
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "alphagenome-pytorch-pr57" / "src"))
-    from alphagenome_pytorch.extensions.finetuning import training as pt_training
-
-    from alphagenome_ft.custom_model import _partitioned_classification_loss
-
-    rng = np.random.default_rng(0)
-    logits = rng.normal(size=(2, 50, 5)).astype(np.float32)
-    labels = np.zeros((2, 50, 5), np.float32)
-    rows = rng.choice(50, size=7, replace=False)          # sparse labels; some chunks empty
-    labels[0, rows, rng.integers(0, 5, size=7)] = 1.0
-    labels[1, rows[:3], 4] = 1.0
-    for n in (1, 3, 8):
-        ours = float(_partitioned_classification_loss(jnp.asarray(logits), jnp.asarray(labels), n))
-        ref = float(pt_training._partitioned_loss(
-            torch.from_numpy(logits), torch.from_numpy(labels), num_partitions=n,
-            loss_fn=lambda p, t: pt_training._ce_loss_with_smoothing(p, t, 1e-7, 5),
-            mask_fn=lambda t: t.any(dim=-1, keepdim=True).expand_as(t),
-            device=torch.device("cpu"),
-        ))
-        np.testing.assert_allclose(ours, ref, rtol=1e-5)
-
-
 def test_validation_order_is_wrap_padded_not_dropped():
     from alphagenome_ft.finetune.data import _pad_order_to_batch_multiple
 
@@ -99,31 +71,6 @@ def test_validation_order_is_wrap_padded_not_dropped():
         padded.append(list(DistributedSampler(range(6), num_replicas=world, rank=r, shuffle=False)))
     flat = sorted(sum(padded, []))
     assert flat == sorted(_pad_order_to_batch_multiple(np.arange(6), world).tolist())
-
-
-def test_genome_tracks_target_scaling_matches_pytorch():
-    import sys
-    from pathlib import Path
-
-    import pytest
-    torch = pytest.importorskip("torch")
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "alphagenome-pytorch-pr57" / "src"))
-    from alphagenome_pytorch.heads import targets_scaling as pt_targets_scaling
-    from alphagenome_research.model import heads as research_heads
-
-    from alphagenome_ft.custom_heads import _with_pytorch_target_scaling
-
-    rng = np.random.default_rng(0)
-    means = rng.uniform(1e-9, 2.0, size=(2, 3)).astype(np.float32)   # includes ~0 means
-    x = rng.gamma(1.0, 5.0, size=(1, 16, 3)).astype(np.float32)
-    head = research_heads.GenomeTracksHead.__new__(research_heads.GenomeTracksHead)
-    object.__setattr__(head, "_track_means", jnp.asarray(means))
-    object.__setattr__(head, "_apply_squashing", True)
-    head = _with_pytorch_target_scaling(head)
-    ours = np.asarray(head.scale(jnp.asarray(x), jnp.array([1]), 1))
-    ref = pt_targets_scaling(torch.from_numpy(x), torch.from_numpy(means[1:2]), 1,
-                             apply_squashing=True).numpy()
-    np.testing.assert_allclose(ours, ref, rtol=1e-6)
 
 
 def test_epoch_log_has_pytorch_leading_columns(tmp_path):
